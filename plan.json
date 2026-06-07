@@ -1,0 +1,236 @@
+{
+  "plan": [
+    {
+      "week": 1,
+      "date": "2026-06-08",
+      "topic": "Auth0 & Modern Identity",
+      "slug": "week-01-auth0-modern-identity",
+      "details": "Auth0 tenants, applications, APIs. JWTs in depth — header, payload, signature, expiry. Flows: Authorization Code + PKCE, Client Credentials, Device. Rules, Actions, M2M. Python SDK integration patterns.",
+      "tags": ["auth", "security", "identity"]
+    },
+    {
+      "week": 2,
+      "date": "2026-06-15",
+      "topic": "OAuth 2.0 & OIDC Deep Dive",
+      "slug": "week-02-oauth2-oidc",
+      "details": "Full spec walkthrough — all grant types, scopes, token introspection, refresh flows. Authentication vs. authorization distinction. Token storage security. Provider comparison: Auth0 vs. Okta vs. Cognito vs. Keycloak.",
+      "tags": ["auth", "security", "oauth"]
+    },
+    {
+      "week": 3,
+      "date": "2026-06-22",
+      "topic": "LLM Fundamentals",
+      "slug": "week-03-llm-fundamentals",
+      "details": "Transformer architecture simplified. Tokens, context windows, embeddings, temperature, top-p. How models are trained and fine-tuned. Quantization basics. Capabilities and hard limits. Difference between base models, instruction-tuned, and RLHF models.",
+      "tags": ["ai", "llm", "ml"]
+    },
+    {
+      "week": 4,
+      "date": "2026-06-29",
+      "topic": "Prompt Engineering & LLM Patterns",
+      "slug": "week-04-prompt-engineering",
+      "details": "System prompts and persona design. Few-shot and zero-shot prompting. Chain-of-thought and tree-of-thought. Prompt injection risks and mitigations. Structured output (JSON mode). Evaluating LLM outputs. Prompt versioning and testing strategies.",
+      "tags": ["ai", "llm", "prompting"]
+    },
+    {
+      "week": 5,
+      "date": "2026-07-06",
+      "topic": "Claude API & Building AI Features",
+      "slug": "week-05-claude-api-ai-features",
+      "details": "Anthropic SDK: messages API, streaming, tool use, vision. Model selection and pricing. Caching (prompt caching). Token counting and cost management. Building AI-powered APIs with FastAPI. Error handling and rate limit strategies.",
+      "tags": ["ai", "llm", "claude", "api"]
+    },
+    {
+      "week": 6,
+      "date": "2026-07-13",
+      "topic": "RAG & Vector Databases",
+      "slug": "week-06-rag-vector-databases",
+      "details": "Retrieval-Augmented Generation architecture. Chunking strategies. Embedding models (dense vs. sparse). Vector databases: pgvector, Pinecone, Weaviate, Chroma. Similarity search algorithms (HNSW, IVFFlat). Hybrid search. Evaluating RAG quality.",
+      "tags": ["ai", "rag", "databases", "vectors"]
+    },
+    {
+      "week": 7,
+      "date": "2026-07-20",
+      "topic": "AI Agents, Tool Use & MCP",
+      "slug": "week-07-ai-agents-tool-use-mcp",
+      "details": "Agentic patterns: ReAct, plan-and-execute, reflection. Tool/function calling in depth. Multi-agent systems — when they help and when they hurt. Model Context Protocol (MCP): architecture, writing servers, connecting tools. Orchestration: LangChain vs. raw SDK vs. custom.",
+      "tags": ["ai", "agents", "mcp", "tools"]
+    },
+    {
+      "week": 8,
+      "date": "2026-07-27",
+      "topic": "Salesforce Platform for Developers",
+      "slug": "week-08-salesforce-platform",
+      "details": "Org architecture: metadata, objects, fields, relationships. Developer Console vs. VS Code + SFDX. Deployment: change sets vs. packages vs. SFDX. Profiles, permission sets, sharing rules. Governor limits — why they exist and how to work with them. Namespaces and managed packages.",
+      "tags": ["salesforce", "apex", "platform"]
+    },
+    {
+      "week": 9,
+      "date": "2026-08-03",
+      "topic": "Apex Deep Dive",
+      "slug": "week-09-apex-deep-dive",
+      "details": "Execution context and governor limit mechanics. Trigger framework patterns — one trigger per object, handler classes. Async Apex: @future, Queueable, Batch, Scheduled. SOQL and SOSL in depth. Bulkification patterns. Exception handling. Unit testing and @isTest. AESF trigger architecture walkthrough.",
+      "tags": ["salesforce", "apex", "triggers"]
+    },
+    {
+      "week": 10,
+      "date": "2026-08-10",
+      "topic": "Salesforce Integration Patterns",
+      "slug": "week-10-salesforce-integration",
+      "details": "REST and SOAP API: authentication, limits, error handling. Outbound messages vs. callouts. Platform Events vs. Change Data Capture (CDC) vs. Streaming API. Webhooks: inbound to Salesforce. The Salesforce to middleware to Epic pattern. Canvas and connected apps.",
+      "tags": ["salesforce", "integration", "api"]
+    },
+    {
+      "week": 11,
+      "date": "2026-08-17",
+      "topic": "Salesforce Data Model & SOQL Mastery",
+      "slug": "week-11-salesforce-data-model-soql",
+      "details": "Standard and custom objects, polymorphic lookups, junction objects. SOQL: relationship queries, semi-joins, aggregate functions. SOSL. Query optimization and selective queries. Reporting snapshots. AESF and CanaryAMS object model deep dive.",
+      "tags": ["salesforce", "soql", "data-model"]
+    },
+    {
+      "week": 12,
+      "date": "2026-08-24",
+      "topic": "Advanced Python — Internals & CPython",
+      "slug": "week-12-advanced-python-internals",
+      "details": "CPython execution model, bytecode disassembly. The GIL — what it actually blocks. Memory management: reference counting, cyclic GC. Descriptors, __slots__, metaclasses, __init_subclass__. The import system. Profiling with cProfile and py-spy.",
+      "tags": ["python", "cpython", "performance"]
+    },
+    {
+      "week": 13,
+      "date": "2026-08-31",
+      "topic": "Advanced Python — Concurrency",
+      "slug": "week-13-advanced-python-concurrency",
+      "details": "asyncio internals: event loop, coroutines, tasks, awaitables. threading vs. multiprocessing vs. asyncio. concurrent.futures. Async context managers. Writing non-blocking FastAPI endpoints. Detecting sync code blocking the async loop.",
+      "tags": ["python", "async", "concurrency"]
+    },
+    {
+      "week": 14,
+      "date": "2026-09-07",
+      "topic": "PostgreSQL Internals",
+      "slug": "week-14-postgresql-internals",
+      "details": "MVCC and how transactions actually work. VACUUM and autovacuum. WAL (Write-Ahead Logging). Heap and TOAST storage. Connection pooling with PgBouncer. EXPLAIN ANALYZE in depth. pg_stat_* views for diagnostics. Alembic migration best practices.",
+      "tags": ["postgresql", "databases", "internals"]
+    },
+    {
+      "week": 15,
+      "date": "2026-09-14",
+      "topic": "Database Indexing & Query Optimization",
+      "slug": "week-15-database-indexing-optimization",
+      "details": "B-tree, hash, GiST, GIN, BRIN — when to use each. Partial, expression, and covering indexes. Join strategies (hash, nested loop, merge). Query planner statistics and ANALYZE. SQLAlchemy patterns and their SQL output. N+1 detection and fixes.",
+      "tags": ["postgresql", "databases", "performance", "indexing"]
+    },
+    {
+      "week": 16,
+      "date": "2026-09-21",
+      "topic": "Distributed Systems Fundamentals",
+      "slug": "week-16-distributed-systems",
+      "details": "CAP theorem and PACELC. Consistency models: eventual, strong, causal. Raft consensus simplified. Distributed clocks: Lamport timestamps, vector clocks. Failure modes: split brain, network partitions. How these apply to Postgres replication and Kafka.",
+      "tags": ["distributed-systems", "consensus", "architecture"]
+    },
+    {
+      "week": 17,
+      "date": "2026-09-28",
+      "topic": "System Design — Scalability Patterns",
+      "slug": "week-17-system-design-scalability",
+      "details": "Horizontal vs. vertical scaling. Load balancing strategies. Stateless services. Read replicas, write routing. CQRS. Database sharding. Idempotency design. Rate limiting algorithms (token bucket, leaky bucket). Analyzing your own middleware architecture.",
+      "tags": ["system-design", "scalability", "architecture"]
+    },
+    {
+      "week": 18,
+      "date": "2026-10-05",
+      "topic": "API Design — REST, gRPC & GraphQL",
+      "slug": "week-18-api-design",
+      "details": "REST maturity levels and Richardson model. Versioning strategies. Hypermedia/HATEOAS. gRPC and Protobuf: when it beats REST. GraphQL: schema design, N+1 problem, DataLoader. OpenAPI/Swagger spec design. FastAPI best practices for large APIs.",
+      "tags": ["api", "rest", "grpc", "graphql"]
+    },
+    {
+      "week": 19,
+      "date": "2026-10-12",
+      "topic": "Event-Driven Architecture & Kafka",
+      "slug": "week-19-event-driven-kafka",
+      "details": "Event-driven vs. request-driven. Kafka internals: brokers, partitions, consumer groups, offsets. Exactly-once semantics. Event sourcing. CQRS + event sourcing. Dead letter queues. Comparison to your current queue-table-based async pattern.",
+      "tags": ["kafka", "event-driven", "architecture", "messaging"]
+    },
+    {
+      "week": 20,
+      "date": "2026-10-19",
+      "topic": "Docker & Kubernetes Deep Dive",
+      "slug": "week-20-docker-kubernetes",
+      "details": "Container internals: namespaces and cgroups. Multi-stage Dockerfiles. Kubernetes architecture: control plane, kubelet, etcd. Deployments, StatefulSets, DaemonSets. Services, Ingress, NetworkPolicy. HPA. Helm chart authoring. Reading your own deployment-manifests as a case study.",
+      "tags": ["kubernetes", "docker", "containers", "devops"]
+    },
+    {
+      "week": 21,
+      "date": "2026-10-26",
+      "topic": "GCP Architecture & Core Services",
+      "slug": "week-21-gcp-architecture",
+      "details": "Resource hierarchy: org, folders, projects. VPC, Cloud NAT, firewall rules. IAM and service accounts — least privilege. Cloud Run vs. GKE vs. Compute Engine. Cloud SQL, Memorystore, Pub/Sub. Workload Identity Federation. Secrets Manager vs. Vault.",
+      "tags": ["gcp", "cloud", "infrastructure"]
+    },
+    {
+      "week": 22,
+      "date": "2026-11-02",
+      "topic": "Data Engineering & ETL Patterns",
+      "slug": "week-22-data-engineering-etl",
+      "details": "ETL vs. ELT. Idempotent and restartable pipelines. Incremental vs. full-load. Watermarking and CDC. Schema evolution. Orchestration: Airflow vs. Prefect vs. cron. Error handling and dead letter patterns. Pentaho/PDI architecture in your BDE and BQ ETL pipelines.",
+      "tags": ["data-engineering", "etl", "pipelines"]
+    },
+    {
+      "week": 23,
+      "date": "2026-11-09",
+      "topic": "BigQuery & Data Warehousing",
+      "slug": "week-23-bigquery-data-warehousing",
+      "details": "BigQuery internals: columnar storage, Dremel execution engine. Partitioning and clustering. Slot-based vs. on-demand billing. Window functions and analytical SQL. Slowly changing dimensions. Star schema vs. OBT. Streaming inserts vs. batch load. Your BQ ETL in depth.",
+      "tags": ["bigquery", "gcp", "data-warehouse", "sql"]
+    },
+    {
+      "week": 24,
+      "date": "2026-11-16",
+      "topic": "Observability — Logs, Metrics, Traces",
+      "slug": "week-24-observability",
+      "details": "The three pillars. Structured logging best practices. Metrics: counters, gauges, histograms. Prometheus scraping. Distributed tracing: OpenTelemetry, trace context propagation. Datadog APM and log correlation. Alerting design — avoiding alert fatigue.",
+      "tags": ["observability", "monitoring", "logging", "tracing"]
+    },
+    {
+      "week": 25,
+      "date": "2026-11-23",
+      "topic": "Performance Engineering & Caching",
+      "slug": "week-25-performance-caching",
+      "details": "Latency vs. throughput. Profiling Python: cProfile, line_profiler, py-spy in production. Cache-aside, write-through, write-behind patterns. Redis data structures and use cases. Distributed vs. local cache. Cache stampede. HTTP load testing with locust.",
+      "tags": ["performance", "caching", "redis", "profiling"]
+    },
+    {
+      "week": 26,
+      "date": "2026-11-30",
+      "topic": "Application Security & Secure Design",
+      "slug": "week-26-application-security",
+      "details": "OWASP Top 10 — mechanisms and mitigations. Input validation, parameterized queries. Secrets management. SSRF, XXE, deserialization attacks. Dependency scanning. mTLS between services. Security in CI/CD. Threat modeling your own integration platform.",
+      "tags": ["security", "owasp", "appsec"]
+    },
+    {
+      "week": 27,
+      "date": "2026-12-07",
+      "topic": "Reliability Engineering & SRE Practices",
+      "slug": "week-27-reliability-sre",
+      "details": "SLOs, SLIs, SLAs. Error budgets. Chaos engineering basics. Graceful degradation. Incident response runbooks. Post-mortem culture — blameless analysis. CI/CD: blue-green, canary, zero-downtime DB migrations.",
+      "tags": ["sre", "reliability", "devops", "incidents"]
+    },
+    {
+      "week": 28,
+      "date": "2026-12-14",
+      "topic": "Advanced Testing Strategies",
+      "slug": "week-28-advanced-testing",
+      "details": "Test pyramid. Property-based testing with Hypothesis. Contract testing (Pact) for API integrations. Mutation testing. Testcontainers for real DB tests. Testing async code. Testing Salesforce integrations and ETL pipelines.",
+      "tags": ["testing", "quality", "tdd"]
+    },
+    {
+      "week": 29,
+      "date": "2026-12-21",
+      "topic": "Staff Engineering — Strategy, Leadership & 2027 Planning",
+      "slug": "week-29-staff-engineering-leadership",
+      "details": "Staff engineer archetypes. Writing RFCs and design docs. ADRs — format and lifecycle. C4 architecture diagrams. Making decisions under uncertainty. Driving alignment without authority. Mentoring. Engineering culture. Designing the 2027 plan.",
+      "tags": ["staff-engineering", "leadership", "architecture", "career"]
+    }
+  ]
+}
