@@ -37,7 +37,7 @@ One topic per week. Each study guide is designed for approximately **2 hours of 
 | Week | Topic | Status |
 |------|-------|--------|
 | [Week 1](weeks/week-01-auth0-modern-identity.md) | Auth0 & Modern Identity | ✅ Available |
-| Week 2 | OAuth 2.0 & OIDC Deep Dive | ⏳ Upcoming |
+| [Week 2](weeks/week-02-oauth2-oidc.md) | OAuth 2.0 & OIDC Deep Dive | ✅ Available |
 | Week 3 | LLM Fundamentals | ⏳ Upcoming |
 | Week 4 | Prompt Engineering & LLM Patterns | ⏳ Upcoming |
 | Week 5 | Claude API & Building AI Features | ⏳ Upcoming |
