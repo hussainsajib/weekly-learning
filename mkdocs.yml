@@ -86,3 +86,4 @@ nav:
     - "Week 2 — OAuth 2.0 & OIDC Deep Dive": weeks/week-02-oauth2-oidc.md
     - "Week 3 — LLM Fundamentals": weeks/week-03-llm-fundamentals.md
     - "Week 4 — Prompt Engineering & LLM Patterns": weeks/week-04-prompt-engineering.md
+    - "Week 7 — AI Agents, Tool Use & MCP": weeks/week-07-ai-agents-tool-use-mcp.md

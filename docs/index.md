@@ -42,7 +42,7 @@ One topic per week. Each study guide is designed for approximately **2 hours of 
 | [Week 4](weeks/week-04-prompt-engineering.md) | Prompt Engineering & LLM Patterns | ✅ Available |
 | Week 5 | Claude API & Building AI Features | ⏳ Upcoming |
 | Week 6 | RAG & Vector Databases | ⏳ Upcoming |
-| Week 7 | AI Agents, Tool Use & MCP | ⏳ Upcoming |
+| [Week 7](weeks/week-07-ai-agents-tool-use-mcp.md) | AI Agents, Tool Use & MCP | ✅ Available |
 | Week 8 | Salesforce Platform for Developers | ⏳ Upcoming |
 | Week 9 | Apex Deep Dive | ⏳ Upcoming |
 | Week 10 | Salesforce Integration Patterns | ⏳ Upcoming |
