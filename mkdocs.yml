@@ -86,4 +86,28 @@ nav:
     - "Week 2 — OAuth 2.0 & OIDC Deep Dive": weeks/week-02-oauth2-oidc.md
     - "Week 3 — LLM Fundamentals": weeks/week-03-llm-fundamentals.md
     - "Week 4 — Prompt Engineering & LLM Patterns": weeks/week-04-prompt-engineering.md
+    - "Week 5 — Claude API & Building AI Features": weeks/week-05-claude-api-ai-features.md
+    - "Week 6 — RAG & Vector Databases": weeks/week-06-rag-vector-databases.md
     - "Week 7 — AI Agents, Tool Use & MCP": weeks/week-07-ai-agents-tool-use-mcp.md
+    - "Week 8 — Salesforce Platform for Developers": weeks/week-08-salesforce-platform.md
+    - "Week 9 — Apex Deep Dive": weeks/week-09-apex-deep-dive.md
+    - "Week 10 — Salesforce Integration Patterns": weeks/week-10-salesforce-integration.md
+    - "Week 11 — Salesforce Data Model & SOQL Mastery": weeks/week-11-salesforce-data-model-soql.md
+    - "Week 12 — Advanced Python — Internals & CPython": weeks/week-12-advanced-python-internals.md
+    - "Week 13 — Advanced Python — Concurrency": weeks/week-13-advanced-python-concurrency.md
+    - "Week 14 — PostgreSQL Internals": weeks/week-14-postgresql-internals.md
+    - "Week 15 — Database Indexing & Query Optimization": weeks/week-15-database-indexing-optimization.md
+    - "Week 16 — Distributed Systems Fundamentals": weeks/week-16-distributed-systems.md
+    - "Week 17 — System Design — Scalability Patterns": weeks/week-17-system-design-scalability.md
+    - "Week 18 — API Design — REST, gRPC & GraphQL": weeks/week-18-api-design.md
+    - "Week 19 — Event-Driven Architecture & Kafka": weeks/week-19-event-driven-kafka.md
+    - "Week 20 — Docker & Kubernetes Deep Dive": weeks/week-20-docker-kubernetes.md
+    - "Week 21 — GCP Architecture & Core Services": weeks/week-21-gcp-architecture.md
+    - "Week 22 — Data Engineering & ETL Patterns": weeks/week-22-data-engineering-etl.md
+    - "Week 23 — BigQuery & Data Warehousing": weeks/week-23-bigquery-data-warehousing.md
+    - "Week 24 — Observability — Logs, Metrics, Traces": weeks/week-24-observability.md
+    - "Week 25 — Performance Engineering & Caching": weeks/week-25-performance-caching.md
+    - "Week 26 — Application Security & Secure Design": weeks/week-26-application-security.md
+    - "Week 27 — Reliability Engineering & SRE Practices": weeks/week-27-reliability-sre.md
+    - "Week 28 — Advanced Testing Strategies": weeks/week-28-advanced-testing.md
+    - "Week 29 — Staff Engineering — Strategy, Leadership & 2027 Planning": weeks/week-29-staff-engineering-leadership.md

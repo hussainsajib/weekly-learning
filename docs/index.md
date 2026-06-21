@@ -40,31 +40,31 @@ One topic per week. Each study guide is designed for approximately **2 hours of 
 | [Week 2](weeks/week-02-oauth2-oidc.md) | OAuth 2.0 & OIDC Deep Dive | ✅ Available |
 | [Week 3](weeks/week-03-llm-fundamentals.md) | LLM Fundamentals | ✅ Available |
 | [Week 4](weeks/week-04-prompt-engineering.md) | Prompt Engineering & LLM Patterns | ✅ Available |
-| Week 5 | Claude API & Building AI Features | ⏳ Upcoming |
-| Week 6 | RAG & Vector Databases | ⏳ Upcoming |
+| [Week 5](weeks/week-05-claude-api-ai-features.md) | Claude API & Building AI Features | ✅ Available |
+| [Week 6](weeks/week-06-rag-vector-databases.md) | RAG & Vector Databases | ✅ Available |
 | [Week 7](weeks/week-07-ai-agents-tool-use-mcp.md) | AI Agents, Tool Use & MCP | ✅ Available |
-| Week 8 | Salesforce Platform for Developers | ⏳ Upcoming |
-| Week 9 | Apex Deep Dive | ⏳ Upcoming |
-| Week 10 | Salesforce Integration Patterns | ⏳ Upcoming |
-| Week 11 | Salesforce Data Model & SOQL Mastery | ⏳ Upcoming |
-| Week 12 | Advanced Python — Internals & CPython | ⏳ Upcoming |
-| Week 13 | Advanced Python — Concurrency | ⏳ Upcoming |
-| Week 14 | PostgreSQL Internals | ⏳ Upcoming |
-| Week 15 | Database Indexing & Query Optimization | ⏳ Upcoming |
-| Week 16 | Distributed Systems Fundamentals | ⏳ Upcoming |
-| Week 17 | System Design — Scalability Patterns | ⏳ Upcoming |
-| Week 18 | API Design — REST, gRPC & GraphQL | ⏳ Upcoming |
-| Week 19 | Event-Driven Architecture & Kafka | ⏳ Upcoming |
-| Week 20 | Docker & Kubernetes Deep Dive | ⏳ Upcoming |
-| Week 21 | GCP Architecture & Core Services | ⏳ Upcoming |
-| Week 22 | Data Engineering & ETL Patterns | ⏳ Upcoming |
-| Week 23 | BigQuery & Data Warehousing | ⏳ Upcoming |
-| Week 24 | Observability — Logs, Metrics, Traces | ⏳ Upcoming |
-| Week 25 | Performance Engineering & Caching | ⏳ Upcoming |
-| Week 26 | Application Security & Secure Design | ⏳ Upcoming |
-| Week 27 | Reliability Engineering & SRE Practices | ⏳ Upcoming |
-| Week 28 | Advanced Testing Strategies | ⏳ Upcoming |
-| Week 29 | Staff Engineering — Strategy & Leadership | ⏳ Upcoming |
+| [Week 8](weeks/week-08-salesforce-platform.md) | Salesforce Platform for Developers | ✅ Available |
+| [Week 9](weeks/week-09-apex-deep-dive.md) | Apex Deep Dive | ✅ Available |
+| [Week 10](weeks/week-10-salesforce-integration.md) | Salesforce Integration Patterns | ✅ Available |
+| [Week 11](weeks/week-11-salesforce-data-model-soql.md) | Salesforce Data Model & SOQL Mastery | ✅ Available |
+| [Week 12](weeks/week-12-advanced-python-internals.md) | Advanced Python — Internals & CPython | ✅ Available |
+| [Week 13](weeks/week-13-advanced-python-concurrency.md) | Advanced Python — Concurrency | ✅ Available |
+| [Week 14](weeks/week-14-postgresql-internals.md) | PostgreSQL Internals | ✅ Available |
+| [Week 15](weeks/week-15-database-indexing-optimization.md) | Database Indexing & Query Optimization | ✅ Available |
+| [Week 16](weeks/week-16-distributed-systems.md) | Distributed Systems Fundamentals | ✅ Available |
+| [Week 17](weeks/week-17-system-design-scalability.md) | System Design — Scalability Patterns | ✅ Available |
+| [Week 18](weeks/week-18-api-design.md) | API Design — REST, gRPC & GraphQL | ✅ Available |
+| [Week 19](weeks/week-19-event-driven-kafka.md) | Event-Driven Architecture & Kafka | ✅ Available |
+| [Week 20](weeks/week-20-docker-kubernetes.md) | Docker & Kubernetes Deep Dive | ✅ Available |
+| [Week 21](weeks/week-21-gcp-architecture.md) | GCP Architecture & Core Services | ✅ Available |
+| [Week 22](weeks/week-22-data-engineering-etl.md) | Data Engineering & ETL Patterns | ✅ Available |
+| [Week 23](weeks/week-23-bigquery-data-warehousing.md) | BigQuery & Data Warehousing | ✅ Available |
+| [Week 24](weeks/week-24-observability.md) | Observability — Logs, Metrics, Traces | ✅ Available |
+| [Week 25](weeks/week-25-performance-caching.md) | Performance Engineering & Caching | ✅ Available |
+| [Week 26](weeks/week-26-application-security.md) | Application Security & Secure Design | ✅ Available |
+| [Week 27](weeks/week-27-reliability-sre.md) | Reliability Engineering & SRE Practices | ✅ Available |
+| [Week 28](weeks/week-28-advanced-testing.md) | Advanced Testing Strategies | ✅ Available |
+| [Week 29](weeks/week-29-staff-engineering-leadership.md) | Staff Engineering — Strategy, Leadership & 2027 Planning | ✅ Available |
 
 ---
 
