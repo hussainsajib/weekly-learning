@@ -85,3 +85,4 @@ nav:
     - "Week 1 — Auth0 & Modern Identity": weeks/week-01-auth0-modern-identity.md
     - "Week 2 — OAuth 2.0 & OIDC Deep Dive": weeks/week-02-oauth2-oidc.md
     - "Week 3 — LLM Fundamentals": weeks/week-03-llm-fundamentals.md
+    - "Week 4 — Prompt Engineering & LLM Patterns": weeks/week-04-prompt-engineering.md
