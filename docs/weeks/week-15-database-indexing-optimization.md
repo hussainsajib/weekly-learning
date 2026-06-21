@@ -8,13 +8,13 @@
 
 ## Overview
 
-Database indexing is the single highest-leverage performance skill for backend engineers working with relational databases. In the AESF middleware, queue tables (`sync_queue`, `sync_status`) are the hottest tables in the system — every Salesforce-triggered sync event writes a row, and every Epic API callback reads and updates one. When those tables grow past a few hundred thousand rows without the right indexes, query latency climbs from milliseconds into seconds, and Epic sync latency follows directly. Understanding how PostgreSQL physically stores and retrieves data is the foundation for fixing that.
+Database indexing is the single highest-leverage performance skill for backend engineers working with relational databases. In the crm-middleware, queue tables (`sync_queue`, `sync_status`) are the hottest tables in the system — every Salesforce-triggered sync event writes a row, and every EHR system API callback reads and updates one. When those tables grow past a few hundred thousand rows without the right indexes, query latency climbs from milliseconds into seconds, and EHR sync latency follows directly. Understanding how PostgreSQL physically stores and retrieves data is the foundation for fixing that.
 
 PostgreSQL ships with several index types, each suited to a different access pattern. B-tree handles equality and range queries on scalar values and covers the vast majority of production workloads. GIN and GiST serve full-text search, JSONB, and geometric data. BRIN offers a compact option for naturally ordered, write-heavy append tables like time-series logs. Choosing the wrong index type — or adding no index at all — is the most common database performance mistake at the senior engineer level.
 
 Beyond index choice, the query planner is the intermediary between your SQL and your storage. PostgreSQL's planner uses column statistics, gathered by `ANALYZE`, to choose join strategies (hash join, merge join, nested loop), decide whether a sequential scan beats an index scan, and estimate intermediate row counts. When planner estimates are wildly wrong — which happens when statistics are stale or a column has high correlation — query plans can degrade catastrophically. Reading `EXPLAIN ANALYZE` output fluently is a non-negotiable skill.
 
-At the ORM layer, SQLAlchemy's convenience abstractions can silently generate expensive SQL. The canonical trap is the N+1 query: loading a list of parent objects and then triggering a separate SELECT per row to load a related child. In the AESF sync status flow, this manifests as one query per `SyncQueue` record to load its associated `Account` or `Policy` object — turning a 200-row result set into 201 round-trips. This guide covers every layer of the stack, from B-tree internals through `EXPLAIN ANALYZE` to SQLAlchemy `joinedload` patterns that eliminate N+1 entirely.
+At the ORM layer, SQLAlchemy's convenience abstractions can silently generate expensive SQL. The canonical trap is the N+1 query: loading a list of parent objects and then triggering a separate SELECT per row to load a related child. In the integration platform sync status flow, this manifests as one query per `SyncQueue` record to load its associated `Account` or `Policy` object — turning a 200-row result set into 201 round-trips. This guide covers every layer of the stack, from B-tree internals through `EXPLAIN ANALYZE` to SQLAlchemy `joinedload` patterns that eliminate N+1 entirely.
 
 ---
 
@@ -82,9 +82,9 @@ GiST is an extensible framework supporting lossy index structures for geometric 
 ```sql
 -- Example: index on a daterange column for policy effective period overlap queries
 CREATE INDEX idx_policy_effective_range_gist
-    ON aesf_policy USING gist (effective_range);
+    ON app_policy USING gist (effective_range);
 
-SELECT * FROM aesf_policy
+SELECT * FROM app_policy
 WHERE effective_range && '[2026-01-01, 2026-12-31]'::daterange;
 ```
 
@@ -448,7 +448,7 @@ with assert_query_count(session, 2):
 
 **Method 3: Datadog APM / pg_stat_statements**
 
-In the AESF middleware, Datadog APM traces show per-endpoint query counts. A spike to 200+ queries on a single `/sync/process` call is a N+1 indicator. Alternatively:
+In the crm-middleware, Datadog APM traces show per-endpoint query counts. A spike to 200+ queries on a single `/sync/process` call is a N+1 indicator. Alternatively:
 
 ```sql
 -- pg_stat_statements: find queries called many times per second
@@ -459,9 +459,9 @@ ORDER BY calls DESC
 LIMIT 20;
 ```
 
-### AESF-Specific Fix: Sync Status Bulk Load
+### Integration Platform-Specific Fix: Sync Status Bulk Load
 
-The AESF worker that processes `sync_queue` rows and checks `sync_status` for each had a classic N+1:
+The integration platform worker that processes `sync_queue` rows and checks `sync_status` for each had a classic N+1:
 
 ```python
 # Before (N+1):
@@ -520,7 +520,7 @@ WHERE n_dead_tup > 10000
 ORDER BY n_dead_tup DESC;
 ```
 
-For the AESF queue table, rows transition `pending → processing → completed` rapidly. Dead tuple accumulation is high. Consider:
+For the integration platform queue table, rows transition `pending → processing → completed` rapidly. Dead tuple accumulation is high. Consider:
 
 1. Tuning `autovacuum_vacuum_scale_factor` down from 0.2 to 0.01 for `sync_queue`.
 2. Archiving completed rows older than 7 days to a `sync_queue_archive` table.
@@ -536,9 +536,9 @@ ALTER TABLE sync_queue SET (
 
 ---
 
-## 9. Practical Index Design for AESF Queue Tables
+## 9. Practical Index Design for Integration Platform Queue Tables
 
-Putting it all together with concrete index recommendations for the AESF middleware schema.
+Putting it all together with concrete index recommendations for the crm-middleware schema.
 
 ```sql
 -- sync_queue: primary access patterns
@@ -644,7 +644,7 @@ SQLAlchemy ORM Loading Strategies
 
 **4.** Your `EXPLAIN ANALYZE` output shows `Batches: 4` on a hash join node. What does this mean and how do you resolve it?
 
-**5.** Describe a scenario in the AESF middleware where a BRIN index would be appropriate and one where it would not.
+**5.** Describe a scenario in the crm-middleware where a BRIN index would be appropriate and one where it would not.
 
 **6.** What is the `loops` field in `EXPLAIN ANALYZE` output, and why is ignoring it a common mistake?
 
@@ -666,7 +666,7 @@ SQLAlchemy ORM Loading Strategies
 
 **15.** You run `ANALYZE sync_queue` but the planner is still making poor row count estimates on the `status` column. What else can you do?
 
-**16.** The AESF worker processes `sync_queue` rows in batches of 500. Describe the N+1 problem that occurs when loading associated `Account` objects and provide the corrected SQLAlchemy code.
+**16.** The integration platform worker processes `sync_queue` rows in batches of 500. Describe the N+1 problem that occurs when loading associated `Account` objects and provide the corrected SQLAlchemy code.
 
 **17.** What is the `INCLUDE` clause in a `CREATE INDEX` statement and how does it enable an "Index Only Scan"?
 
@@ -674,7 +674,7 @@ SQLAlchemy ORM Loading Strategies
 
 **19.** Explain the difference between `autovacuum_vacuum_scale_factor` and `autovacuum_vacuum_threshold` and how you would tune them for a high-churn queue table.
 
-**20.** You are profiling a FastAPI endpoint in AESF that calls `session.query(SyncQueue).filter(...).all()` followed by per-row attribute access. `pg_stat_statements` shows the SELECT is called 350 times per request. What is happening and how do you fix it?
+**20.** You are profiling a FastAPI endpoint in the crm-middleware that calls `session.query(SyncQueue).filter(...).all()` followed by per-row attribute access. `pg_stat_statements` shows the SELECT is called 350 times per request. What is happening and how do you fix it?
 
 ---
 

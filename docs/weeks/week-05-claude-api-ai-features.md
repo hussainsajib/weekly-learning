@@ -12,7 +12,7 @@ By 2026, integrating LLM capabilities into backend services is no longer experim
 
 This week focuses on the Anthropic SDK and the Claude API — the most capable LLM API available to engineers as of mid-2026. Your existing stack is a natural fit: FastAPI for AI-powered HTTP endpoints, SQLAlchemy for caching usage metadata, and GKE for hosting inference-adjacent services. Understanding the internals — why prompt caching works as a prefix match, why streaming is mandatory above certain token thresholds, why tool use requires a loop — is what separates an engineer who integrates AI from one who architects around it.
 
-In the AESF context, the most immediately applicable patterns are: using Claude to enrich Salesforce records or classify data from Epic EHR, building a FastAPI middleware layer that proxies Claude calls with proper rate-limit handling and cost tracking, and using prompt caching to reduce costs when the same large document (e.g., a policy schema or EHR context blob) is referenced across many requests. The ETL side is equally relevant — Claude can serve as a document-understanding or data-extraction layer sitting between Pentaho outputs and downstream Salesforce writes.
+In the integration platform context, the most immediately applicable patterns are: using Claude to enrich Salesforce records or classify data from the EHR system, building a FastAPI middleware layer that proxies Claude calls with proper rate-limit handling and cost tracking, and using prompt caching to reduce costs when the same large document (e.g., a policy schema or EHR context blob) is referenced across many requests. The ETL side is equally relevant — Claude can serve as a document-understanding or data-extraction layer sitting between Pentaho outputs and downstream Salesforce writes.
 
 After studying this week, you should be able to: build a production-grade FastAPI service that wraps the Claude API with streaming, caching, and error handling; reason about token costs and implement prompt caching correctly; use tool use to build agentic workflows; and select the right model tier for a given workload. You will also understand the sharp edges — the silent cache invalidators, the rate limit headers that matter, the token counting mistakes that cause cost surprises.
 
@@ -63,7 +63,7 @@ response = client.with_options(timeout=5.0).messages.create(
 )
 ```
 
-**AESF Application:** In `aesf-py-middleware`, the `client = anthropic.Anthropic()` initialization belongs in your `app/core/config.py` or as a FastAPI dependency — not in request handlers. Create it once at startup, reuse it across requests. The SDK handles connection pooling internally via httpx.
+**Integration Platform Application:** In `crm-middleware`, the `client = anthropic.Anthropic()` initialization belongs in your `app/core/config.py` or as a FastAPI dependency — not in request handlers. Create it once at startup, reuse it across requests. The SDK handles connection pooling internally via httpx.
 
 ### Common Mistake: Recreating the Client Per Request
 
@@ -182,7 +182,7 @@ The Anthropic Python SDK will raise a `ValueError` if you request more than ~16,
 with client.messages.stream(
     model="claude-opus-4-8",
     max_tokens=64000,
-    messages=[{"role": "user", "content": "Write a detailed analysis of this Epic EHR data..."}]
+    messages=[{"role": "user", "content": "Write a detailed analysis of this EHR system data..."}]
 ) as stream:
     for text in stream.text_stream:
         print(text, end="", flush=True)
@@ -256,15 +256,15 @@ tools = [
             "properties": {
                 "account_id": {
                     "type": "string",
-                    "description": "The Salesforce Account ID (18-char AESF namespace ID)"
+                    "description": "The Salesforce Account ID (18-char platform namespace ID)"
                 }
             },
             "required": ["account_id"]
         }
     },
     {
-        "name": "get_epic_client",
-        "description": "Fetch client data from Epic EHR by client code. Use when you need EHR data to cross-reference with Salesforce.",
+        "name": "get_ehr_client",
+        "description": "Fetch client data from the EHR system by client code. Use when you need EHR data to cross-reference with Salesforce.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -279,9 +279,9 @@ tools = [
 def execute_tool(name: str, tool_input: dict) -> str:
     """Your actual tool implementation — calls middleware API, Salesforce, etc."""
     if name == "get_salesforce_account":
-        # Call aesf-py-middleware or directly via simple-salesforce
+        # Call crm-middleware or directly via simple-salesforce
         return json.dumps({"Name": "Acme Corp", "Industry": "Technology"})
-    elif name == "get_epic_client":
+    elif name == "get_ehr_client":
         return json.dumps({"client_code": tool_input["client_code"], "status": "Active"})
     return "Tool not found"
 
@@ -320,7 +320,7 @@ def run_agent(user_message: str) -> str:
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
 
-result = run_agent("What is the current status of Salesforce account 0013x00001ABC123 and does their Epic client data match?")
+result = run_agent("What is the current status of Salesforce account 0013x00001ABC123 and does their EHR client data match?")
 print(result)
 ```
 
@@ -335,11 +335,11 @@ client = Anthropic()
 
 @beta_tool
 def search_policy_database(policy_number: str, include_lines: bool = False) -> str:
-    """Search the AESF policy database for a policy record.
+    """Search the integration platform policy database for a policy record.
 
     Args:
-        policy_number: The AESF__Policy__c policy number from Salesforce.
-        include_lines: Whether to include associated AESF__Line__c records.
+        policy_number: The APP__Policy__c policy number from Salesforce.
+        include_lines: Whether to include associated APP__Line__c records.
     """
     # Your actual implementation
     return f"Policy {policy_number}: Active, renewal due 2027-01-15"
@@ -377,7 +377,7 @@ messages.append({"role": "user", "content": tool_results})           # Then resu
 
 ### Supported Input Methods
 
-Claude supports two ways to provide images: base64 encoding (works anywhere) and URL references (image must be publicly accessible). In the AESF context, base64 is almost always the right choice since you're working with internal documents and EHR data.
+Claude supports two ways to provide images: base64 encoding (works anywhere) and URL references (image must be publicly accessible). In the integration platform context, base64 is almost always the right choice since you're working with internal documents and EHR data.
 
 ```python
 import anthropic
@@ -431,7 +431,7 @@ response = client.messages.create(
     messages=[{
         "role": "user",
         "content": [
-            {"type": "text", "text": "Compare these two Epic EHR screenshots and identify what changed:"},
+            {"type": "text", "text": "Compare these two EHR system screenshots and identify what changed:"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": before_b64}},
             {"type": "text", "text": "BEFORE"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": after_b64}},
@@ -445,7 +445,7 @@ response = client.messages.create(
 
 ```python
 # WRONG — Claude cannot access your internal network or auth-gated URLs
-{"type": "image", "source": {"type": "url", "url": "https://internal.aesf.com/doc.png"}}
+{"type": "image", "source": {"type": "url", "url": "https://internal.example.com/doc.png"}}
 
 # RIGHT — base64 for anything that isn't a public URL
 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64_data}}
@@ -475,12 +475,12 @@ client = anthropic.Anthropic()
 
 # Large stable system prompt — this is what we want to cache
 LARGE_SYSTEM_PROMPT = """
-You are an expert insurance data analyst working with the AESF (Applied Epic for Salesforce) platform.
-You understand the data model including AESF__Policy__c, AESF__Line__c, AESF__Plan__c objects.
+You are an expert insurance data analyst working with the CRM-EHR Integration Platform.
+You understand the data model including APP__Policy__c, APP__Line__c, APP__Plan__c objects.
 Key rules:
-- Policy types map to Epic policy_type codes via AESF__Policy_Type__c lookup
+- Policy types map to EHR policy_type codes via APP__Policy_Type__c lookup
 - All monetary values are in USD unless noted
-- Epic Structure Combinations determine servicing hierarchies
+- EHR Structure Combinations determine servicing hierarchies
 [... 5000+ more tokens of context ...]
 """
 
@@ -829,7 +829,7 @@ import anthropic
 import asyncio
 from datetime import datetime
 
-app = FastAPI(title="AESF AI Service")
+app = FastAPI(title="Integration Platform AI Service")
 
 
 # --- Models ---
@@ -854,7 +854,7 @@ def get_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic()
 
 CLASSIFICATION_SYSTEM = """
-You are a Salesforce data classifier for the AESF (Applied Epic for Salesforce) platform.
+You are a Salesforce data classifier for the CRM-EHR Integration Platform.
 Classify user input into one of the provided categories.
 Respond with valid JSON only: {"category": "...", "confidence": "high|medium|low", "reasoning": "..."}
 """
@@ -868,7 +868,7 @@ async def classify_text(
     background_tasks: BackgroundTasks,
     client: anthropic.AsyncAnthropic = Depends(get_client),
 ):
-    """Classify text into AESF data categories using Claude."""
+    """Classify text into integration platform data categories using Claude."""
     categories_str = ", ".join(request.categories)
 
     try:
@@ -979,7 +979,7 @@ response = client.messages.create(
     max_tokens=16000,
     thinking={"type": "adaptive", "display": "summarized"},  # Show thinking summaries
     output_config={"effort": "high"},  # low | medium | high | xhigh | max
-    messages=[{"role": "user", "content": "Design a data reconciliation algorithm for syncing Salesforce Opportunities with Epic EHR opportunities, handling conflict resolution when both sides update simultaneously."}]
+    messages=[{"role": "user", "content": "Design a data reconciliation algorithm for syncing Salesforce Opportunities with EHR system opportunities, handling conflict resolution when both sides update simultaneously."}]
 )
 
 for block in response.content:
@@ -1113,7 +1113,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **14.** Describe two distinct approaches to structured output with Claude (beyond just prompting for JSON). What are the trade-offs of each?
 
-**15.** In the AESF middleware context, you want Claude to analyze incoming Salesforce webhook payloads and enrich them with Epic EHR data before writing to the queue tables. Sketch the tool definitions you would create and explain the loop flow.
+**15.** In the crm-middleware context, you want Claude to analyze incoming Salesforce webhook payloads and enrich them with EHR system data before writing to the queue tables. Sketch the tool definitions you would create and explain the loop flow.
 
 **16.** What is `stream.get_final_message()` and why is it preferred over collecting streaming chunks manually in most API use cases?
 
@@ -1121,9 +1121,9 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **18.** You receive a `RateLimitError`. The response header `retry-after` says 45 seconds. Your exponential backoff formula gives a 3-second wait. Which should you use and why?
 
-**19.** When should you use `tool_choice: {"type": "any"}` versus `{"type": "auto"}`? Give a concrete AESF example for each.
+**19.** When should you use `tool_choice: {"type": "any"}` versus `{"type": "auto"}`? Give a concrete integration platform example for each.
 
-**20.** You are designing a batch processing job that uses Claude to extract structured data from 50,000 Epic EHR documents overnight. What API surface would you use instead of individual `messages.create()` calls, and what is the cost benefit?
+**20.** You are designing a batch processing job that uses Claude to extract structured data from 50,000 EHR system documents overnight. What API surface would you use instead of individual `messages.create()` calls, and what is the cost benefit?
 
 ---
 
@@ -1170,7 +1170,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **14.** Two approaches: (1) **Structured outputs via `output_config.format`** — set `output_config={"format": {"type": "json_schema", "schema": {...}}}`. Claude's output is guaranteed to validate against your schema. No need for a prefill or parsing errors. Best for extracting well-defined data. Tradeoff: first-request latency as the schema is compiled (24-hour cache after that). (2) **Strict tool use via `strict: true`** — add `"strict": True` to a tool definition alongside `additionalProperties: False` and `required` on all fields. Claude's `tool_use.input` will always be valid per schema. Best when you want structured *actions* rather than structured *text output*. Tradeoff: only applies to tool call inputs, not to the final text response.
 
-    **15.** Two tool definitions: `get_salesforce_account(account_id: str)` — fetches Account data from AESF Salesforce via the middleware API; and `get_epic_client(client_code: str, include_policies: bool)` — fetches client data from Epic EHR via the middleware. The loop flow: (1) Claude receives the webhook payload as the user message, (2) Claude calls `get_salesforce_account` to get current Salesforce data, (3) Your code executes the middleware call and returns the result, (4) Claude calls `get_epic_client` to get EHR context, (5) Your code executes and returns, (6) Claude generates an enriched payload recommendation and reaches `end_turn`, (7) You write the result to the queue table. Tool descriptions should specify *when* to call them, not just what they do.
+    **15.** Two tool definitions: `get_salesforce_account(account_id: str)` — fetches Account data from Salesforce via the crm-middleware API; and `get_ehr_client(client_code: str, include_policies: bool)` — fetches client data from the EHR system via the middleware. The loop flow: (1) Claude receives the webhook payload as the user message, (2) Claude calls `get_salesforce_account` to get current Salesforce data, (3) Your code executes the middleware call and returns the result, (4) Claude calls `get_ehr_client` to get EHR context, (5) Your code executes and returns, (6) Claude generates an enriched payload recommendation and reaches `end_turn`, (7) You write the result to the queue table. Tool descriptions should specify *when* to call them, not just what they do.
 
     **16.** `stream.get_final_message()` is a helper method available inside the `messages.stream()` context manager that waits for the stream to complete and returns a fully-assembled `Message` object — identical in structure to what `messages.create()` returns (with `usage`, `stop_reason`, `content` with all blocks). It is preferred over manual chunk collection because: (1) it handles reconnection and partial assembly internally, (2) it guarantees you have the complete usage statistics including `cache_read_input_tokens`, and (3) it simplifies downstream code that only needs the final result and not the streaming events. Use raw event iteration only when you need per-token delivery to a user interface.
 
@@ -1178,6 +1178,6 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **18.** Use the `retry-after` header value (45 seconds), not your computed backoff (3 seconds). The `retry-after` header is set by the API based on when the rate limit will actually reset. Retrying before this time will result in another rate limit error. Your exponential backoff formula is designed as a fallback heuristic for when no server guidance is available — when the server tells you exactly when to retry, that value takes precedence. In code: `retry_after = int(e.response.headers.get("retry-after", your_computed_backoff))` and then `time.sleep(retry_after + random.uniform(0, 1))` (small jitter to prevent thundering herd).
 
-    **19.** Use `tool_choice: {"type": "any"}` when you require Claude to use a tool on every turn — for example, when building a structured extraction pipeline where every response must be a `extract_policy_data` tool call, not free text. You want to guarantee a structured output format. Use `tool_choice: {"type": "auto"}` (the default) when Claude should decide whether a tool is needed — for example, an AESF assistant that can answer simple questions from context but should call `get_account_data` only when it actually needs fresh Salesforce data. `auto` produces more natural behavior in conversational agents; `any` is better for guaranteed structured pipelines.
+    **19.** Use `tool_choice: {"type": "any"}` when you require Claude to use a tool on every turn — for example, when building a structured extraction pipeline where every response must be a `extract_policy_data` tool call, not free text. You want to guarantee a structured output format. Use `tool_choice: {"type": "auto"}` (the default) when Claude should decide whether a tool is needed — for example, an integration platform assistant that can answer simple questions from context but should call `get_account_data` only when it actually needs fresh Salesforce data. `auto` produces more natural behavior in conversational agents; `any` is better for guaranteed structured pipelines.
 
     **20.** Use the **Message Batches API** (`client.messages.batches.create()`). It processes up to 100,000 requests asynchronously and costs 50% of standard pricing — half price for input and output tokens. For 50,000 documents at Opus pricing, this is a significant saving. The trade-off is latency: batches complete within 1 hour (sometimes much faster), not in real-time. This is ideal for overnight ETL jobs. Implementation: create a batch with all 50,000 requests, poll `client.messages.batches.retrieve(batch_id).processing_status` until `"ended"`, then stream results with `client.messages.batches.results(batch_id)`. Match results to inputs via `custom_id` — results arrive in unpredictable order, so never assume position corresponds to submission order.

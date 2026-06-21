@@ -8,13 +8,13 @@
 
 ## Overview
 
-Retrieval-Augmented Generation (RAG) is an architecture pattern that addresses one of the core limitations of large language models: their knowledge is frozen at training time and they cannot reason over private, domain-specific, or recently updated data. RAG solves this by splitting the problem into two phases — first *retrieve* the most relevant context from a corpus of documents, then *generate* a response conditioned on that retrieved context. The retrieval step is powered by vector similarity search, which finds semantically related chunks even when keyword overlap is absent. For an engineer like you working on the AESF middleware, this means you could build a system that answers questions about Epic policy types, Salesforce object schemas, or ETL job history without fine-tuning a model or stuffing a 100,000-token prompt.
+Retrieval-Augmented Generation (RAG) is an architecture pattern that addresses one of the core limitations of large language models: their knowledge is frozen at training time and they cannot reason over private, domain-specific, or recently updated data. RAG solves this by splitting the problem into two phases — first *retrieve* the most relevant context from a corpus of documents, then *generate* a response conditioned on that retrieved context. The retrieval step is powered by vector similarity search, which finds semantically related chunks even when keyword overlap is absent. For an engineer like you working on the CRM-EHR Integration Platform middleware, this means you could build a system that answers questions about EHR system policy types, Salesforce object schemas, or ETL job history without fine-tuning a model or stuffing a 100,000-token prompt.
 
 Vector databases store high-dimensional numerical representations of text (embeddings) and answer approximate-nearest-neighbor queries against them in milliseconds. The key insight is that an embedding model maps semantically similar phrases to nearby points in vector space — so "property damage liability coverage" and "PDL policy" end up close together even though they share no words. This property enables a retrieval layer that can bridge the gap between how humans phrase questions and how documents are actually written, which is especially valuable in domains like insurance EHR integration where jargon is dense and inconsistent.
 
 The architecture has several moving parts that interact: a chunking pipeline that splits source documents into embedding-sized pieces, an embedding model that converts those chunks to vectors, a vector store that indexes and serves similarity queries, and an LLM that synthesizes a final answer from the retrieved chunks plus the original question. Each of these components has its own quality/performance tradeoffs, and getting them right requires understanding the full pipeline end-to-end. A weak link anywhere — over-aggressive chunking, a mismatched embedding model, poorly tuned HNSW parameters, or an LLM with too small a context window — will degrade the final answer quality.
 
-For the AESF project specifically, you already have PostgreSQL infrastructure with the `pgvector` extension available. This means you can add semantic search capabilities to the existing middleware without introducing a new managed service. A well-designed RAG layer over your Epic schema documentation, Salesforce knowledge base articles, and policy type definitions could dramatically reduce the time engineers spend context-switching between documentation systems when debugging sync failures or writing new trigger handlers.
+For the integration platform specifically, you already have PostgreSQL infrastructure with the `pgvector` extension available. This means you can add semantic search capabilities to the existing middleware without introducing a new managed service. A well-designed RAG layer over your EHR system schema documentation, Salesforce knowledge base articles, and policy type definitions could dramatically reduce the time engineers spend context-switching between documentation systems when debugging sync failures or writing new trigger handlers.
 
 ---
 
@@ -35,7 +35,7 @@ User question → Embedding model → Vector store (similarity search) → Top-k
     → Prompt assembly → LLM → Answer
 ```
 
-The indexing path runs as a batch job or incremental pipeline. In the AESF context you could trigger re-indexing whenever a new Salesforce object schema is deployed or a new Epic endpoint is documented. The query path runs synchronously inside the FastAPI middleware — a new `/search` or `/ask` endpoint that wraps both retrieval and generation.
+The indexing path runs as a batch job or incremental pipeline. In the integration platform context you could trigger re-indexing whenever a new Salesforce object schema is deployed or a new EHR system endpoint is documented. The query path runs synchronously inside the FastAPI middleware — a new `/search` or `/ask` endpoint that wraps both retrieval and generation.
 
 ### Minimal FastAPI RAG endpoint
 
@@ -161,9 +161,9 @@ def recursive_chunks(
     return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 ```
 
-### Document-aware chunking (for AESF)
+### Document-aware chunking (for the integration platform)
 
-Epic schema documentation and Salesforce field definitions have structured formats. Prefer chunking at object/field boundaries rather than arbitrary token counts:
+EHR system schema documentation and Salesforce field definitions have structured formats. Prefer chunking at object/field boundaries rather than arbitrary token counts:
 
 ```python
 import json
@@ -213,7 +213,7 @@ An embedding model maps text to a fixed-length float vector. The choice of model
 | Latency | ANN query (fast) | Inverted index (fast) |
 | Examples | `text-embedding-3-small`, `all-MiniLM-L6-v2` | BM25, SPLADE, `opensearch` |
 
-**Dense models** are the default for RAG because they capture semantic meaning. For AESF you want a model trained on a domain close to insurance/healthcare. `text-embedding-3-small` (OpenAI) or `BAAI/bge-base-en-v1.5` (open-source, 768-dim) are strong baselines.
+**Dense models** are the default for RAG because they capture semantic meaning. For the integration platform you want a model trained on a domain close to insurance/healthcare. `text-embedding-3-small` (OpenAI) or `BAAI/bge-base-en-v1.5` (open-source, 768-dim) are strong baselines.
 
 **Embedding dimensions** affect both quality and storage. 1536-dim embeddings are more expressive but require more RAM and disk. For pgvector on PostgreSQL, a 1536-dim vector index on 500,000 rows consumes roughly 3 GB of memory. Start with 768-dim if resources are constrained.
 
@@ -253,7 +253,7 @@ class Embedder:
 
 ## 4. pgvector — RAG on Your Existing PostgreSQL
 
-Since AESF already runs PostgreSQL (Cloud SQL or Kubernetes-hosted), `pgvector` is the lowest-friction path to production vector search. You get ACID transactions, row-level security, and the ability to JOIN vector results with your existing relational tables in a single query.
+Since the integration platform already runs PostgreSQL (Cloud SQL or Kubernetes-hosted), `pgvector` is the lowest-friction path to production vector search. You get ACID transactions, row-level security, and the ability to JOIN vector results with your existing relational tables in a single query.
 
 ### Schema with Alembic migration
 
@@ -396,7 +396,7 @@ SET hnsw.ef_search = 100;
 | `ef_construction` | Build-time beam width — higher = better index quality, slower build | 32–128 |
 | `ef_search` | Query-time beam width — higher = better recall, slower query | 40–200 |
 
-**HNSW vs IVFFlat for AESF:** HNSW is preferred for the RAG use case because it maintains good recall as you add new documents (no need to rebuild the index), whereas IVFFlat degrades and eventually needs a full REINDEX as data grows. The memory overhead (~1.3× the vector data size for default parameters) is acceptable for a few hundred thousand policy documents.
+**HNSW vs IVFFlat for the integration platform:** HNSW is preferred for the RAG use case because it maintains good recall as you add new documents (no need to rebuild the index), whereas IVFFlat degrades and eventually needs a full REINDEX as data grows. The memory overhead (~1.3× the vector data size for default parameters) is acceptable for a few hundred thousand policy documents.
 
 **Common mistake:** Setting `ef_construction` too low to save build time, then being surprised by poor recall. The index build is a one-time cost — spend it. A well-built HNSW index with `m=16, ef_construction=128` has 10–30× better recall at a given query latency than one built with defaults.
 
@@ -404,7 +404,7 @@ SET hnsw.ef_search = 100;
 
 ## 6. Hybrid Search — Combining Dense and Sparse Retrieval
 
-Neither dense nor sparse retrieval is universally better. Dense retrieval wins on semantic similarity; sparse (keyword) retrieval wins on exact term matching, which matters when users search for specific Epic field names, Salesforce API names, or error codes.
+Neither dense nor sparse retrieval is universally better. Dense retrieval wins on semantic similarity; sparse (keyword) retrieval wins on exact term matching, which matters when users search for specific EHR system field names, Salesforce API names, or error codes.
 
 Hybrid search runs both retrievers and fuses the result lists using **Reciprocal Rank Fusion (RRF)** or a weighted score combination.
 
@@ -494,7 +494,7 @@ When pgvector isn't the right fit (e.g., you need multi-tenant vector isolation,
 | Hybrid search | Manual (FTS + pgvector) | Built-in (sparse-dense) | Built-in (BM25 + vector) | Dense only |
 | ACID transactions | Yes | No | No | No |
 | Cost at 1M vectors | Infrastructure only | ~$70/mo (starter) | Infrastructure or ~$25/mo | Free (local) |
-| AESF fit | Best — reuse existing infra | Good for production scale | Good — built-in RAG modules | Good for local dev/testing |
+| Integration platform fit | Best — reuse existing infra | Good for production scale | Good — built-in RAG modules | Good for local dev/testing |
 
 ### Chroma — local development and testing
 
@@ -507,14 +507,14 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 
 client = chromadb.Client()
 ef = SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-base-en-v1.5")
-collection = client.create_collection("aesf_docs", embedding_function=ef)
+collection = client.create_collection("platform_docs", embedding_function=ef)
 
-# Index some AESF policy type descriptions
+# Index some integration platform policy type descriptions
 collection.add(
     documents=[
-        "AESF__Policy_Type__c represents the category of insurance policy in Epic.",
-        "The Line of Business field maps to Epic's LOB code in the BDE backend.",
-        "Opportunity sync failure usually indicates a missing Epic client ID on the Account.",
+        "APP__Policy_Type__c represents the category of insurance policy in the EHR system.",
+        "The Line of Business field maps to the EHR system's LOB code in the BDE backend.",
+        "Opportunity sync failure usually indicates a missing EHR client ID on the Account.",
     ],
     ids=["pt-1", "lob-1", "opp-err-1"],
 )
@@ -559,13 +559,13 @@ from ragas.metrics import answer_relevancy, context_precision, context_recall, f
 
 samples = [
     {
-        "question": "What Salesforce object stores Epic policy types?",
-        "answer": "AESF__Policy_Type__c stores Epic policy types in Salesforce.",
+        "question": "What Salesforce object stores EHR system policy types?",
+        "answer": "APP__Policy_Type__c stores EHR system policy types in Salesforce.",
         "contexts": [
-            "AESF__Policy_Type__c represents the category of insurance policy synced from Epic.",
-            "Policy types are synced one-way from Epic to Salesforce via the ETL pipeline.",
+            "APP__Policy_Type__c represents the category of insurance policy synced from the EHR system.",
+            "Policy types are synced one-way from the EHR system to Salesforce via the ETL pipeline.",
         ],
-        "ground_truth": "The AESF__Policy_Type__c object stores Epic policy types.",
+        "ground_truth": "The APP__Policy_Type__c object stores EHR system policy types.",
     }
 ]
 
@@ -581,39 +581,39 @@ print(results)
 
 ---
 
-## 9. AESF-Specific RAG Application Patterns
+## 9. Integration Platform RAG Application Patterns
 
-The AESF middleware is a natural host for RAG capabilities because it already sits between Salesforce and Epic, owns the data schemas, and serves a team that regularly needs to answer questions about sync behavior.
+The crm-middleware is a natural host for RAG capabilities because it already sits between Salesforce and the EHR system, owns the data schemas, and serves a team that regularly needs to answer questions about sync behavior.
 
-### Use case 1 — Semantic search over Epic schema documentation
+### Use case 1 — Semantic search over EHR system schema documentation
 
-Index the Epic EHR API spec (endpoint descriptions, field definitions) so engineers can ask "which Epic endpoint handles marketing submission line items?" instead of scanning a 300-page PDF.
+Index the EHR system API spec (endpoint descriptions, field definitions) so engineers can ask "which EHR system endpoint handles marketing submission line items?" instead of scanning a 300-page PDF.
 
 ### Use case 2 — Policy type resolution
 
-When Epic returns an unrecognized policy type code, query the vector index to find the closest known `AESF__Policy_Type__c` record and suggest a mapping. This turns a silent sync failure into a recoverable warning.
+When the EHR system returns an unrecognized policy type code, query the vector index to find the closest known `APP__Policy_Type__c` record and suggest a mapping. This turns a silent sync failure into a recoverable warning.
 
 ```python
 async def resolve_policy_type(
-    epic_code: str,
+    ehr_code: str,
     session: AsyncSession,
 ) -> list[dict]:
-    """Find the closest known AESF policy types for an unrecognized Epic code."""
-    query = f"Epic policy type code: {epic_code}"
+    """Find the closest known integration platform policy types for an unrecognized EHR code."""
+    query = f"EHR system policy type code: {ehr_code}"
     results = await semantic_search(q=query, top_k=3, session=session)
     return [r for r in results if r["score"] > 0.75]
 ```
 
 ### Use case 3 — Salesforce knowledge base Q&A
 
-Index Salesforce Knowledge articles (exported as JSON) so support engineers can ask natural-language questions about AESF configuration without leaving the middleware admin panel.
+Index Salesforce Knowledge articles (exported as JSON) so support engineers can ask natural-language questions about integration platform configuration without leaving the middleware admin panel.
 
 ### Integration architecture
 
 ```
-[Epic API spec PDF]  ─┐
+[EHR API spec PDF]   ─┐
 [SF Knowledge JSON]  ─┼─▶ Indexer job (async, Kubernetes CronJob) ─▶ pgvector (document_chunks)
-[AESF CLAUDE.md]    ─┘                                                        │
+[Platform CLAUDE.md] ─┘                                                        │
                                                                                ▼
 User/Engineer ──▶ FastAPI /rag/search or /rag/ask ──▶ Embedding ──▶ pgvector query ──▶ LLM
 ```
@@ -636,7 +636,7 @@ RAG Architecture
 │   │   ├── Dense  (semantic similarity)  → bge-base, text-embedding-3-small
 │   │   └── Sparse (keyword matching)     → BM25, SPLADE
 │   └── Vector Stores
-│       ├── pgvector      (AESF: reuse PostgreSQL, ACID, JOIN-able)
+│       ├── pgvector      (integration platform: reuse PostgreSQL, ACID, JOIN-able)
 │       ├── Pinecone      (managed, billion-scale)
 │       ├── Weaviate      (built-in hybrid search + modules)
 │       └── Chroma        (local dev / testing only)
@@ -676,7 +676,7 @@ RAG Architecture
 
 **7.** You build an IVFFlat index with `lists = 100` on a table with only 200 rows. What happens and why?
 
-**8.** In the AESF context, why is pgvector preferable to a managed vector database like Pinecone for the initial RAG deployment?
+**8.** In the integration platform context, why is pgvector preferable to a managed vector database like Pinecone for the initial RAG deployment?
 
 **9.** What does the `ef_construction` parameter in HNSW control, and when should you increase it?
 
@@ -684,13 +684,13 @@ RAG Architecture
 
 **11.** What is the difference between context precision and context recall in RAGAS?
 
-**12.** You want to re-index AESF documents incrementally without re-embedding unchanged chunks. What field would you add to the `document_chunks` table to support this?
+**12.** You want to re-index integration platform documents incrementally without re-embedding unchanged chunks. What field would you add to the `document_chunks` table to support this?
 
 **13.** A chunk retrieved from the vector store has a cosine distance of `0.85`. What does this imply about its relevance?
 
 **14.** Why should you not use Chroma's in-memory client in a production FastAPI application?
 
-**15.** What chunking strategy is best suited for the AESF Epic schema JSON that has structured object/field definitions?
+**15.** What chunking strategy is best suited for the EHR system schema JSON that has structured object/field definitions?
 
 **16.** Describe how you would use a single PostgreSQL query to perform hybrid search combining pgvector cosine distance with full-text search ranking.
 
@@ -698,7 +698,7 @@ RAG Architecture
 
 **18.** You run RAGAS and find low context recall. What does this mean, and what part of the pipeline should you adjust?
 
-**19.** What embedding dimension would you choose for 500,000 AESF documents stored in Cloud SQL PostgreSQL, and what is the approximate memory cost of the HNSW index?
+**19.** What embedding dimension would you choose for 500,000 integration platform documents stored in Cloud SQL PostgreSQL, and what is the approximate memory cost of the HNSW index?
 
 **20.** Explain the indexing-path / query-path separation in RAG and why it matters for production systems.
 
@@ -722,7 +722,7 @@ RAG Architecture
 
     **7.** IVFFlat tries to build `lists = 100` clusters using k-means on 200 rows. With fewer than `lists * 10` rows the clusters are poorly defined — several centroids will end up with 0 or 1 document, making the index essentially useless. PostgreSQL may emit a warning or silently create a degraded index. You should always ensure `n_rows >= lists * 10` before building an IVFFlat index; for small datasets, skip the index or use HNSW.
 
-    **8.** pgvector reuses the existing PostgreSQL infrastructure already running in the AESF GKE cluster (Cloud SQL or self-hosted), avoiding a new managed service, new credentials, and new network egress costs. pgvector supports ACID transactions, row-level security, and JOIN operations — for example, filtering retrieved chunks by `metadata->>'object_name'` while simultaneously joining against the `aesf_policies` table. It also keeps the operational footprint minimal for a team already expert in PostgreSQL.
+    **8.** pgvector reuses the existing PostgreSQL infrastructure already running in the integration platform GKE cluster (Cloud SQL or self-hosted), avoiding a new managed service, new credentials, and new network egress costs. pgvector supports ACID transactions, row-level security, and JOIN operations — for example, filtering retrieved chunks by `metadata->>'object_name'` while simultaneously joining against the platform policies table. It also keeps the operational footprint minimal for a team already expert in PostgreSQL.
 
     **9.** `ef_construction` controls the beam width used during HNSW graph construction — how many candidate neighbors are evaluated when adding each new node to the graph. Higher values produce a better-connected graph with higher recall but increase build time. Increase it when you observe low recall on benchmark queries after building the index; a value of 128 is a good production default. The build is a one-time cost so investing in quality is almost always worthwhile.
 
@@ -736,7 +736,7 @@ RAG Architecture
 
     **14.** Chroma's default in-memory client stores all data in process memory with no persistence, meaning data is lost on restart. More critically, the in-memory client is not thread-safe and will corrupt its internal state under concurrent FastAPI requests. For production use, pgvector with your existing PostgreSQL cluster provides persistence, concurrency safety via PostgreSQL's MVCC, and ACID guarantees. Use Chroma only in local scripts and notebooks where these properties are not required.
 
-    **15.** Document-aware chunking is best: parse the schema JSON and emit one chunk per Epic object header and one chunk per field definition. This keeps each chunk semantically self-contained (all context about a single field in one place) and avoids splitting related fields across chunks. It also enables precise metadata tagging (`object_name`, `field_name`, `field_type`) that supports metadata filtering at query time — e.g., "only search within the Policy object."
+    **15.** Document-aware chunking is best: parse the schema JSON and emit one chunk per EHR system object header and one chunk per field definition. This keeps each chunk semantically self-contained (all context about a single field in one place) and avoids splitting related fields across chunks. It also enables precise metadata tagging (`object_name`, `field_name`, `field_type`) that supports metadata filtering at query time — e.g., "only search within the Policy object."
 
     **16.** Run two CTEs in a single query: one selecting the top-N dense results with `ORDER BY embedding <=> $query_vec LIMIT N`, another selecting the top-N sparse results using `WHERE content @@ plainto_tsquery('english', $query_text) ORDER BY ts_rank(...) DESC LIMIT N`. Then UNION the two CTEs, apply RRF scoring in the outer query using `ROW_NUMBER() OVER (ORDER BY ...)` for each list, and return the top-k by combined RRF score. This avoids two round-trips to the database.
 
@@ -746,4 +746,4 @@ RAG Architecture
 
     **19.** For 500,000 documents at 768 dimensions, each vector costs `768 × 4 bytes = 3,072 bytes` (float32). The raw vector data is `500,000 × 3,072 ≈ 1.5 GB`. An HNSW index with `m = 16` stores approximately `m × 2 × 4 bytes` per node in graph overhead ≈ `500,000 × 128 bytes ≈ 64 MB` for graph links, plus the vector data itself. Total index memory is roughly `1.6–2.0 GB`. This is comfortably within the memory budget of a Cloud SQL Postgres instance with 4+ GB RAM, making 768-dim a practical choice over 1536-dim (which would roughly double the cost).
 
-    **20.** The indexing path (document loading → chunking → embedding → vector store upsert) runs offline, asynchronously, and independently of user traffic — typically as a Kubernetes CronJob or an event-driven pipeline triggered on document changes. The query path (user question → embedding → vector search → LLM generation) runs synchronously on every user request and must meet a latency SLA (typically < 2 seconds). Separating them means the expensive batch work of re-indexing thousands of documents never blocks user requests, and the query path can be horizontally scaled independently from the indexing workers. In AESF, this maps naturally to a separate `indexer` Kubernetes Deployment with its own resource limits, decoupled from the FastAPI middleware pods.
+    **20.** The indexing path (document loading → chunking → embedding → vector store upsert) runs offline, asynchronously, and independently of user traffic — typically as a Kubernetes CronJob or an event-driven pipeline triggered on document changes. The query path (user question → embedding → vector search → LLM generation) runs synchronously on every user request and must meet a latency SLA (typically < 2 seconds). Separating them means the expensive batch work of re-indexing thousands of documents never blocks user requests, and the query path can be horizontally scaled independently from the indexing workers. In the integration platform, this maps naturally to a separate `indexer` Kubernetes Deployment with its own resource limits, decoupled from the FastAPI middleware pods.

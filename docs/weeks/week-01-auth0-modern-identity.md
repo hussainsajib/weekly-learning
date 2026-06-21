@@ -8,7 +8,7 @@
 
 ## Overview
 
-Identity and authentication are the front door to every system you build. Auth0 is one of the most widely adopted Identity-as-a-Service (IDaaS) platforms, and understanding it deeply means understanding the entire modern auth ecosystem — OAuth 2.0, OpenID Connect (OIDC), JWTs, and secure token flows. This is foundational knowledge that underpins everything from your own apps to the AESF middleware's service-to-service calls.
+Identity and authentication are the front door to every system you build. Auth0 is one of the most widely adopted Identity-as-a-Service (IDaaS) platforms, and understanding it deeply means understanding the entire modern auth ecosystem — OAuth 2.0, OpenID Connect (OIDC), JWTs, and secure token flows. This is foundational knowledge that underpins everything from your own apps to the integration platform middleware's service-to-service calls.
 
 By the end of this week you will understand: how Auth0 is structured, how JWTs work internally, which OAuth flow to use in which situation, and how to integrate Auth0 into a Python/FastAPI service.
 
@@ -231,7 +231,7 @@ async def get_m2m_token() -> str:
     return response.json()["access_token"]
 ```
 
-This is the pattern you'd use for the AESF middleware calling a protected internal service.
+This is the pattern you'd use for the integration platform middleware calling a protected internal service.
 
 ### Device Authorization Flow
 

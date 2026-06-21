@@ -8,25 +8,25 @@
 
 ## Overview
 
-Salesforce's data model is the foundation beneath every ETL pipeline, Apex trigger, and reporting snapshot you touch in the AESF ecosystem. At its core the platform organizes data into standard objects (Account, Contact, Opportunity, etc.) and custom objects (AESF__Policy__c, AESF__Line__c, CanaryAMS objects, and so on), each described by metadata that controls field types, validation, sharing, and relationship cardinality. Understanding how those relationships are physically stored — lookup fields, master-detail relationships, external ID fields, and the hidden junction tables that power many-to-many associations — lets you predict both query performance and data-integrity behavior before you write a single line of code or ETL transform.
+Salesforce's data model is the foundation beneath every ETL pipeline, Apex trigger, and reporting snapshot you touch in the CRM-EHR Integration Platform ecosystem. At its core the platform organizes data into standard objects (Account, Contact, Opportunity, etc.) and custom objects (APP__Policy__c, APP__Line__c, the AMS package objects, and so on), each described by metadata that controls field types, validation, sharing, and relationship cardinality. Understanding how those relationships are physically stored — lookup fields, master-detail relationships, external ID fields, and the hidden junction tables that power many-to-many associations — lets you predict both query performance and data-integrity behavior before you write a single line of code or ETL transform.
 
 SOQL (Salesforce Object Query Language) is the primary way code interacts with platform data, and its performance characteristics differ substantially from PostgreSQL or BigQuery SQL. Salesforce enforces governor limits — a maximum of 50,000 rows per query, 100 SOQL queries per synchronous transaction — so query design is never purely academic. Selective queries, proper use of indexed fields, semi-joins, and aggregate functions are not micro-optimizations; they determine whether an Apex trigger completes within governor limits or fails an entire save operation for your users, and whether an ETL batch job runs in minutes or hours.
 
-For AESF specifically, SOQL mastery has direct ETL implications. The `etl-appliedcrm-bde` and `etl-appliedcrm-bq` pipelines fetch Salesforce data through REST API queries whose underlying SOQL shapes the payload size, the number of API calls consumed, and the fidelity of relationship traversal. A poorly selective query on AESF__Policy__c (which may have hundreds of thousands of records in a production org) can time out or exceed row limits, causing incomplete ETL runs and data drift between Salesforce and BigQuery. The CanaryAMS package, with 134 custom objects, compounds this: complex relationship trees between policy, coverage, and client objects mean that naive query patterns produce either N+1 anti-patterns or bloated result sets.
+For the integration platform specifically, SOQL mastery has direct ETL implications. The `etl-bde-pipeline` and `etl-bq-pipeline` pipelines fetch Salesforce data through REST API queries whose underlying SOQL shapes the payload size, the number of API calls consumed, and the fidelity of relationship traversal. A poorly selective query on APP__Policy__c (which may have hundreds of thousands of records in a production org) can time out or exceed row limits, causing incomplete ETL runs and data drift between Salesforce and BigQuery. The AMS package, with 134 custom objects, compounds this: complex relationship trees between policy, coverage, and client objects mean that naive query patterns produce either N+1 anti-patterns or bloated result sets.
 
-This week covers the full arc from data model fundamentals through advanced SOQL techniques, with a deep dive into the AESF and CanaryAMS object models and their ETL implications. By the end you should be able to write selective, relationship-aware SOQL queries, understand when to use SOSL versus SOQL, and design data model patterns (junction objects, polymorphic lookups, rollup summaries) that remain performant at scale.
+This week covers the full arc from data model fundamentals through advanced SOQL techniques, with a deep dive into the integration platform and AMS package object models and their ETL implications. By the end you should be able to write selective, relationship-aware SOQL queries, understand when to use SOSL versus SOQL, and design data model patterns (junction objects, polymorphic lookups, rollup summaries) that remain performant at scale.
 
 ---
 
 ## 1. Standard and Custom Objects — Structure and Metadata
 
-Every Salesforce object is a combination of a schema definition (fields, relationships, page layouts, validation rules) and a set of records stored in a multi-tenant database that Salesforce abstracts away from direct access. Standard objects like Account, Contact, Opportunity, and Lead ship with the platform and carry built-in behaviors (sharing rules, activity tracking, duplicate management). Custom objects are suffixed with `__c` and live in a package namespace when deployed via a managed package — hence `AESF__Policy__c` rather than `Policy__c` in subscriber orgs.
+Every Salesforce object is a combination of a schema definition (fields, relationships, page layouts, validation rules) and a set of records stored in a multi-tenant database that Salesforce abstracts away from direct access. Standard objects like Account, Contact, Opportunity, and Lead ship with the platform and carry built-in behaviors (sharing rules, activity tracking, duplicate management). Custom objects are suffixed with `__c` and live in a package namespace when deployed via a managed package — hence `APP__Policy__c` rather than `Policy__c` in subscriber orgs.
 
 Each field on an object maps to one of Salesforce's field types: Text, Number, Currency, Date/DateTime, Picklist, Formula, Rollup Summary, Lookup Relationship, Master-Detail Relationship, External ID, and several others. The field type determines indexing behavior. Salesforce automatically creates indexes on Id, Name, OwnerId, CreatedDate, LastModifiedDate, SystemModstamp, and any field marked as an External ID or Unique. Standard index fields are the key levers for building selective SOQL queries.
 
-For the AESF package, custom fields like `AESF__Policy__c.AESF__Epic_Policy_Id__c` are typically marked as External ID fields so that upsert operations in ETL pipelines can use them as idempotent keys. In `etl-appliedcrm-bde`, the Pentaho jobs rely on this field to avoid duplicate Policy records when Epic data is pushed into Salesforce. If that External ID field were removed or its uniqueness constraint dropped, the ETL's upsert logic would silently create duplicates.
+For the integration platform package, custom fields like `APP__Policy__c.APP__EHR_Policy_Id__c` are typically marked as External ID fields so that upsert operations in ETL pipelines can use them as idempotent keys. In `etl-bde-pipeline`, the Pentaho jobs rely on this field to avoid duplicate Policy records when EHR system data is pushed into Salesforce. If that External ID field were removed or its uniqueness constraint dropped, the ETL's upsert logic would silently create duplicates.
 
-**Common mistake:** Treating all custom fields as queryable indexes. Only External ID, Unique, and certain formula fields are indexed. Filtering on a non-indexed Text field on a large object (e.g., `WHERE AESF__Policy_Name__c = 'XYZ'` on a table with 500k rows) bypasses indexes and forces a full table scan, which Salesforce will either slow-process or reject as non-selective.
+**Common mistake:** Treating all custom fields as queryable indexes. Only External ID, Unique, and certain formula fields are indexed. Filtering on a non-indexed Text field on a large object (e.g., `WHERE APP__Policy_Name__c = 'XYZ'` on a table with 500k rows) bypasses indexes and forces a full table scan, which Salesforce will either slow-process or reject as non-selective.
 
 ---
 
@@ -46,9 +46,9 @@ FROM Task
 WHERE OwnerId = :currentUserId
 ```
 
-In the AESF data model, `AESF__Relationship__c` and `AESF__Relationships_Junction__c` implement a many-to-many structure between Account (client) records and related parties. Understanding whether these use polymorphic lookups or discrete lookup fields affects how you traverse the relationship tree in SOQL when extracting relationship data for the BigQuery ETL.
+In the integration platform data model, `APP__Relationship__c` and `APP__Relationships_Junction__c` implement a many-to-many structure between Account (client) records and related parties. Understanding whether these use polymorphic lookups or discrete lookup fields affects how you traverse the relationship tree in SOQL when extracting relationship data for the BigQuery ETL.
 
-**Junction objects** implement many-to-many relationships by having two master-detail fields pointing to the two parent objects. Deleting either parent cascades to the junction record. `AESF__Category_Junction__c` connects an Account with an `AESF__Agency_Defined_Category__c` — the ETL must handle the possibility that junction records disappear when either parent is deleted, and must propagate those deletes to BigQuery via the `SystemModstamp` or a deletion log strategy.
+**Junction objects** implement many-to-many relationships by having two master-detail fields pointing to the two parent objects. Deleting either parent cascades to the junction record. `APP__Category_Junction__c` connects an Account with an `APP__Agency_Defined_Category__c` — the ETL must handle the possibility that junction records disappear when either parent is deleted, and must propagate those deletes to BigQuery via the `SystemModstamp` or a deletion log strategy.
 
 **Common mistake:** Using a lookup instead of a master-detail when rollup summaries or cascade deletes are needed. Lookups cannot have rollup summary fields on the parent. Choosing the wrong relationship type at design time is expensive to fix in a managed package deployed to hundreds of orgs.
 
@@ -64,15 +64,15 @@ SOQL is syntactically similar to SQL SELECT but with important restrictions: no 
 | Asynchronous (Batch/Future/Queueable) | 200 queries | 50,000 rows |
 | REST API (single request) | N/A (one query per call) | 2,000 rows (paginated via `nextRecordsUrl`) |
 
-For ETL workloads, the REST API pagination model matters most. When `etl-appliedcrm-bq` queries `AESF__Policy__c` for all modified records since the last run, it must iterate `nextRecordsUrl` pages until `done: true`. Failing to handle pagination causes silent data loss — the ETL loads only the first 2,000 records and marks the run complete.
+For ETL workloads, the REST API pagination model matters most. When `etl-bq-pipeline` queries `APP__Policy__c` for all modified records since the last run, it must iterate `nextRecordsUrl` pages until `done: true`. Failing to handle pagination causes silent data loss — the ETL loads only the first 2,000 records and marks the run complete.
 
 A basic parameterized SOQL query on Policy records modified in the last 24 hours:
 
 ```soql
-SELECT Id, Name, AESF__Epic_Policy_Id__c, AESF__Account__c,
-       AESF__Policy_Type__c, AESF__Effective_Date__c,
-       AESF__Expiration_Date__c, SystemModstamp, LastModifiedDate
-FROM AESF__Policy__c
+SELECT Id, Name, APP__EHR_Policy_Id__c, APP__Account__c,
+       APP__Policy_Type__c, APP__Effective_Date__c,
+       APP__Expiration_Date__c, SystemModstamp, LastModifiedDate
+FROM APP__Policy__c
 WHERE LastModifiedDate >= LAST_N_DAYS:1
 ORDER BY LastModifiedDate ASC
 ```
@@ -89,11 +89,11 @@ SOQL traverses relationships in two directions. **Child-to-parent** uses dot not
 
 ```soql
 SELECT Id, Name,
-       AESF__Account__r.Name,
-       AESF__Account__r.BillingState,
-       AESF__Policy_Type__r.Name
-FROM AESF__Policy__c
-WHERE AESF__Account__r.BillingState = 'CA'
+       APP__Account__r.Name,
+       APP__Account__r.BillingState,
+       APP__Policy_Type__r.Name
+FROM APP__Policy__c
+WHERE APP__Account__r.BillingState = 'CA'
   AND LastModifiedDate >= LAST_N_DAYS:7
 ```
 
@@ -103,18 +103,18 @@ The `__r` suffix replaces `__c` on the field to navigate the relationship. For s
 
 ```soql
 SELECT Id, Name,
-  (SELECT Id, AESF__Line_Type__c, AESF__Premium__c,
-          AESF__Effective_Date__c
-   FROM AESF__Lines__r
-   WHERE AESF__Line_Status__c = 'Active')
-FROM AESF__Policy__c
-WHERE AESF__Expiration_Date__c >= TODAY
-  AND AESF__Account__r.Type = 'Customer'
+  (SELECT Id, APP__Line_Type__c, APP__Premium__c,
+          APP__Effective_Date__c
+   FROM APP__Lines__r
+   WHERE APP__Line_Status__c = 'Active')
+FROM APP__Policy__c
+WHERE APP__Expiration_Date__c >= TODAY
+  AND APP__Account__r.Type = 'Customer'
 ```
 
-Nested subqueries return up to 200 child records per parent. If a Policy can have more than 200 Lines, the subquery result is truncated and you must issue a separate, filtered query on `AESF__Line__c` for those specific Policy Ids. The ETL pipelines in `etl-appliedcrm-bq` typically query child objects separately and join in BigQuery rather than relying on nested SOQL, which avoids the 200-row subquery limit.
+Nested subqueries return up to 200 child records per parent. If a Policy can have more than 200 Lines, the subquery result is truncated and you must issue a separate, filtered query on `APP__Line__c` for those specific Policy Ids. The ETL pipelines in `etl-bq-pipeline` typically query child objects separately and join in BigQuery rather than relying on nested SOQL, which avoids the 200-row subquery limit.
 
-**Common mistake:** Assuming the child relationship name is simply the object's API name. The relationship name is a separate metadata attribute. For `AESF__Line__c` with a master-detail to `AESF__Policy__c`, the relationship name might be `AESF__Lines__r` but it could also be something custom — always verify in Schema Builder or the object's metadata XML.
+**Common mistake:** Assuming the child relationship name is simply the object's API name. The relationship name is a separate metadata attribute. For `APP__Line__c` with a master-detail to `APP__Policy__c`, the relationship name might be `APP__Lines__r` but it could also be something custom — always verify in Schema Builder or the object's metadata XML.
 
 ---
 
@@ -124,12 +124,12 @@ Semi-joins (`IN` with a subquery) and anti-joins (`NOT IN` with a subquery) allo
 
 ```soql
 -- Policies that have at least one active Line (semi-join)
-SELECT Id, Name, AESF__Epic_Policy_Id__c
-FROM AESF__Policy__c
+SELECT Id, Name, APP__EHR_Policy_Id__c
+FROM APP__Policy__c
 WHERE Id IN (
-  SELECT AESF__Policy__c
-  FROM AESF__Line__c
-  WHERE AESF__Line_Status__c = 'Active'
+  SELECT APP__Policy__c
+  FROM APP__Line__c
+  WHERE APP__Line_Status__c = 'Active'
 )
 AND LastModifiedDate >= LAST_N_DAYS:30
 
@@ -144,7 +144,7 @@ WHERE Id NOT IN (
 AND Type = 'Customer'
 ```
 
-Semi-joins are valuable in ETL scenarios where you need to identify records in one object that have or lack corresponding records in another — for example, finding AESF__Policy__c records that have no corresponding `AESF__Line__c` records, which would indicate a data integrity issue that the reconciliation job should flag.
+Semi-joins are valuable in ETL scenarios where you need to identify records in one object that have or lack corresponding records in another — for example, finding APP__Policy__c records that have no corresponding `APP__Line__c` records, which would indicate a data integrity issue that the reconciliation job should flag.
 
 The inner SELECT in a semi-join must return an Id field or a lookup field that references the outer object. You cannot use aggregate functions, relationship traversals, or LIMIT in the inner SELECT. The inner query is also subject to the 50,000-row limit independently.
 
@@ -157,17 +157,17 @@ The inner SELECT in a semi-join must return an Id field or a lookup field that r
 SOQL supports `COUNT()`, `COUNT(fieldName)`, `SUM()`, `AVG()`, `MIN()`, `MAX()`, and `COUNT_DISTINCT()`. Aggregate queries are useful for ETL reconciliation — verifying that the count of records in BigQuery matches Salesforce after a load — and for building summary datasets:
 
 ```soql
-SELECT AESF__Policy_Type__r.Name, AESF__Account__r.BillingState,
+SELECT APP__Policy_Type__r.Name, APP__Account__r.BillingState,
        COUNT(Id) policyCount,
-       SUM(AESF__Total_Premium__c) totalPremium,
-       MIN(AESF__Effective_Date__c) earliestEffective,
-       MAX(AESF__Expiration_Date__c) latestExpiration
-FROM AESF__Policy__c
-WHERE AESF__Account__r.Type = 'Customer'
-  AND AESF__Policy_Status__c = 'Active'
-GROUP BY AESF__Policy_Type__r.Name, AESF__Account__r.BillingState
-HAVING SUM(AESF__Total_Premium__c) > 10000
-ORDER BY SUM(AESF__Total_Premium__c) DESC
+       SUM(APP__Total_Premium__c) totalPremium,
+       MIN(APP__Effective_Date__c) earliestEffective,
+       MAX(APP__Expiration_Date__c) latestExpiration
+FROM APP__Policy__c
+WHERE APP__Account__r.Type = 'Customer'
+  AND APP__Policy_Status__c = 'Active'
+GROUP BY APP__Policy_Type__r.Name, APP__Account__r.BillingState
+HAVING SUM(APP__Total_Premium__c) > 10000
+ORDER BY SUM(APP__Total_Premium__c) DESC
 ```
 
 Aggregate queries return `AggregateResult` objects in Apex, accessed via `get('aliasName')`. In the REST API they return as JSON objects with aliased keys. Note that `COUNT()` (no argument) counts all rows including null fields, while `COUNT(fieldName)` counts only non-null values — a distinction that matters when counting sparse fields.
@@ -186,15 +186,15 @@ Key strategies for selectivity:
 
 | Strategy | Example |
 |----------|---------|
-| Filter on indexed fields | `WHERE Id IN :idSet`, `WHERE SystemModstamp >= :lastRun`, `WHERE AESF__Epic_Policy_Id__c = :externalId` |
-| Combine indexed + non-indexed | Lead with indexed field first: `WHERE LastModifiedDate >= LAST_N_DAYS:1 AND AESF__Policy_Status__c = 'Active'` |
+| Filter on indexed fields | `WHERE Id IN :idSet`, `WHERE SystemModstamp >= :lastRun`, `WHERE APP__EHR_Policy_Id__c = :externalId` |
+| Combine indexed + non-indexed | Lead with indexed field first: `WHERE LastModifiedDate >= LAST_N_DAYS:1 AND APP__Policy_Status__c = 'Active'` |
 | Avoid leading wildcards | `LIKE 'POL-%'` is better than `LIKE '%POL%'` |
 | Use `LIMIT` when possible | Cap exploratory queries in Apex to avoid row-limit exceptions |
 | Leverage External IDs for upsert | Indexed field, avoids full scan in upsert operations |
 
 The `EXPLAIN` command is available in the Developer Console's Query Plan tool. It returns a cost estimate — values below 1 indicate a selective query; values above 1 indicate a likely full scan. Running EXPLAIN against any new ETL query before deploying to production is a critical discipline.
 
-For the BigQuery ETL (`etl-appliedcrm-bq`), incremental load queries should always include `WHERE SystemModstamp >= :watermark` where `watermark` is stored in a state table. This ensures that even if a run is restarted, the query remains selective on the `SystemModstamp` index rather than scanning all records.
+For the BigQuery ETL (`etl-bq-pipeline`), incremental load queries should always include `WHERE SystemModstamp >= :watermark` where `watermark` is stored in a state table. This ensures that even if a run is restarted, the query remains selective on the `SystemModstamp` index rather than scanning all records.
 
 **Common mistake:** Not accounting for soft-deleted records. By default SOQL excludes records in the Recycle Bin. To include them, append `ALL ROWS` to the query. If the ETL needs to propagate deletes to BigQuery, it must use `ALL ROWS` with `IsDeleted = true` — but note that Recycle Bin records are permanently purged after 15 days, so the ETL must run at least every 15 days or use Salesforce's streaming/Change Data Capture API instead.
 
@@ -209,7 +209,7 @@ FIND {Acme Insurance*} IN ALL FIELDS
 RETURNING
   Account(Id, Name, BillingState WHERE Type = 'Customer'),
   Contact(Id, FirstName, LastName, Email WHERE AccountId != null),
-  AESF__Policy__c(Id, Name, AESF__Epic_Policy_Id__c)
+  APP__Policy__c(Id, Name, APP__EHR_Policy_Id__c)
 LIMIT 200
 ```
 
@@ -227,7 +227,7 @@ A Reporting Snapshot is a scheduled process that runs a summary report and saves
 
 To implement a Reporting Snapshot: (1) create a custom object to hold snapshot rows, (2) build a summary/matrix report with the metrics you want to capture, (3) configure the Reporting Snapshot to map report columns to custom object fields, (4) schedule it (daily, weekly, etc.). The snapshot records accumulate over time and can be queried with SOQL for trend analysis.
 
-In the AESF context, a Reporting Snapshot on active policy counts by `AESF__Policy_Type__c` and `BillingState` provides historical data that would otherwise require ETL pipelines querying Salesforce at regular intervals and storing the results in BigQuery. For metrics that the business only needs weekly, Reporting Snapshots are a lower-complexity alternative to a full ETL pipeline.
+In the integration platform context, a Reporting Snapshot on active policy counts by `APP__Policy_Type__c` and `BillingState` provides historical data that would otherwise require ETL pipelines querying Salesforce at regular intervals and storing the results in BigQuery. For metrics that the business only needs weekly, Reporting Snapshots are a lower-complexity alternative to a full ETL pipeline.
 
 ```soql
 -- Query accumulated snapshot data
@@ -241,36 +241,36 @@ ORDER BY SnapshotDate ASC, PolicyType__c ASC
 
 ---
 
-## 10. AESF and CanaryAMS Object Model Deep Dive
+## 10. Integration Platform and AMS Package Object Model Deep Dive
 
-The AESF package centers on a **Policy hierarchy**: `Account` (client) → `AESF__Policy__c` → `AESF__Line__c` → `AESF__Plan__c` → `AESF__Rate__c`. Each level has a master-detail relationship to its parent, meaning cascade deletes propagate downward. The ETL must account for this: a delete on `AESF__Policy__c` silently removes all descendant Lines, Plans, and Rates from Salesforce's Recycle Bin, which means the BigQuery side must apply the same cascade logic or it will retain orphaned child records.
+The integration platform package centers on a **Policy hierarchy**: `Account` (client) → `APP__Policy__c` → `APP__Line__c` → `APP__Plan__c` → `APP__Rate__c`. Each level has a master-detail relationship to its parent, meaning cascade deletes propagate downward. The ETL must account for this: a delete on `APP__Policy__c` silently removes all descendant Lines, Plans, and Rates from Salesforce's Recycle Bin, which means the BigQuery side must apply the same cascade logic or it will retain orphaned child records.
 
-The `AESF__Servicing__c` object bridges a Policy to its servicing employees (`AESF__Employee__c`), implementing a many-to-many through junction logic. `AESF__Marketing_Submission__c` and `AESF__Marketing_Line__c` form a parallel hierarchy tracking submissions to carriers, separate from the bound policy hierarchy.
+The `APP__Servicing__c` object bridges a Policy to its servicing employees (`APP__Employee__c`), implementing a many-to-many through junction logic. `APP__Marketing_Submission__c` and `APP__Marketing_Line__c` form a parallel hierarchy tracking submissions to carriers, separate from the bound policy hierarchy.
 
 Key cross-object query pattern used by ETL to extract a policy with its lines in one pass:
 
 ```soql
-SELECT Id, Name, AESF__Epic_Policy_Id__c,
-       AESF__Account__r.Id, AESF__Account__r.Name,
-       AESF__Account__r.AESF__Epic_Client_Id__c,
-       AESF__Policy_Type__r.Name, AESF__Effective_Date__c,
-       AESF__Expiration_Date__c, AESF__Policy_Status__c,
+SELECT Id, Name, APP__EHR_Policy_Id__c,
+       APP__Account__r.Id, APP__Account__r.Name,
+       APP__Account__r.APP__EHR_Client_Id__c,
+       APP__Policy_Type__r.Name, APP__Effective_Date__c,
+       APP__Expiration_Date__c, APP__Policy_Status__c,
        SystemModstamp,
-  (SELECT Id, AESF__Epic_Line_Id__c, AESF__Line_Type__c,
-          AESF__Premium__c, AESF__Line_Status__c, SystemModstamp
-   FROM AESF__Lines__r
-   WHERE AESF__Line_Status__c != 'Cancelled')
-FROM AESF__Policy__c
+  (SELECT Id, APP__EHR_Line_Id__c, APP__Line_Type__c,
+          APP__Premium__c, APP__Line_Status__c, SystemModstamp
+   FROM APP__Lines__r
+   WHERE APP__Line_Status__c != 'Cancelled')
+FROM APP__Policy__c
 WHERE SystemModstamp >= :watermarkTs
-  AND AESF__Policy_Status__c != 'Cancelled'
+  AND APP__Policy_Status__c != 'Cancelled'
 LIMIT 2000
 ```
 
-CanaryAMS, with 134 custom objects, follows a similar hierarchy but covers the full agency management surface: coverage types, endorsements, billing transactions, claims, and producer commissions. The key ETL risk in CanaryAMS is **object cardinality** — objects like billing transactions can have millions of records, meaning any ETL query must be watermarked on `SystemModstamp` with extremely tight incremental windows to avoid scanning the full table.
+The AMS package, with 134 custom objects, follows a similar hierarchy but covers the full agency management surface: coverage types, endorsements, billing transactions, claims, and producer commissions. The key ETL risk in the AMS package is **object cardinality** — objects like billing transactions can have millions of records, meaning any ETL query must be watermarked on `SystemModstamp` with extremely tight incremental windows to avoid scanning the full table.
 
-The BigQuery schema mirrors the Salesforce object hierarchy as a set of denormalized fact tables and dimension tables. `aesf_policy` is the central fact table, joined to `aesf_account`, `aesf_line`, `aesf_plan`, and `aesf_rate` dimension tables via foreign keys matching the Salesforce Id fields. When ETL upserts a Line record, it must also verify that the parent Policy record exists in BigQuery — referential integrity that Salesforce enforces via master-detail but BigQuery does not.
+The BigQuery schema mirrors the Salesforce object hierarchy as a set of denormalized fact tables and dimension tables. `app_policy` is the central fact table, joined to `app_account`, `app_line`, `app_plan`, and `app_rate` dimension tables via foreign keys matching the Salesforce Id fields. When ETL upserts a Line record, it must also verify that the parent Policy record exists in BigQuery — referential integrity that Salesforce enforces via master-detail but BigQuery does not.
 
-**Common mistake:** Querying CanaryAMS high-volume objects without a `LastModifiedDate` or `SystemModstamp` filter. Objects like billing transactions are write-heavy; even a 1-hour incremental window may return tens of thousands of records. Always verify the expected row count in a sandbox before scheduling ETL incremental jobs against production.
+**Common mistake:** Querying AMS package high-volume objects without a `LastModifiedDate` or `SystemModstamp` filter. Objects like billing transactions are write-heavy; even a 1-hour incremental window may return tens of thousands of records. Always verify the expected row count in a sandbox before scheduling ETL incremental jobs against production.
 
 ---
 
@@ -281,12 +281,12 @@ Salesforce Data Model
 ├── Object Types
 │   ├── Standard (Account, Contact, Opportunity, Lead, Task)
 │   └── Custom (*__c, namespace-prefixed in managed packages)
-│       ├── AESF__Policy__c
-│       ├── AESF__Line__c
-│       ├── AESF__Plan__c
-│       ├── AESF__Rate__c
-│       ├── AESF__Servicing__c
-│       └── CanaryAMS (134 objects)
+│       ├── APP__Policy__c
+│       ├── APP__Line__c
+│       ├── APP__Plan__c
+│       ├── APP__Rate__c
+│       ├── APP__Servicing__c
+│       └── AMS package (134 objects)
 │
 ├── Relationship Types
 │   ├── Lookup (soft FK, nullable, no cascade)
@@ -323,13 +323,13 @@ Salesforce Data Model
 
 **2.** In SOQL, what suffix replaces `__c` when navigating a custom relationship in a query?
 
-**3.** You query `AESF__Policy__c` with no WHERE clause in an org with 600,000 policy records. What is likely to happen and why?
+**3.** You query `APP__Policy__c` with no WHERE clause in an org with 600,000 policy records. What is likely to happen and why?
 
 **4.** What does `SystemModstamp` capture that `LastModifiedDate` does not?
 
-**5.** Explain the 200-row limit on nested SOQL subqueries and describe how the AESF ETL should handle policies that have more than 200 lines.
+**5.** Explain the 200-row limit on nested SOQL subqueries and describe how the integration platform ETL should handle policies that have more than 200 lines.
 
-**6.** Write a SOQL query using a semi-join to find all Accounts that have at least one active AESF__Policy__c.
+**6.** Write a SOQL query using a semi-join to find all Accounts that have at least one active APP__Policy__c.
 
 **7.** What is the purpose of the `EXPLAIN` command in the Developer Console's Query Plan tool, and what cost value indicates a non-selective query?
 
@@ -339,7 +339,7 @@ Salesforce Data Model
 
 **10.** In a master-detail hierarchy like Policy → Line → Plan, what happens in Salesforce when a Policy record is deleted? What must the BigQuery ETL do to stay consistent?
 
-**11.** What are External ID fields and why are they important for ETL upsert operations in AESF?
+**11.** What are External ID fields and why are they important for ETL upsert operations in the integration platform?
 
 **12.** Explain the `ALL ROWS` modifier in SOQL. When would an ETL pipeline need to use it?
 
@@ -353,11 +353,11 @@ Salesforce Data Model
 
 **17.** What is the difference between `COUNT()` and `COUNT(fieldName)` in SOQL aggregate queries?
 
-**18.** In the AESF object hierarchy, which object acts as a junction between a Policy and its servicing employees, and what relationship type does it likely use?
+**18.** In the integration platform object hierarchy, which object acts as a junction between a Policy and its servicing employees, and what relationship type does it likely use?
 
-**19.** Why is it risky to query high-volume CanaryAMS objects (like billing transactions) without a `SystemModstamp` filter? What could go wrong?
+**19.** Why is it risky to query high-volume AMS package objects (like billing transactions) without a `SystemModstamp` filter? What could go wrong?
 
-**20.** A developer adds a new non-indexed Text field `AESF__Custom_Reference__c` on `AESF__Policy__c` and uses it as the sole WHERE clause filter in an ETL query. Explain the performance implications and suggest a fix.
+**20.** A developer adds a new non-indexed Text field `APP__Custom_Reference__c` on `APP__Policy__c` and uses it as the sole WHERE clause filter in an ETL query. Explain the performance implications and suggest a fix.
 
 ---
 
@@ -367,25 +367,25 @@ Salesforce Data Model
 
     **1.** A lookup relationship is a soft foreign key: the child record can exist independently, the lookup field is nullified (not deleted) when the parent is deleted, and the parent cannot have rollup summary fields aggregating child data. A master-detail relationship is a hard dependency: deleting the parent cascade-deletes all children, the child inherits the parent's sharing model, and the parent can use rollup summary fields (COUNT, SUM, MIN, MAX) over child records. Rollup summary fields are the key feature exclusive to master-detail.
 
-    **2.** The `__c` suffix is replaced with `__r` when navigating a relationship in SOQL. For example, `AESF__Policy__c.AESF__Account__c` (the lookup field) becomes `AESF__Policy__c.AESF__Account__r.Name` to access the parent Account's Name field. For standard objects, the pattern is the relationship name without `Id` — `Opportunity.AccountId` becomes `Opportunity.Account.Name`.
+    **2.** The `__c` suffix is replaced with `__r` when navigating a relationship in SOQL. For example, `APP__Policy__c.APP__Account__c` (the lookup field) becomes `APP__Policy__c.APP__Account__r.Name` to access the parent Account's Name field. For standard objects, the pattern is the relationship name without `Id` — `Opportunity.AccountId` becomes `Opportunity.Account.Name`.
 
     **3.** Salesforce will likely treat the query as non-selective because there is no WHERE clause filtering on indexed fields, meaning it must scan all 600,000 records. On very large objects, Salesforce may return a `QUERY_TIMEOUT` error, queue the query for offline processing, or reject it entirely if it exceeds governor limits. Even if it succeeds, the 50,000-row query limit would truncate the results to 50,000 records, silently omitting 550,000 records. Always include a selective WHERE clause, especially on high-volume objects.
 
     **4.** `SystemModstamp` is updated by any write to the record, including system-triggered changes such as sharing rule recalculations, workflow field updates, formula field recalculations triggered by related changes, and platform-level housekeeping updates. `LastModifiedDate` is only updated when a user (human or API call acting as a user) explicitly saves the record. ETL incremental loads should use `SystemModstamp` to avoid missing records that were modified by system processes, which would not update `LastModifiedDate`.
 
-    **5.** Nested SOQL subqueries (parent-to-child) return a maximum of 200 child records per parent record. If a Policy has more than 200 Lines, the subquery result is silently truncated — Salesforce does not raise an error. The AESF ETL should handle this by querying `AESF__Line__c` separately, filtered by the Policy Ids retrieved in the parent query, rather than relying on nested subqueries. This is also more performant at scale because it allows the Line query to use its own `SystemModstamp` watermark independently.
+    **5.** Nested SOQL subqueries (parent-to-child) return a maximum of 200 child records per parent record. If a Policy has more than 200 Lines, the subquery result is silently truncated — Salesforce does not raise an error. The integration platform ETL should handle this by querying `APP__Line__c` separately, filtered by the Policy Ids retrieved in the parent query, rather than relying on nested subqueries. This is also more performant at scale because it allows the Line query to use its own `SystemModstamp` watermark independently.
 
     **6.**
     ```soql
     SELECT Id, Name, BillingState, Type
     FROM Account
     WHERE Id IN (
-      SELECT AESF__Account__c
-      FROM AESF__Policy__c
-      WHERE AESF__Policy_Status__c = 'Active'
+      SELECT APP__Account__c
+      FROM APP__Policy__c
+      WHERE APP__Policy_Status__c = 'Active'
     )
     ```
-    This semi-join returns only Accounts that have at least one related Policy record in Active status. The inner SELECT must return a lookup field (here `AESF__Account__c`) that references the outer object (Account). No aggregate functions, LIMIT, or relationship traversal are allowed in the inner SELECT.
+    This semi-join returns only Accounts that have at least one related Policy record in Active status. The inner SELECT must return a lookup field (here `APP__Account__c`) that references the outer object (Account). No aggregate functions, LIMIT, or relationship traversal are allowed in the inner SELECT.
 
     **7.** The `EXPLAIN` command in the Developer Console's Query Plan tool returns a cost estimate for a SOQL query without executing it. The cost value represents how many rows Salesforce estimates will be scanned relative to using a full-table scan. A cost value below 1.0 indicates a selective query that will use an index efficiently. A cost value above 1.0 — especially values significantly greater than 1 — indicates a non-selective query that will scan a large portion of the table, leading to slow performance, timeouts, or governor limit failures in production.
 
@@ -395,20 +395,20 @@ Salesforce Data Model
 
     **10.** When a Policy record is deleted in a master-detail hierarchy, Salesforce cascade-deletes all child Line records, which in turn cascade-deletes all grandchild Plan records, and so on down the hierarchy. These deleted records move to the Recycle Bin and are permanently purged after 15 days. The BigQuery ETL must detect these deletions and propagate them to BigQuery. The recommended approach is to query with `ALL ROWS` and `IsDeleted = true` filtered by `SystemModstamp` within the current watermark window. If the ETL does not run within 15 days, those delete records will be permanently gone from Salesforce, requiring a full reconciliation query to detect orphaned records in BigQuery.
 
-    **11.** External ID fields are custom fields marked as "External ID" in Salesforce metadata, which causes Salesforce to create a database index on that field. They are used in ETL upsert operations to match incoming records by a business key (like `AESF__Epic_Policy_Id__c`) rather than by Salesforce's internal Id. This allows the ETL to insert a new record if no match is found, or update the existing record if a match is found, all in a single API call. Without an External ID field, the ETL would need to first query for the Salesforce Id, then decide whether to insert or update, doubling the API call count and introducing race conditions.
+    **11.** External ID fields are custom fields marked as "External ID" in Salesforce metadata, which causes Salesforce to create a database index on that field. They are used in ETL upsert operations to match incoming records by a business key (like `APP__EHR_Policy_Id__c`) rather than by Salesforce's internal Id. This allows the ETL to insert a new record if no match is found, or update the existing record if a match is found, all in a single API call. Without an External ID field, the ETL would need to first query for the Salesforce Id, then decide whether to insert or update, doubling the API call count and introducing race conditions.
 
-    **12.** The `ALL ROWS` modifier in SOQL includes soft-deleted records (records currently in the Recycle Bin) and archived records in the query results, which are normally excluded from standard queries. An ETL pipeline needs `ALL ROWS` when it must propagate hard deletes from Salesforce to a downstream system like BigQuery. The query `SELECT Id, IsDeleted FROM AESF__Policy__c WHERE IsDeleted = true AND SystemModstamp >= :watermark ALL ROWS` returns recently deleted Policy records that need to be removed from BigQuery. Without `ALL ROWS`, deleted records are invisible to SOQL, and BigQuery would silently retain stale data indefinitely.
+    **12.** The `ALL ROWS` modifier in SOQL includes soft-deleted records (records currently in the Recycle Bin) and archived records in the query results, which are normally excluded from standard queries. An ETL pipeline needs `ALL ROWS` when it must propagate hard deletes from Salesforce to a downstream system like BigQuery. The query `SELECT Id, IsDeleted FROM APP__Policy__c WHERE IsDeleted = true AND SystemModstamp >= :watermark ALL ROWS` returns recently deleted Policy records that need to be removed from BigQuery. Without `ALL ROWS`, deleted records are invisible to SOQL, and BigQuery would silently retain stale data indefinitely.
 
     **13.**
     ```soql
-    SELECT AESF__Policy_Type__r.Name, AESF__Account__r.BillingState,
+    SELECT APP__Policy_Type__r.Name, APP__Account__r.BillingState,
            COUNT(Id) policyCount,
-           SUM(AESF__Total_Premium__c) totalPremium
-    FROM AESF__Policy__c
-    WHERE AESF__Policy_Status__c = 'Active'
-    GROUP BY AESF__Policy_Type__r.Name, AESF__Account__r.BillingState
-    HAVING SUM(AESF__Total_Premium__c) > 50000
-    ORDER BY SUM(AESF__Total_Premium__c) DESC
+           SUM(APP__Total_Premium__c) totalPremium
+    FROM APP__Policy__c
+    WHERE APP__Policy_Status__c = 'Active'
+    GROUP BY APP__Policy_Type__r.Name, APP__Account__r.BillingState
+    HAVING SUM(APP__Total_Premium__c) > 50000
+    ORDER BY SUM(APP__Total_Premium__c) DESC
     ```
     The `HAVING` clause filters groups after aggregation (analogous to SQL's HAVING). Both the grouped-by relationship fields must appear in the GROUP BY clause. Non-aggregate fields in SELECT must all appear in GROUP BY.
 
@@ -418,10 +418,10 @@ Salesforce Data Model
 
     **16.** A nested SOQL subquery (parent-to-child relationship query) returns a maximum of 200 child records per parent record. This is a hard platform limit that cannot be raised. If more than 200 children exist for a parent, the subquery result is silently truncated — no error is raised and no indicator is provided that records were omitted. For ETL pipelines that need all child records regardless of count, the recommended pattern is to query child objects separately using the parent Id as a filter rather than relying on nested subqueries.
 
-    **17.** `COUNT()` with no argument counts all rows in the result set including rows where fields have null values — it is equivalent to `COUNT(*)` in SQL. `COUNT(fieldName)` counts only rows where the specified field is non-null, ignoring records where that field is empty. The difference matters when counting sparse optional fields: `COUNT(AESF__Total_Premium__c)` would exclude Policies where premium has not been set, while `COUNT(Id)` always counts every Policy record in the group. Always choose the form that reflects your actual metric to avoid misleading counts in reports and reconciliation checks.
+    **17.** `COUNT()` with no argument counts all rows in the result set including rows where fields have null values — it is equivalent to `COUNT(*)` in SQL. `COUNT(fieldName)` counts only rows where the specified field is non-null, ignoring records where that field is empty. The difference matters when counting sparse optional fields: `COUNT(APP__Total_Premium__c)` would exclude Policies where premium has not been set, while `COUNT(Id)` always counts every Policy record in the group. Always choose the form that reflects your actual metric to avoid misleading counts in reports and reconciliation checks.
 
-    **18.** `AESF__Servicing__c` acts as the junction between a Policy (or client Account) and its servicing employees (`AESF__Employee__c`). It likely uses either two master-detail fields (to Policy and Employee) or a master-detail to Policy and a lookup to Employee, depending on whether the Employee is managed within the AESF package or sourced from an ETL-only sync. If both relationships are master-detail, the Servicing record is deleted when either parent is deleted, which the ETL must account for by detecting those deletions via `ALL ROWS` queries and propagating them to BigQuery's servicing dimension table.
+    **18.** `APP__Servicing__c` acts as the junction between a Policy (or client Account) and its servicing employees (`APP__Employee__c`). It likely uses either two master-detail fields (to Policy and Employee) or a master-detail to Policy and a lookup to Employee, depending on whether the Employee is managed within the integration platform package or sourced from an ETL-only sync. If both relationships are master-detail, the Servicing record is deleted when either parent is deleted, which the ETL must account for by detecting those deletions via `ALL ROWS` queries and propagating them to BigQuery's servicing dimension table.
 
-    **19.** High-volume CanaryAMS objects like billing transactions can contain millions of records accumulated over years of agency operations. Without a `SystemModstamp` filter, the SOQL query has no selective WHERE clause on an indexed field, causing Salesforce to scan the entire table. This will likely trigger a `QUERY_TIMEOUT` error in production, exceed the 50,000-row query limit (silently truncating results), and consume enormous API call quotas during pagination. In the worst case, a misconfigured ETL job could hit daily API limits for the entire org, blocking all other integrations. Always validate the expected row count in a sandbox using `SELECT COUNT() FROM Object WHERE SystemModstamp >= :window` before deploying any ETL query against production.
+    **19.** High-volume AMS package objects like billing transactions can contain millions of records accumulated over years of agency operations. Without a `SystemModstamp` filter, the SOQL query has no selective WHERE clause on an indexed field, causing Salesforce to scan the entire table. This will likely trigger a `QUERY_TIMEOUT` error in production, exceed the 50,000-row query limit (silently truncating results), and consume enormous API call quotas during pagination. In the worst case, a misconfigured ETL job could hit daily API limits for the entire org, blocking all other integrations. Always validate the expected row count in a sandbox using `SELECT COUNT() FROM Object WHERE SystemModstamp >= :window` before deploying any ETL query against production.
 
-    **20.** A non-indexed Text field as the sole WHERE clause filter forces a full table scan on `AESF__Policy__c`. With 600,000+ records in a production org, this query will be flagged as non-selective by Salesforce's query optimizer, leading to a `QUERY_TIMEOUT` or severely degraded performance. The fix has two parts: (1) mark `AESF__Custom_Reference__c` as an External ID field (if values are unique) or a Unique field in the object's metadata, which causes Salesforce to create a database index on it; (2) if the field cannot be made an External ID (e.g., values are not unique), combine the filter with an already-indexed field like `WHERE LastModifiedDate >= LAST_N_DAYS:7 AND AESF__Custom_Reference__c = :value` so the optimizer can use the `LastModifiedDate` index to limit the scan before applying the non-indexed filter.
+    **20.** A non-indexed Text field as the sole WHERE clause filter forces a full table scan on `APP__Policy__c`. With 600,000+ records in a production org, this query will be flagged as non-selective by Salesforce's query optimizer, leading to a `QUERY_TIMEOUT` or severely degraded performance. The fix has two parts: (1) mark `APP__Custom_Reference__c` as an External ID field (if values are unique) or a Unique field in the object's metadata, which causes Salesforce to create a database index on it; (2) if the field cannot be made an External ID (e.g., values are not unique), combine the filter with an already-indexed field like `WHERE LastModifiedDate >= LAST_N_DAYS:7 AND APP__Custom_Reference__c = :value` so the optimizer can use the `LastModifiedDate` index to limit the scan before applying the non-indexed filter.

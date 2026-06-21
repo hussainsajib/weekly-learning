@@ -10,11 +10,11 @@
 
 Reliability engineering is the discipline of building systems that remain trustworthy under real-world load, partial failure, and human error. Google's Site Reliability Engineering (SRE) model formalized this into a set of practices — SLOs, error budgets, blameless post-mortems, and toil reduction — that have since become the baseline expectation for senior engineers at any company running production services. For a staff-track engineer, knowing *how to define* reliability targets is as important as knowing how to hit them.
 
-AESF is a production integration platform where reliability has a precise, business-visible consequence: when the middleware goes down or degrades, Salesforce and Epic fall out of sync, creating data drift that takes hours of reconciliation work to repair. That context makes SRE practices immediately relevant rather than abstract. Every concept in this week's material maps to something you either own today (SLO definition for Epic sync lag, incident response, Alembic migrations) or will own as you move toward a staff role (cross-team reliability contracts, chaos program, deployment strategy).
+The CRM-EHR Integration Platform is a production integration platform where reliability has a precise, business-visible consequence: when the middleware goes down or degrades, Salesforce and the EHR system fall out of sync, creating data drift that takes hours of reconciliation work to repair. That context makes SRE practices immediately relevant rather than abstract. Every concept in this week's material maps to something you either own today (SLO definition for EHR sync lag, incident response, Alembic migrations) or will own as you move toward a staff role (cross-team reliability contracts, chaos program, deployment strategy).
 
 This guide covers the full SRE toolbox in practical depth: SLIs/SLOs/SLAs and how they chain together, error budgets as a policy instrument, chaos engineering at the GKE level, graceful degradation patterns for FastAPI, incident response runbooks, blameless post-mortem culture, and zero-downtime deployment and database migration strategies. Each section includes working code, configuration, or templates grounded in your stack (Python 3.13, FastAPI, GKE, Datadog, Alembic, Helm).
 
-By the end of this week you should be able to write a defensible SLO document for the AESF middleware, draft a Datadog SLO monitor in Terraform, run a controlled chaos experiment against a GKE deployment, write an incident runbook, and execute a zero-downtime Alembic migration on Cloud SQL — all without causing a production incident in the process.
+By the end of this week you should be able to write a defensible SLO document for the integration platform middleware, draft a Datadog SLO monitor in Terraform, run a controlled chaos experiment against a GKE deployment, write an incident runbook, and execute a zero-downtime Alembic migration on Cloud SQL — all without causing a production incident in the process.
 
 ---
 
@@ -28,31 +28,31 @@ By the end of this week you should be able to write a defensible SLO document fo
 
 The key insight is that SLAs should always be *looser* than your SLOs, which should be looser than what your system actually achieves. If your middleware's real availability is 99.95%, your SLO might target 99.9%, and your SLA might commit to 99.5%. That gap is your operational runway.
 
-For AESF, the most meaningful SLIs are:
+For the integration platform, the most meaningful SLIs are:
 
 | SLI | Measurement | Why it matters |
 |-----|-------------|----------------|
-| Sync lag (P95) | Time from Epic event to Salesforce record update | Data drift; sales reps see stale policy data |
+| Sync lag (P95) | Time from EHR system event to Salesforce record update | Data drift; sales reps see stale policy data |
 | API success rate | Non-5xx responses / total requests (rolling 5m) | Sync jobs depend on middleware uptime |
 | Queue depth | Pending records in middleware queue tables | Leading indicator of backlog/debt |
 | Migration execution time | Alembic `upgrade head` wall-clock duration | Downtime risk during deploys |
 
-**AESF SLO definition example (YAML, stored in repo):**
+**Integration platform SLO definition example (YAML, stored in repo):**
 
 ```yaml
-# aesf-py-middleware/slos/epic-sync-slo.yaml
-service: aesf-middleware
+# crm-middleware/slos/ehr-sync-slo.yaml
+service: crm-middleware
 owner: platform-team
 window: 30d
 
 slos:
-  - name: epic_sync_lag_p95
+  - name: ehr_sync_lag_p95
     description: >
-      95th-percentile latency from Epic BDE event creation to
+      95th-percentile latency from EHR system event creation to
       Salesforce record upsert must stay below 60 seconds.
     sli:
       type: latency
-      metric: aesf.sync.lag_seconds
+      metric: integration.sync.lag_seconds
       aggregation: p95
       source: datadog
     target: 60  # seconds
@@ -75,13 +75,13 @@ slos:
 
 ```hcl
 resource "datadog_service_level_objective" "middleware_availability" {
-  name        = "AESF Middleware Availability — 30d"
+  name        = "CRM Middleware Availability — 30d"
   type        = "metric"
-  description = "HTTP success rate for aesf-py-middleware /api/v2/* endpoints"
+  description = "HTTP success rate for crm-middleware /api/v2/* endpoints"
 
   query {
-    numerator   = "sum:trace.fastapi.request.hits{http.status_code:2*,service:aesf-middleware}.as_count()"
-    denominator = "sum:trace.fastapi.request.hits{service:aesf-middleware}.as_count()"
+    numerator   = "sum:trace.fastapi.request.hits{http.status_code:2*,service:crm-middleware}.as_count()"
+    denominator = "sum:trace.fastapi.request.hits{service:crm-middleware}.as_count()"
   }
 
   thresholds {
@@ -90,7 +90,7 @@ resource "datadog_service_level_objective" "middleware_availability" {
     warning   = 99.95
   }
 
-  tags = ["service:aesf-middleware", "env:prod", "team:platform"]
+  tags = ["service:crm-middleware", "env:prod", "team:platform"]
 }
 ```
 
@@ -107,7 +107,7 @@ Error budgets change the conversation from "should we ship this?" to "do we have
 **Budget consumption tracking in Python (simplified):**
 
 ```python
-# aesf-py-middleware/app/core/slo.py
+# crm-middleware/app/core/slo.py
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -156,7 +156,7 @@ def check_deploy_gate(budget: ErrorBudget) -> tuple[bool, str]:
 | < 5% | Feature freeze; reliability work only |
 | 0% | All hands on reliability; escalate to leadership |
 
-**AESF application:** After the March 2026 Cloud SQL failover incident consumed 40% of the quarterly error budget in a single event, the team should have enforced a two-week feature freeze and mandated chaos testing of the failover path before the next release. Error budget policy makes that decision automatic rather than political.
+**Integration platform application:** After the March 2026 Cloud SQL failover incident consumed 40% of the quarterly error budget in a single event, the team should have enforced a two-week feature freeze and mandated chaos testing of the failover path before the next release. Error budget policy makes that decision automatic rather than political.
 
 > **Common mistake:** Setting a single error budget for the entire service. Break it down: one budget for the sync pipeline, one for the admin API, one for migrations. A slow batch job eating sync budget is invisible if you only track aggregate availability.
 
@@ -177,20 +177,20 @@ The canonical approach (from Netflix's Chaos Monkey and Principles of Chaos Engi
 
 ```bash
 # Identify running middleware pods
-kubectl get pods -n aesf-prod -l app=aesf-middleware
+kubectl get pods -n integration-prod -l app=crm-middleware
 
 # Kill one pod — GKE should reschedule within ~30s
-kubectl delete pod aesf-middleware-7d9f8b-xkp2v -n aesf-prod
+kubectl delete pod crm-middleware-7d9f8b-xkp2v -n integration-prod
 
 # Watch recovery
-kubectl get pods -n aesf-prod -l app=aesf-middleware -w
+kubectl get pods -n integration-prod -l app=crm-middleware -w
 ```
 
 **Chaos experiment using Chaos Toolkit (Python DSL):**
 
 ```json
 {
-  "title": "AESF middleware survives single pod failure",
+  "title": "CRM middleware survives single pod failure",
   "description": "Kill one middleware pod; assert sync lag P95 stays under 60s",
   "steady-state-hypothesis": {
     "title": "Sync lag within SLO",
@@ -201,7 +201,7 @@ kubectl get pods -n aesf-prod -l app=aesf-middleware -w
         "tolerance": {"type": "range", "range": [0, 60]},
         "provider": {
           "type": "http",
-          "url": "http://aesf-middleware-internal/metrics/sync_lag_p95"
+          "url": "http://crm-middleware-internal/metrics/sync_lag_p95"
         }
       }
     ]
@@ -213,7 +213,7 @@ kubectl get pods -n aesf-prod -l app=aesf-middleware -w
       "provider": {
         "type": "process",
         "path": "kubectl",
-        "arguments": "delete pod -n aesf-prod -l app=aesf-middleware --field-selector=status.phase=Running --sort-by=.metadata.creationTimestamp -o name | head -1 | xargs kubectl delete -n aesf-prod"
+        "arguments": "delete pod -n integration-prod -l app=crm-middleware --field-selector=status.phase=Running --sort-by=.metadata.creationTimestamp -o name | head -1 | xargs kubectl delete -n integration-prod"
       },
       "pauses": {"after": 30}
     }
@@ -222,13 +222,13 @@ kubectl get pods -n aesf-prod -l app=aesf-middleware -w
 }
 ```
 
-**GKE-specific chaos scenarios relevant to AESF:**
+**GKE-specific chaos scenarios relevant to the integration platform:**
 
 | Scenario | Inject via | Expected behavior |
 |----------|-----------|-------------------|
 | Pod OOM kill | Resource limit reduction | Queue drain resumes after reschedule |
 | Cloud SQL connection exhaustion | `pgbench` saturation test | Connection pool rejects and returns 503 |
-| Epic BDE timeout | `tc netem` delay on egress | Retry with exponential backoff; alert fires |
+| EHR system timeout | `tc netem` delay on egress | Retry with exponential backoff; alert fires |
 | Node pool drain | `kubectl drain <node>` | Pod rescheduled to healthy node; no queue gap |
 
 > **Common mistake:** Running chaos experiments in production without a rollback plan and an on-call engineer watching dashboards. Always have a "stop" procedure documented before starting. Start in staging.
@@ -237,24 +237,24 @@ kubectl get pods -n aesf-prod -l app=aesf-middleware -w
 
 ## 4. Graceful Degradation
 
-Graceful degradation means a system continues to provide reduced — but acceptable — service when a dependency fails, rather than failing completely. For AESF, the most important degradation scenarios are: Epic BDE unavailable, Cloud SQL read replica lag, and Salesforce API rate limiting.
+Graceful degradation means a system continues to provide reduced — but acceptable — service when a dependency fails, rather than failing completely. For the integration platform, the most important degradation scenarios are: EHR system unavailable, Cloud SQL read replica lag, and Salesforce API rate limiting.
 
 **FastAPI dependency health with fallback:**
 
 ```python
-# aesf-py-middleware/app/api/deps.py
+# crm-middleware/app/api/deps.py
 from fastapi import HTTPException, status
-from app.core.epic_client import EpicClient, EpicUnavailableError
+from app.core.ehr_client import EhrClient, EhrUnavailableError
 from app.core.cache import get_cached_policy
 
 async def get_policy_with_fallback(policy_id: str) -> dict:
     """
-    Try Epic BDE first; fall back to last-known-good cache on transient errors.
+    Try EHR system first; fall back to last-known-good cache on transient errors.
     Raises 503 only if cache is also stale (> 4h old).
     """
     try:
-        return await EpicClient().get_policy(policy_id)
-    except EpicUnavailableError:
+        return await EhrClient().get_policy(policy_id)
+    except EhrUnavailableError:
         cached = await get_cached_policy(policy_id)
         if cached and cached.age_seconds < 14400:  # 4h TTL
             cached.metadata["degraded"] = True
@@ -262,8 +262,8 @@ async def get_policy_with_fallback(policy_id: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
-                "error": "epic_unavailable",
-                "message": "Epic BDE is unreachable and cache is stale. Retry later.",
+                "error": "ehr_unavailable",
+                "message": "EHR system is unreachable and cache is stale. Retry later.",
                 "retry_after": 60,
             }
         )
@@ -274,18 +274,18 @@ async def get_policy_with_fallback(policy_id: str) -> dict:
 ```python
 from circuitbreaker import circuit
 
-@circuit(failure_threshold=5, recovery_timeout=30, expected_exception=EpicUnavailableError)
-async def call_epic_api(endpoint: str, payload: dict) -> dict:
-    return await EpicClient().post(endpoint, payload)
+@circuit(failure_threshold=5, recovery_timeout=30, expected_exception=EhrUnavailableError)
+async def call_ehr_api(endpoint: str, payload: dict) -> dict:
+    return await EhrClient().post(endpoint, payload)
 ```
 
-**Degradation levels for AESF sync pipeline:**
+**Degradation levels for the integration platform sync pipeline:**
 
 ```
 Level 0 (Normal):   Full sync, all objects, real-time
 Level 1 (Degraded): Write-through cache; skip non-critical objects (Categories, Structures)
-Level 2 (Minimal):  Queue writes locally; batch sync when Epic recovers
-Level 3 (Read-only): Serve stale data from cache; disable all writes to Epic
+Level 2 (Minimal):  Queue writes locally; batch sync when EHR system recovers
+Level 3 (Read-only): Serve stale data from cache; disable all writes to EHR system
 Level 4 (Down):     Return 503; alert PagerDuty; start incident
 ```
 
@@ -297,20 +297,20 @@ Level 4 (Down):     Return 503; alert PagerDuty; start incident
 
 A runbook is a documented, step-by-step procedure for diagnosing and resolving a specific class of incident. Good runbooks reduce mean-time-to-resolve (MTTR) by eliminating the cognitive load of figuring out what to check during a high-stress outage.
 
-**AESF incident runbook template:**
+**Integration platform incident runbook template:**
 
 ```markdown
-# Runbook: AESF Sync Queue Backlog (ALERT: aesf.queue.depth > 500)
+# Runbook: Integration Platform Sync Queue Backlog (ALERT: integration.queue.depth > 500)
 
 **Severity:** SEV-2
 **Owner:** Platform Team
 **Last updated:** 2026-12-07
-**PagerDuty policy:** aesf-platform-oncall
+**PagerDuty policy:** integration-platform-oncall
 
 ---
 
 ## Symptoms
-- Datadog alert: `aesf.queue.depth` exceeds 500 for 5+ minutes
+- Datadog alert: `integration.queue.depth` exceeds 500 for 5+ minutes
 - Salesforce reps report stale policy/contact data
 - Sync lag P95 > 120s (2× SLO threshold)
 
@@ -318,19 +318,19 @@ A runbook is a documented, step-by-step procedure for diagnosing and resolving a
 
 1. **Check middleware pod health:**
    ```bash
-   kubectl get pods -n aesf-prod -l app=aesf-middleware
-   kubectl logs -n aesf-prod -l app=aesf-middleware --tail=100 | grep ERROR
+   kubectl get pods -n integration-prod -l app=crm-middleware
+   kubectl logs -n integration-prod -l app=crm-middleware --tail=100 | grep ERROR
    ```
 
-2. **Check Epic BDE connectivity:**
+2. **Check EHR system connectivity:**
    ```bash
-   kubectl exec -n aesf-prod deploy/aesf-middleware -- \
-     curl -sf http://de21web/epic-sdk/health || echo "EPIC UNREACHABLE"
+   kubectl exec -n integration-prod deploy/crm-middleware -- \
+     curl -sf http://ehr-server-prod/ehr-sdk/health || echo "EHR UNREACHABLE"
    ```
 
 3. **Check Cloud SQL connection pool:**
    ```bash
-   kubectl exec -n aesf-prod deploy/aesf-middleware -- \
+   kubectl exec -n integration-prod deploy/crm-middleware -- \
      python -c "from app.db.session import engine; print(engine.pool.status())"
    ```
 
@@ -347,7 +347,7 @@ A runbook is a documented, step-by-step procedure for diagnosing and resolving a
 ```
 Queue > 500?
 ├── Are middleware pods running? NO → restart deploy, page on-call
-├── Epic BDE unreachable? YES → activate Level 2 degradation, notify Epic team
+├── EHR system unreachable? YES → activate Level 2 degradation, notify EHR team
 ├── DB connection pool exhausted? YES → increase pool size, restart pods
 └── All healthy but queue growing? → check ETL job; check rate limiting on Salesforce API
 ```
@@ -373,10 +373,10 @@ A post-mortem (or "incident review") is a structured analysis of what went wrong
 
 **The blameless principle** rests on the assumption that engineers act rationally given the information and tools they had at the time. If an engineer made a "bad" decision, ask: Why did the system make that decision seem correct? What monitoring, tooling, or process was absent?
 
-**AESF post-mortem template:**
+**Integration platform post-mortem template:**
 
 ```markdown
-# Post-Mortem: AESF Sync Outage — 2026-11-14
+# Post-Mortem: Integration Platform Sync Outage — 2026-11-14
 
 **Duration:** 47 minutes (14:22–15:09 UTC)
 **Severity:** SEV-2
@@ -403,7 +403,7 @@ causing all middleware pods to crash-loop on startup after the 14:20 deploy.
 | 15:09 | All pods healthy; queue backlog cleared |
 
 ## Root cause
-Migration `2026_11_14_add_epic_ref_id.py` added `epic_ref_id VARCHAR NOT NULL`
+Migration `2026_11_14_add_ehr_ref_id.py` added `ehr_ref_id VARCHAR NOT NULL`
 without a server-side default. Cloud SQL applied the DDL; existing rows violated
 the constraint; SQLAlchemy model validation raised on startup.
 
@@ -435,21 +435,21 @@ the constraint; SQLAlchemy model validation raised on startup.
 
 ## 7. CI/CD Deployment Strategies — Blue-Green and Canary
 
-Zero-downtime deployment is a prerequisite for maintaining error budgets. The two main strategies for stateless services like AESF middleware are blue-green and canary.
+Zero-downtime deployment is a prerequisite for maintaining error budgets. The two main strategies for stateless services like the integration platform middleware are blue-green and canary.
 
 **Blue-Green Deployment:**
 Two identical environments (blue = current, green = new). Traffic switches atomically from blue to green. Rollback is instant: switch traffic back.
 
 ```yaml
-# kubernetes/aesf-middleware/blue-green-service.yaml
+# kubernetes/crm-middleware/blue-green-service.yaml
 apiVersion: v1
 kind: Service
 metadata:
-  name: aesf-middleware
-  namespace: aesf-prod
+  name: crm-middleware
+  namespace: integration-prod
 spec:
   selector:
-    app: aesf-middleware
+    app: crm-middleware
     slot: green   # Toggle between "blue" and "green" for cutover
   ports:
     - port: 80
@@ -458,21 +458,21 @@ spec:
 
 ```bash
 # Deploy green slot
-helm upgrade aesf-middleware ./charts/aesf-middleware \
+helm upgrade crm-middleware ./charts/crm-middleware \
   --set image.tag=v2.14.0 \
   --set slot=green \
   --set replicaCount=3 \
-  -n aesf-prod
+  -n integration-prod
 
 # Verify green is healthy
-kubectl rollout status deployment/aesf-middleware-green -n aesf-prod
+kubectl rollout status deployment/crm-middleware-green -n integration-prod
 
 # Cut over: patch service selector
-kubectl patch service aesf-middleware -n aesf-prod \
+kubectl patch service crm-middleware -n integration-prod \
   -p '{"spec":{"selector":{"slot":"green"}}}'
 
 # Monitor for 10 min, then decommission blue
-kubectl delete deployment aesf-middleware-blue -n aesf-prod
+kubectl delete deployment crm-middleware-blue -n integration-prod
 ```
 
 **Canary Deployment (Helm-based weight split):**
@@ -495,13 +495,13 @@ stable:
 # Alert if canary error rate > 2× stable error rate
 query = """
 (
-  sum:trace.fastapi.request.errors{service:aesf-middleware,version:v2.15.0-rc1}.as_rate()
+  sum:trace.fastapi.request.errors{service:crm-middleware,version:v2.15.0-rc1}.as_rate()
   /
-  sum:trace.fastapi.request.hits{service:aesf-middleware,version:v2.15.0-rc1}.as_rate()
+  sum:trace.fastapi.request.hits{service:crm-middleware,version:v2.15.0-rc1}.as_rate()
 ) > 2 * (
-  sum:trace.fastapi.request.errors{service:aesf-middleware,version:v2.14.0}.as_rate()
+  sum:trace.fastapi.request.errors{service:crm-middleware,version:v2.14.0}.as_rate()
   /
-  sum:trace.fastapi.request.hits{service:aesf-middleware,version:v2.14.0}.as_rate()
+  sum:trace.fastapi.request.hits{service:crm-middleware,version:v2.14.0}.as_rate()
 )
 """
 ```
@@ -520,11 +520,11 @@ The **expand/contract pattern** solves this:
 3. **Constrain:** Add NOT NULL constraint and index after backfill completes. Deploy.
 4. **Contract:** Remove the old column once all code references are gone. Deploy.
 
-**AESF example — adding `epic_ref_id` safely:**
+**Integration platform example — adding `ehr_ref_id` safely:**
 
 ```python
-# alembic/versions/2026_12_07_001_expand_epic_ref_id.py
-"""expand: add epic_ref_id nullable
+# alembic/versions/2026_12_07_001_expand_ehr_ref_id.py
+"""expand: add ehr_ref_id nullable
 
 Revision ID: a1b2c3d4e5f6
 """
@@ -535,25 +535,25 @@ def upgrade():
     # Step 1: Add nullable — no exclusive lock, no downtime
     op.add_column(
         'sync_queue',
-        sa.Column('epic_ref_id', sa.String(64), nullable=True)
+        sa.Column('ehr_ref_id', sa.String(64), nullable=True)
     )
     # Partial index — only locks rows being indexed, not the whole table
     op.create_index(
-        'ix_sync_queue_epic_ref_id',
+        'ix_sync_queue_ehr_ref_id',
         'sync_queue',
-        ['epic_ref_id'],
-        postgresql_where=sa.text('epic_ref_id IS NOT NULL')
+        ['ehr_ref_id'],
+        postgresql_where=sa.text('ehr_ref_id IS NOT NULL')
     )
 
 def downgrade():
-    op.drop_index('ix_sync_queue_epic_ref_id', 'sync_queue')
-    op.drop_column('sync_queue', 'epic_ref_id')
+    op.drop_index('ix_sync_queue_ehr_ref_id', 'sync_queue')
+    op.drop_column('sync_queue', 'ehr_ref_id')
 ```
 
 ```python
-# scripts/backfill_epic_ref_id.py — run as a one-off job, NOT in migration
+# scripts/backfill_ehr_ref_id.py — run as a one-off job, NOT in migration
 """
-Backfill epic_ref_id in batches of 1000 to avoid long-running locks.
+Backfill ehr_ref_id in batches of 1000 to avoid long-running locks.
 Safe to run while production traffic is live.
 """
 import asyncio
@@ -567,11 +567,11 @@ async def backfill():
         while True:
             result = await conn.execute(text("""
                 UPDATE sync_queue
-                SET epic_ref_id = epic_id::text
-                WHERE epic_ref_id IS NULL
+                SET ehr_ref_id = ehr_id::text
+                WHERE ehr_ref_id IS NULL
                   AND id IN (
                     SELECT id FROM sync_queue
-                    WHERE epic_ref_id IS NULL
+                    WHERE ehr_ref_id IS NULL
                     LIMIT :batch
                     FOR UPDATE SKIP LOCKED
                   )
@@ -587,8 +587,8 @@ asyncio.run(backfill())
 ```
 
 ```python
-# alembic/versions/2026_12_07_002_constrain_epic_ref_id.py
-"""constrain: make epic_ref_id NOT NULL after backfill
+# alembic/versions/2026_12_07_002_constrain_ehr_ref_id.py
+"""constrain: make ehr_ref_id NOT NULL after backfill
 
 Revision ID: b2c3d4e5f6a7
 """
@@ -600,18 +600,18 @@ def upgrade():
     # Then validate separately — shares lock mode, does not block reads/writes
     op.execute(
         "ALTER TABLE sync_queue "
-        "ADD CONSTRAINT sync_queue_epic_ref_id_not_null "
-        "CHECK (epic_ref_id IS NOT NULL) NOT VALID"
+        "ADD CONSTRAINT sync_queue_ehr_ref_id_not_null "
+        "CHECK (ehr_ref_id IS NOT NULL) NOT VALID"
     )
     op.execute(
         "ALTER TABLE sync_queue "
-        "VALIDATE CONSTRAINT sync_queue_epic_ref_id_not_null"
+        "VALIDATE CONSTRAINT sync_queue_ehr_ref_id_not_null"
     )
 
 def downgrade():
     op.execute(
         "ALTER TABLE sync_queue "
-        "DROP CONSTRAINT sync_queue_epic_ref_id_not_null"
+        "DROP CONSTRAINT sync_queue_ehr_ref_id_not_null"
     )
 ```
 
@@ -641,26 +641,26 @@ import datadog
 datadog.initialize(api_key="...", app_key="...")
 
 monitor = {
-    "name": "AESF SLO Burn Rate — 1h Fast Burn",
+    "name": "Integration Platform SLO Burn Rate — 1h Fast Burn",
     "type": "query alert",
     "query": """
         (
           1 - (
-            sum:trace.fastapi.request.hits{http.status_code:2*,service:aesf-middleware}
+            sum:trace.fastapi.request.hits{http.status_code:2*,service:crm-middleware}
               .as_rate().rollup(sum, 3600)
             /
-            sum:trace.fastapi.request.hits{service:aesf-middleware}
+            sum:trace.fastapi.request.hits{service:crm-middleware}
               .as_rate().rollup(sum, 3600)
           )
         ) / 0.001 > 14.4
     """,
     # 14.4× burn rate = consuming 30-day budget in 50 hours
     "message": (
-        "AESF middleware is burning its error budget at 14.4× the sustainable rate.\n"
+        "CRM middleware is burning its error budget at 14.4× the sustainable rate.\n"
         "At this rate the 30-day budget will be exhausted in ~50 hours.\n"
-        "@pagerduty-aesf-platform @slack-aesf-alerts"
+        "@pagerduty-integration-platform @slack-integration-alerts"
     ),
-    "tags": ["service:aesf-middleware", "slo:availability"],
+    "tags": ["service:crm-middleware", "slo:availability"],
     "options": {
         "thresholds": {"critical": 14.4, "warning": 6.0},
         "notify_no_data": False,
@@ -669,18 +669,18 @@ monitor = {
 }
 ```
 
-**Synthetic monitor for AESF sync pipeline health (Datadog):**
+**Synthetic monitor for integration platform sync pipeline health (Datadog):**
 
 ```python
 # Runs every 5 minutes from us-east-1, eu-west-1, ap-southeast-1
 synthetic_test = {
-    "name": "AESF Middleware — Sync Health Check",
+    "name": "CRM Middleware — Sync Health Check",
     "type": "api",
     "subtype": "http",
     "config": {
         "request": {
             "method": "GET",
-            "url": "https://aesf-middleware.prod.internal/health/sync",
+            "url": "https://crm-middleware.prod.internal/health/sync",
             "timeout": 10,
         },
         "assertions": [
@@ -740,15 +740,15 @@ Reliability Engineering & SRE
 
 **1.** What is the difference between an SLI and an SLO, and why does the distinction matter?
 
-**2.** Your AESF middleware has a 99.9% availability SLO over 30 days. How many minutes of "downtime equivalent" does your error budget represent?
+**2.** Your integration platform middleware has a 99.9% availability SLO over 30 days. How many minutes of "downtime equivalent" does your error budget represent?
 
 **3.** What is the expand/contract migration pattern and why is it necessary for zero-downtime deploys?
 
-**4.** A colleague runs `op.alter_column('sync_queue', 'epic_ref_id', nullable=False)` in an Alembic migration. What PostgreSQL behavior does this trigger and what is the risk?
+**4.** A colleague runs `op.alter_column('sync_queue', 'ehr_ref_id', nullable=False)` in an Alembic migration. What PostgreSQL behavior does this trigger and what is the risk?
 
 **5.** Describe the three-tier reliability contract: SLI → SLO → SLA. Why should SLAs always be looser than SLOs?
 
-**6.** You observe AESF sync lag P95 has been 45 seconds for the past hour (SLO: < 60s). Should you be concerned? What would make you more confident in your answer?
+**6.** You observe the integration platform sync lag P95 has been 45 seconds for the past hour (SLO: < 60s). Should you be concerned? What would make you more confident in your answer?
 
 **7.** What is error budget burn rate, and what does a 14.4× burn rate mean in terms of budget exhaustion time for a 30-day window?
 
@@ -760,23 +760,23 @@ Reliability Engineering & SRE
 
 **11.** What is the difference between a blameless post-mortem and a traditional root-cause analysis that names responsible individuals?
 
-**12.** You are writing a runbook for "AESF queue depth > 500." What are the first three diagnostic commands an on-call engineer should run?
+**12.** You are writing a runbook for "integration platform queue depth > 500." What are the first three diagnostic commands an on-call engineer should run?
 
 **13.** What is `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT`? Why is this safer than a direct `NOT NULL` alter?
 
 **14.** You have 4% of your monthly error budget remaining and it's day 22 of a 30-day cycle. What policy should you enforce?
 
-**15.** Describe two AESF-specific SLIs that are more meaningful than generic infrastructure metrics like CPU or memory.
+**15.** Describe two integration-platform-specific SLIs that are more meaningful than generic infrastructure metrics like CPU or memory.
 
 **16.** What is a canary deployment and how do you decide when to promote a canary to stable?
 
-**17.** What is graceful degradation Level 2 in the AESF context, and how does it protect the Epic sync pipeline during an outage?
+**17.** What is graceful degradation Level 2 in the integration platform context, and how does it protect the EHR sync pipeline during an outage?
 
 **18.** What is the primary risk of defining SLOs on infrastructure metrics (CPU, memory) rather than user-facing behavior?
 
 **19.** Why should the backfill script (Step 2 of expand/contract) be run as a separate job rather than inside the Alembic migration?
 
-**20.** What is toil in the SRE context, and give one example of toil in AESF operations that could be automated?
+**20.** What is toil in the SRE context, and give one example of toil in integration platform operations that could be automated?
 
 ---
 
@@ -790,11 +790,11 @@ Reliability Engineering & SRE
 
     **3.** The expand/contract pattern splits a schema change into three safe phases: first, add the new column as nullable (no locking DDL); second, backfill existing rows in small batches; third, add the NOT NULL constraint using PostgreSQL's two-step `ADD CONSTRAINT NOT VALID` + `VALIDATE CONSTRAINT`. It is necessary for zero-downtime deploys because a single-step `ALTER TABLE ... ADD COLUMN ... NOT NULL` takes an `ACCESS EXCLUSIVE` lock that blocks all reads and writes on the table until it completes — on a large table in production this can cause seconds to minutes of effective downtime.
 
-    **4.** SQLAlchemy's `alter_column(..., nullable=False)` generates `ALTER TABLE sync_queue ALTER COLUMN epic_ref_id SET NOT NULL`. In PostgreSQL this acquires an `ACCESS EXCLUSIVE` lock and performs a full table scan to verify no nulls exist. On a large table under production load this blocks all concurrent reads and writes for the duration of the scan, which can range from seconds to minutes. The risk is a sync outage and error budget consumption during what appears to be a routine deploy.
+    **4.** SQLAlchemy's `alter_column(..., nullable=False)` generates `ALTER TABLE sync_queue ALTER COLUMN ehr_ref_id SET NOT NULL`. In PostgreSQL this acquires an `ACCESS EXCLUSIVE` lock and performs a full table scan to verify no nulls exist. On a large table under production load this blocks all concurrent reads and writes for the duration of the scan, which can range from seconds to minutes. The risk is a sync outage and error budget consumption during what appears to be a routine deploy.
 
     **5.** The chain works as follows: SLIs are measured facts about system behavior; SLOs are internal targets placed on those SLIs; SLAs are external commitments made to customers or partners, backed by SLOs. SLAs must be looser than SLOs because there must be a buffer for real-world variation — if your SLO is 99.9% and you commit an SLA to 99.9%, any month where you barely meet your SLO will breach the SLA. The buffer between SLO and SLA represents the operational margin that protects the business from contractual consequences during normal engineering variance.
 
-    **6.** A sync lag of 45 seconds is within the SLO (< 60s), so no breach is occurring — but you should be monitoring the trend. If lag has been climbing from 20s to 45s over the past hour, you are likely approaching a breach and should investigate the cause now rather than after the SLO fires. More useful context would be: is the Epic queue growing? Is one object type disproportionately slow? Is a recent deploy correlated with the increase? The metric alone is insufficient without a rate-of-change view.
+    **6.** A sync lag of 45 seconds is within the SLO (< 60s), so no breach is occurring — but you should be monitoring the trend. If lag has been climbing from 20s to 45s over the past hour, you are likely approaching a breach and should investigate the cause now rather than after the SLO fires. More useful context would be: is the EHR queue growing? Is one object type disproportionately slow? Is a recent deploy correlated with the increase? The metric alone is insufficient without a rate-of-change view.
 
     **7.** Error budget burn rate is the ratio of the current error rate to the sustainable error rate that would exactly consume the budget over the SLO window. A 14.4× burn rate on a 30-day window means the service is consuming its monthly budget at 14.4 times the safe pace, which will exhaust the entire budget in approximately 30 / 14.4 ≈ 2.08 days, or roughly 50 hours. This is the "fast burn" threshold in Google's SRE alerting model and should trigger an immediate page rather than waiting for the SLO to breach.
 
@@ -806,20 +806,20 @@ Reliability Engineering & SRE
 
     **11.** A blameless post-mortem starts from the assumption that engineers acted rationally given the tools, information, and environment available to them at the time. When something goes wrong, the question is not "who made the mistake" but "what about the system, process, or tooling led a rational person to take the action that caused the failure?" Traditional root-cause analyses that name individuals suppress future incident reporting — engineers avoid disclosing mistakes if they expect punishment — which means systemic problems go unfixed and recur. Blameless culture produces better action items because it targets the conditions that made failure possible, not the person who happened to trigger it.
 
-    **12.** The first three commands in the AESF queue depth runbook should be: (1) `kubectl get pods -n aesf-prod -l app=aesf-middleware` — confirm pods are running and not crash-looping; (2) `kubectl logs -n aesf-prod -l app=aesf-middleware --tail=100 | grep ERROR` — check for application errors like database connection failures or Epic API timeouts; (3) a direct SQL query against the sync_queue table: `SELECT status, COUNT(*) FROM sync_queue WHERE status IN ('pending','failed') GROUP BY status` — to understand whether records are pending (not yet processed) or failed (attempted and errored), which points to different root causes.
+    **12.** The first three commands in the integration platform queue depth runbook should be: (1) `kubectl get pods -n integration-prod -l app=crm-middleware` — confirm pods are running and not crash-looping; (2) `kubectl logs -n integration-prod -l app=crm-middleware --tail=100 | grep ERROR` — check for application errors like database connection failures or EHR API timeouts; (3) a direct SQL query against the sync_queue table: `SELECT status, COUNT(*) FROM sync_queue WHERE status IN ('pending','failed') GROUP BY status` — to understand whether records are pending (not yet processed) or failed (attempted and errored), which points to different root causes.
 
     **13.** `ADD CONSTRAINT ... NOT VALID` adds the constraint to the table metadata so new inserts and updates must satisfy it, but it explicitly does not re-scan existing rows to verify them. This means it completes almost instantly without blocking. `VALIDATE CONSTRAINT` then performs the scan — but it holds only a `SHARE UPDATE EXCLUSIVE` lock, which allows concurrent reads and writes to proceed normally. The split approach is safer than a direct `SET NOT NULL` because it never blocks production traffic for the duration of a full table scan, which on a large Cloud SQL table could take minutes.
 
     **14.** With 4% budget remaining and 8 days left in the cycle, you should enforce a **feature freeze** (deploy only reliability fixes and critical security patches). At current consumption rate, the budget will likely be exhausted before the cycle ends, and any additional incidents will breach the SLO. The appropriate policy actions are: (a) require a post-mortem for whatever caused the budget burn to reach 96%; (b) staff a reliability sprint for the remaining week; (c) notify stakeholders that feature velocity is halted until reliability is restored.
 
-    **15.** Two AESF-specific SLIs more meaningful than CPU/memory: (1) **Sync lag P95** — the 95th-percentile time between an Epic BDE event being created and the corresponding Salesforce record being updated. This directly measures the user-visible pain of data drift. (2) **Queue failure rate** — the fraction of sync_queue records that transition to `failed` status within their first processing attempt. This measures the reliability of the Salesforce↔Epic data path, which is the core business function of the platform, independent of whether infrastructure is technically "healthy."
+    **15.** Two integration-platform-specific SLIs more meaningful than CPU/memory: (1) **Sync lag P95** — the 95th-percentile time between an EHR system event being created and the corresponding Salesforce record being updated. This directly measures the user-visible pain of data drift. (2) **Queue failure rate** — the fraction of sync_queue records that transition to `failed` status within their first processing attempt. This measures the reliability of the Salesforce-to-EHR data path, which is the core business function of the platform, independent of whether infrastructure is technically "healthy."
 
     **16.** A canary deployment routes a small fraction of production traffic (typically 1–10%) to the new version while the majority stays on the stable version. The promotion decision is based on comparing error rate, latency, and custom business metrics between canary and stable over a observation window (typically 10–30 minutes). The canary is promoted to stable when: (a) its error rate is not statistically higher than stable; (b) P95 latency has not regressed; and (c) any custom SLI checks (e.g., sync queue depth not growing) pass. Automated promotion gates in Argo Rollouts or Flagger can make this decision programmatically.
 
-    **17.** Level 2 degradation in the AESF context means the middleware stops attempting real-time Epic API calls and instead queues all write operations locally in the database, batching them for replay when Epic connectivity is restored. Reads may still be served from a cache with a staleness indicator. This protects the sync pipeline by preventing cascading failures: rather than failing all in-flight Salesforce-triggered operations with 503s (which would cause Apex trigger failures and lost events), the system absorbs the writes safely and reconciles them when the dependency recovers. Data drift is bounded and controlled rather than unbounded.
+    **17.** Level 2 degradation in the integration platform context means the middleware stops attempting real-time EHR API calls and instead queues all write operations locally in the database, batching them for replay when EHR connectivity is restored. Reads may still be served from a cache with a staleness indicator. This protects the sync pipeline by preventing cascading failures: rather than failing all in-flight Salesforce-triggered operations with 503s (which would cause Apex trigger failures and lost events), the system absorbs the writes safely and reconciles them when the dependency recovers. Data drift is bounded and controlled rather than unbounded.
 
-    **18.** Defining SLOs on CPU and memory creates a false sense of reliability: the infrastructure can be "green" while users experience degraded service. Conversely, CPU at 80% might be perfectly acceptable during a batch job with no user-facing impact. Infrastructure metrics are leading indicators of potential problems, not direct measures of user experience. If you page on high CPU, you create alert fatigue from false positives. If your SLO only covers infrastructure, you will miss incidents where the service is responding slowly or incorrectly despite healthy-looking infrastructure — exactly the kind of subtle degradation that causes data drift in AESF.
+    **18.** Defining SLOs on CPU and memory creates a false sense of reliability: the infrastructure can be "green" while users experience degraded service. Conversely, CPU at 80% might be perfectly acceptable during a batch job with no user-facing impact. Infrastructure metrics are leading indicators of potential problems, not direct measures of user experience. If you page on high CPU, you create alert fatigue from false positives. If your SLO only covers infrastructure, you will miss incidents where the service is responding slowly or incorrectly despite healthy-looking infrastructure — exactly the kind of subtle degradation that causes data drift in the integration platform.
 
     **19.** Running the backfill inside the Alembic migration is dangerous for two reasons. First, Alembic migrations run inside a transaction — a backfill that processes millions of rows holds an open transaction for minutes or hours, blocking other DDL operations and consuming database connection resources. Second, if the backfill fails partway through, the entire migration rolls back, leaving the schema unchanged and requiring the engineer to diagnose and re-run in a stressful deploy situation. A separate script gives you fine-grained control: it can be paused, resumed, monitored, and retried in isolation without touching the schema state.
 
-    **20.** Toil in the SRE context is operational work that is manual, repetitive, automatable, tactical (reactive rather than strategic), and scales linearly with service growth rather than remaining constant. Google's SRE model targets keeping toil below 50% of an engineer's time. One concrete AESF example: manually running `python scripts/reconcile.py --hours 4` after every incident to repair data drift. This is manual (requires SSH access or kubectl exec), repetitive (happens after most SEV-2 incidents), automatable (could be triggered automatically when queue depth returns to normal after an incident), and scales with incident frequency. Automating it via a post-recovery Kubernetes Job would eliminate this toil entirely.
+    **20.** Toil in the SRE context is operational work that is manual, repetitive, automatable, tactical (reactive rather than strategic), and scales linearly with service growth rather than remaining constant. Google's SRE model targets keeping toil below 50% of an engineer's time. One concrete integration platform example: manually running `python scripts/reconcile.py --hours 4` after every incident to repair data drift. This is manual (requires SSH access or kubectl exec), repetitive (happens after most SEV-2 incidents), automatable (could be triggered automatically when queue depth returns to normal after an incident), and scales with incident frequency. Automating it via a post-recovery Kubernetes Job would eliminate this toil entirely.

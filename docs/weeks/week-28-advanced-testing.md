@@ -12,13 +12,13 @@ Testing is the discipline that separates software you can ship with confidence f
 
 Property-based testing with Hypothesis pushes unit testing to its logical extreme by letting the framework generate thousands of inputs to your functions automatically, finding edge cases you would never think to write by hand. Mutation testing inverts the process: rather than asking "does this test pass?", it asks "if I subtly break the code, do the tests catch it?" Together, these two techniques measure the quality of your test suite itself, not just whether it runs green.
 
-The AESF middleware is a canonical example of an integration-heavy system that is genuinely hard to test. It sits between Salesforce (Apex callouts), an Epic EHR backend, and a PostgreSQL queue. A pure unit test of the sync logic misses the contract between Salesforce and the middleware. A full E2E test against production Epic is slow and risky. The answer is a layered strategy: contract testing with Pact for the Apex→middleware interface, property-based testing for sync deduplication invariants, and Testcontainers to spin up a real PostgreSQL instance for queue-table logic — all running in CI without external dependencies.
+The crm-middleware is a canonical example of an integration-heavy system that is genuinely hard to test. It sits between Salesforce (Apex callouts), the EHR system backend, and a PostgreSQL queue. A pure unit test of the sync logic misses the contract between Salesforce and the middleware. A full E2E test against production the EHR system is slow and risky. The answer is a layered strategy: contract testing with Pact for the Apex→middleware interface, property-based testing for sync deduplication invariants, and Testcontainers to spin up a real PostgreSQL instance for queue-table logic — all running in CI without external dependencies.
 
-Async code and ETL pipelines add another dimension. FastAPI's async request handlers, SQLAlchemy's async sessions, and pytest-asyncio introduce ordering and event-loop pitfalls that trip up engineers who treat async as just "faster sync". This week covers all these layers with concrete pytest code, Hypothesis strategies, Pact contract definitions, and Testcontainers fixtures — grounded throughout in the AESF codebase patterns you actually work with.
+Async code and ETL pipelines add another dimension. FastAPI's async request handlers, SQLAlchemy's async sessions, and pytest-asyncio introduce ordering and event-loop pitfalls that trip up engineers who treat async as just "faster sync". This week covers all these layers with concrete pytest code, Hypothesis strategies, Pact contract definitions, and Testcontainers fixtures — grounded throughout in the integration platform codebase patterns you actually work with.
 
 ---
 
-## 1. The Test Pyramid and Where AESF Lives
+## 1. The Test Pyramid and Where the Integration Platform Lives
 
 The test pyramid, coined by Mike Cohn, defines three layers by speed and scope:
 
@@ -32,18 +32,18 @@ The test pyramid, coined by Mike Cohn, defines three layers by speed and scope:
   /------------------\
 ```
 
-For AESF specifically, the layers map like this:
+For the integration platform specifically, the layers map like this:
 
-| Layer | AESF Example | Tooling | Speed |
+| Layer | Example | Tooling | Speed |
 |---|---|---|---|
 | Unit | Sync deduplication logic, field-mapping transforms | pytest + Hypothesis | <100 ms |
 | Integration | Middleware endpoints + real PostgreSQL queue tables | pytest + Testcontainers | 1–10 s |
-| Contract | Apex callout ↔ middleware JSON shape | Pact | seconds (no live Epic) |
-| E2E | Full Account sync from Salesforce sandbox to Epic QA | Manual / Cypress | minutes |
+| Contract | Apex callout ↔ middleware JSON shape | Pact | seconds (no live EHR system) |
+| E2E | Full Account sync from Salesforce sandbox to EHR QA | Manual / Cypress | minutes |
 
-The goal is to push as much coverage as possible down the pyramid without sacrificing confidence. A contract test that runs in CI in 3 seconds gives you more day-to-day safety than an E2E test against the QA org that requires a live Epic DEV server.
+The goal is to push as much coverage as possible down the pyramid without sacrificing confidence. A contract test that runs in CI in 3 seconds gives you more day-to-day safety than an E2E test against the QA org that requires a live EHR DEV server.
 
-**Common mistake:** Writing integration tests that call the real Epic BDE endpoint from CI. This makes CI dependent on network availability, Epic server uptime, and test data state. Use Pact consumer-driven contracts instead — the consumer (middleware) defines what it expects, and the provider (Epic SDK or a mock) verifies it without a live server.
+**Common mistake:** Writing integration tests that call the real EHR BDE endpoint from CI. This makes CI dependent on network availability, EHR server uptime, and test data state. Use Pact consumer-driven contracts instead — the consumer (middleware) defines what it expects, and the provider (EHR SDK or a mock) verifies it without a live server.
 
 ---
 
@@ -95,7 +95,7 @@ def test_deduplication_preserves_latest(events):
 
 ### Stateful testing with RuleBasedStateMachine
 
-For the AESF queue table, which behaves like a state machine (events enqueued → processing → done/failed), Hypothesis's `RuleBasedStateMachine` is a natural fit:
+For the integration platform queue table, which behaves like a state machine (events enqueued → processing → done/failed), Hypothesis's `RuleBasedStateMachine` is a natural fit:
 
 ```python
 from hypothesis.stateful import RuleBasedStateMachine, rule, initialize, invariant
@@ -134,9 +134,9 @@ TestQueueStateMachine = QueueStateMachine.TestCase
 
 Pact is a consumer-driven contract testing framework. The consumer (e.g., the Apex callout or the ETL job) defines what it expects from the provider (the middleware API), and the provider verifies those expectations independently — without a live consumer present.
 
-### Why this matters for AESF
+### Why this matters for the integration platform
 
-The Apex `AccountTriggerHandler` makes HTTP callouts to `aesf-py-middleware`. If a middleware developer renames a JSON field (say, `client_id` → `clientId`), Salesforce deployments break silently until someone manually tests the integration. Pact catches this in CI.
+The Apex `AccountTriggerHandler` makes HTTP callouts to crm-middleware. If a middleware developer renames a JSON field (say, `client_id` → `clientId`), Salesforce deployments break silently until someone manually tests the integration. Pact catches this in CI.
 
 ### Consumer side (Python client simulating Apex behavior)
 
@@ -150,7 +150,7 @@ PACT_DIR = "tests/contract/pacts"
 @pytest.fixture(scope="session")
 def pact():
     p = Consumer("ApexAccountTrigger").has_pact_with(
-        Provider("AESFMiddleware"),
+        Provider("CRMMiddleware"),
         pact_dir=PACT_DIR,
         log_dir="logs/pact",
     )
@@ -204,7 +204,7 @@ from pact import Verifier
 
 def test_provider_honors_apex_contract():
     verifier = Verifier(
-        provider="AESFMiddleware",
+        provider="CRMMiddleware",
         provider_base_url="http://localhost:8000",  # real FastAPI app in test
     )
     output, _ = verifier.verify_with_broker(
@@ -233,7 +233,7 @@ def test_provider_honors_apex_contract():
 
 Mutation testing answers the question: "How good are my tests, really?" It works by automatically introducing small bugs (mutations) into the source code — flipping `>` to `>=`, removing a `return`, changing `and` to `or` — and then checking whether your test suite fails. A mutation that does not cause any test to fail is a "surviving mutant", which indicates a gap in test coverage.
 
-### Running mutmut on AESF middleware
+### Running mutmut on the middleware
 
 ```bash
 # Install
@@ -256,7 +256,7 @@ Mutation score: 73%   (73 killed / 100 total mutants)
 Surviving mutants: 27
 ```
 
-A score above 80% is generally considered healthy for business logic. For sync deduplication and field-mapping code — which is the heart of AESF correctness — aim for 90%+.
+A score above 80% is generally considered healthy for business logic. For sync deduplication and field-mapping code — which is the heart of integration platform correctness — aim for 90%+.
 
 ### Example: catching a surviving mutant
 
@@ -288,7 +288,7 @@ def test_deduplication_keeps_existing_on_equal_timestamp():
 
 ## 5. Testcontainers for Real PostgreSQL Tests
 
-Testcontainers spins up real Docker containers during tests and tears them down afterward. For AESF, this means your integration tests run against a real PostgreSQL database — not SQLite, not mocks — so you catch dialect-specific behavior, constraint violations, and index performance issues that mocks hide.
+Testcontainers spins up real Docker containers during tests and tears them down afterward. For the integration platform, this means your integration tests run against a real PostgreSQL database — not SQLite, not mocks — so you catch dialect-specific behavior, constraint violations, and index performance issues that mocks hide.
 
 ### Fixture setup with pytest
 
@@ -321,7 +321,7 @@ def db_session(db_engine):
     session.close()
 ```
 
-### Testing AESF queue table logic
+### Testing integration platform queue table logic
 
 ```python
 # tests/integration/test_queue_table.py
@@ -349,7 +349,7 @@ def test_failed_event_is_retryable(db_session):
     manager.enqueue(event)
 
     dequeued = manager.dequeue_one()
-    manager.mark_failed(dequeued, reason="Epic timeout")
+    manager.mark_failed(dequeued, reason="EHR timeout")
 
     # Failed events with retry_count < MAX_RETRIES should be re-enqueued
     retryable = manager.get_retryable_events()
@@ -532,7 +532,7 @@ Apex callouts to external services cannot hit real endpoints during unit tests �
 
 ### Mocking inbound Apex callouts in Python tests
 
-When AESF middleware receives a callout from Apex, you test the middleware endpoint independently. The question is: does the middleware correctly handle the JSON shape that Apex actually sends?
+When crm-middleware receives a callout from Apex, you test the middleware endpoint independently. The question is: does the middleware correctly handle the JSON shape that Apex actually sends?
 
 ```python
 # tests/unit/test_apex_callout_handler.py
@@ -546,8 +546,8 @@ APEX_ACCOUNT_PAYLOAD = {
     "Name": "Acme Insurance",
     "BillingCity": "Chicago",
     "BillingState": "IL",
-    "AESF__Epic_Client_Id__c": None,
-    "AESF__Sync_Status__c": "Pending",
+    "APP__EHR_Client_Id__c": None,
+    "APP__Sync_Status__c": "Pending",
 }
 
 async def test_middleware_accepts_apex_account_shape(client):
@@ -555,12 +555,12 @@ async def test_middleware_accepts_apex_account_shape(client):
     assert response.status_code in (200, 201)
     assert "client_id" in response.json()
 
-async def test_middleware_returns_epic_id_for_apex_to_write_back(client):
+async def test_middleware_returns_ehr_id_for_apex_to_write_back(client):
     response = await client.post("/api/v2/clients", json=APEX_ACCOUNT_PAYLOAD)
     data = response.json()
-    # Apex reads this field and writes it back to AESF__Epic_Client_Id__c
-    assert "epic_client_id" in data
-    assert isinstance(data["epic_client_id"], str)
+    # Apex reads this field and writes it back to APP__EHR_Client_Id__c
+    assert "ehr_client_id" in data
+    assert isinstance(data["ehr_client_id"], str)
 ```
 
 ### Testing Apex itself with HttpCalloutMock
@@ -572,13 +572,13 @@ For completeness, the Apex side (not Python) uses this pattern:
 @IsTest
 private class AccountTriggerHandlerTest {
     @IsTest
-    static void testSyncToEpic_CreatesClient() {
-        Test.setMock(HttpCalloutMock.class, new AESFMiddlewareMock(201, '{"epic_client_id":"EPIC_001"}'));
+    static void testSyncToEHR_CreatesClient() {
+        Test.setMock(HttpCalloutMock.class, new CRMMiddlewareMock(201, '{"ehr_client_id":"EHR_001"}'));
         Account acc = new Account(Name = 'Test Corp', BillingCity = 'Chicago');
         insert acc;
-        // Assert AESF__Epic_Client_Id__c was set by the trigger
-        acc = [SELECT AESF__Epic_Client_Id__c FROM Account WHERE Id = :acc.Id];
-        System.assertEquals('EPIC_001', acc.AESF__Epic_Client_Id__c);
+        // Assert APP__EHR_Client_Id__c was set by the trigger
+        acc = [SELECT APP__EHR_Client_Id__c FROM Account WHERE Id = :acc.Id];
+        System.assertEquals('EHR_001', acc.APP__EHR_Client_Id__c);
     }
 }
 ```
@@ -633,7 +633,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: pytest -m contract
-      - run: pact-broker can-i-deploy --pacticipant AESFMiddleware --version ${{ github.sha }}
+      - run: pact-broker can-i-deploy --pacticipant CRMMiddleware --version ${{ github.sha }}
 
   mutation:
     runs-on: ubuntu-latest
@@ -684,7 +684,7 @@ Advanced Testing Strategies
 │   ├── AsyncClient + ASGITransport for FastAPI
 │   └── Background task mocking
 │
-└── AESF Applications
+└── Integration Platform Applications
     ├── Pact: Apex callout ↔ middleware JSON contract
     ├── Hypothesis: deduplication invariants + queue state machine
     ├── Testcontainers: queue table logic + ETL source tables
@@ -723,7 +723,7 @@ Advanced Testing Strategies
 
 **13.** What invariant properties can Hypothesis test for a deduplication function that a fixed set of example-based tests might miss?
 
-**14.** Describe how you would structure CI for the AESF middleware to balance speed (fast feedback) against coverage (real I/O tests).
+**14.** Describe how you would structure CI for the crm-middleware to balance speed (fast feedback) against coverage (real I/O tests).
 
 **15.** What is the `RuleBasedStateMachine` in Hypothesis and what kind of system is it suited for?
 
@@ -757,7 +757,7 @@ Advanced Testing Strategies
 
     **7.** Mutation testing is computationally expensive: for each mutant, it re-runs the entire test suite. If a codebase has 1,000 mutants and the test suite takes 30 seconds, a full mutation run takes roughly 8 hours. Running this on every commit would block developers waiting for CI feedback. Instead, mutation testing is best run nightly, weekly, or scoped to files changed in a pull request (using `--paths-to-mutate` targeting the diff). This provides the quality signal without blocking the development loop.
 
-    **8.** SQLite and PostgreSQL have different SQL dialects, different constraint enforcement behavior, different index strategies, and different handling of concurrent writes. Code that works perfectly against SQLite can fail against PostgreSQL due to dialect-specific syntax (e.g., `ON CONFLICT DO UPDATE`), stricter foreign key enforcement, different NULL handling in indexes, or transaction isolation differences. Testcontainers runs a real PostgreSQL container, so your integration tests catch these issues before deployment. This is especially important for AESF queue table logic, which uses PostgreSQL-specific features like advisory locks and `FOR UPDATE SKIP LOCKED`.
+    **8.** SQLite and PostgreSQL have different SQL dialects, different constraint enforcement behavior, different index strategies, and different handling of concurrent writes. Code that works perfectly against SQLite can fail against PostgreSQL due to dialect-specific syntax (e.g., `ON CONFLICT DO UPDATE`), stricter foreign key enforcement, different NULL handling in indexes, or transaction isolation differences. Testcontainers runs a real PostgreSQL container, so your integration tests catch these issues before deployment. This is especially important for integration platform queue table logic, which uses PostgreSQL-specific features like advisory locks and `FOR UPDATE SKIP LOCKED`.
 
     **9.** The container and engine are expensive to create — starting a Docker container takes several seconds, and creating a SQLAlchemy engine runs initial connection setup. Reusing them across the entire test session is efficient. The database session, however, must be isolated per test: each test should start with a clean transaction and roll it back at the end so that data inserted by one test does not affect another. Using `scope="function"` for the session ensures every test gets a fresh, empty transaction, making tests order-independent and preventing data pollution.
 
@@ -765,13 +765,13 @@ Advanced Testing Strategies
 
     **11.** Salesforce's platform sandbox enforces a rule that Apex code executed during tests cannot make real outbound HTTP callouts, throwing `System.CalloutException` if attempted. This is by design — it prevents tests from depending on external service availability and avoids unintended side effects in external systems. Salesforce provides the `HttpCalloutMock` interface as the replacement: developers implement the interface to return a controlled `HttpResponse`, register it with `Test.setMock()`, and the Apex HTTP classes use the mock during test execution instead of making a real network request.
 
-    **12.** Pact creates a verified link between the mock and reality. The consumer test generates a pact file that records the exact request/response interaction, including the JSON shape the consumer expects. The provider (the real middleware) runs a verification step in CI that replays every interaction from the pact file against the actual running FastAPI application and asserts the responses match. If a middleware developer changes the response schema — renaming `epic_client_id` to `epicClientId` — the provider verification fails in middleware CI, preventing the breaking change from being deployed. The Pact Broker's "Can I Deploy" gate then blocks the Salesforce deployment until the consumer and provider are compatible.
+    **12.** Pact creates a verified link between the mock and reality. The consumer test generates a pact file that records the exact request/response interaction, including the JSON shape the consumer expects. The provider (the real middleware) runs a verification step in CI that replays every interaction from the pact file against the actual running FastAPI application and asserts the responses match. If a middleware developer changes the response schema — renaming `ehr_client_id` to `ehrClientId` — the provider verification fails in middleware CI, preventing the breaking change from being deployed. The Pact Broker's "Can I Deploy" gate then blocks the Salesforce deployment until the consumer and provider are compatible.
 
     **13.** Hypothesis can test invariants that hold for all valid inputs: deduplication is idempotent (running it twice gives the same result as once), deduplication never increases the number of events, each external ID appears at most once in the output, and the surviving event for a given ID is always the one with the latest `updated_at` timestamp. These invariants are much harder to verify exhaustively with fixed examples because edge cases like exactly two events with the same ID and equal timestamps, or a list of 50 events where 49 have the same ID, require explicit thought to include. Hypothesis generates these cases automatically.
 
-    **14.** A well-structured CI for AESF middleware uses separate jobs per layer: a `unit` job that runs fast (`pytest -m unit`) with no Docker, completing in under a minute; an `integration` job that uses Testcontainers (requires Docker-in-Docker) and runs in 2–5 minutes; a `contract` job that runs Pact consumer and provider verification in parallel; and a nightly `mutation` job scoped to changed files. The `unit` job runs on every push and is the primary developer feedback loop. The `integration` and `contract` jobs run on pull requests. This structure means most commits get feedback in under 2 minutes while still having real-database and contract coverage on every PR.
+    **14.** A well-structured CI for crm-middleware uses separate jobs per layer: a `unit` job that runs fast (`pytest -m unit`) with no Docker, completing in under a minute; an `integration` job that uses Testcontainers (requires Docker-in-Docker) and runs in 2–5 minutes; a `contract` job that runs Pact consumer and provider verification in parallel; and a nightly `mutation` job scoped to changed files. The `unit` job runs on every push and is the primary developer feedback loop. The `integration` and `contract` jobs run on pull requests. This structure means most commits get feedback in under 2 minutes while still having real-database and contract coverage on every PR.
 
-    **15.** `RuleBasedStateMachine` is a Hypothesis class for testing stateful systems. You define rules (methods decorated with `@rule`) that represent valid state transitions, and an invariant (decorated with `@invariant`) that must hold after every rule application. Hypothesis generates sequences of rule applications — essentially random but valid state machine paths — and checks the invariant after each step. It is suited for systems that are naturally stateful: queues (enqueue/dequeue/fail/retry), caches (set/get/evict), event sourcing systems, and any system where the order of operations matters. For AESF's sync queue, it can verify that the queue never delivers an event more times than it was enqueued.
+    **15.** `RuleBasedStateMachine` is a Hypothesis class for testing stateful systems. You define rules (methods decorated with `@rule`) that represent valid state transitions, and an invariant (decorated with `@invariant`) that must hold after every rule application. Hypothesis generates sequences of rule applications — essentially random but valid state machine paths — and checks the invariant after each step. It is suited for systems that are naturally stateful: queues (enqueue/dequeue/fail/retry), caches (set/get/evict), event sourcing systems, and any system where the order of operations matters. For the integration platform's sync queue, it can verify that the queue never delivers an event more times than it was enqueued.
 
     **16.** FastAPI's `BackgroundTasks` run after the HTTP response has been sent to the client. A test that only asserts `response.status_code == 201` never waits for the background task to complete and has no visibility into whether it ran, what it did, or whether it failed. To test background task behavior, either mock the task function with `unittest.mock.AsyncMock` and assert it was called with the correct arguments (testing that the endpoint correctly schedules the task), or use `anyio` task groups to await the task directly in a unit test (testing the task's logic itself). Both approaches give you deterministic, fast tests without relying on timing or thread scheduling.
 
@@ -779,6 +779,6 @@ Advanced Testing Strategies
 
     **18.** Log output is a side effect of implementation, not a specification of behavior. If the ETL transform function logs "processed 5 rows" but actually wrote corrupted data to the output table, a log-based assertion would pass while the real failure is invisible. Logs can also change without changing behavior — adding a debug log line would break log-based tests unnecessarily. Assertions on transformed data — the actual rows in the output table, the count of processed records, the field values in the BigQuery rows — are direct assertions on what the ETL is supposed to do. They are stable under refactoring and fail precisely when the behavior changes.
 
-    **19.** The "Can I Deploy" check queries the Pact Broker to determine whether a specific version of a pacticipant (consumer or provider) is compatible with all the other pacticipants it integrates with in a target environment. It should gate deployments immediately before the actual deployment step — after all tests pass but before `kubectl apply` or `helm upgrade` runs. For AESF, it would check: "Is this version of AESFMiddleware compatible with all known consumers (ApexAccountTrigger, ETL jobs) that are currently deployed in the target environment?" If a breaking change was introduced and the consumer has not yet been updated, "Can I Deploy" returns false and the deployment is blocked.
+    **19.** The "Can I Deploy" check queries the Pact Broker to determine whether a specific version of a pacticipant (consumer or provider) is compatible with all the other pacticipants it integrates with in a target environment. It should gate deployments immediately before the actual deployment step — after all tests pass but before `kubectl apply` or `helm upgrade` runs. For the integration platform, it would check: "Is this version of CRMMiddleware compatible with all known consumers (ApexAccountTrigger, ETL jobs) that are currently deployed in the target environment?" If a breaking change was introduced and the consumer has not yet been updated, "Can I Deploy" returns false and the deployment is blocked.
 
     **20.** Property-based testing and mutation testing are complementary and neither can replace the other. Property-based testing is a test-writing technique: it generates inputs to verify that your code satisfies invariants. Mutation testing is a test-quality measurement technique: it verifies that your tests are sensitive to behavioral changes. You can have a property-based test that is poorly written — testing a trivially true invariant — and mutation testing would reveal that surviving mutants are not caught by it. Conversely, mutation testing tells you there is a gap but does not tell you what input to use; property-based testing is a powerful way to fill that gap once the survivor points you at the right code. Use Hypothesis to build high-quality assertions, and mutmut to verify that those assertions actually exercise the full behavioral space.

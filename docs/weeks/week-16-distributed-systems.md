@@ -8,13 +8,13 @@
 
 ## Overview
 
-Distributed systems are the backbone of every modern, scalable application — and they introduce a category of problems that simply do not exist when everything runs on a single machine. The moment you split state across two nodes, you are confronted with questions about consistency, availability, and the reliability of the network between them. For an engineer working on a system like AESF, where a single business transaction must be coherently reflected in three separate systems — Salesforce, the FastAPI middleware's PostgreSQL database, and the Epic EHR backend — mastering this mental model is not optional. It is the core reasoning tool for every architectural decision you make.
+Distributed systems are the backbone of every modern, scalable application — and they introduce a category of problems that simply do not exist when everything runs on a single machine. The moment you split state across two nodes, you are confronted with questions about consistency, availability, and the reliability of the network between them. For an engineer working on a system like the integration platform, where a single business transaction must be coherently reflected in three separate systems — Salesforce, the FastAPI middleware's PostgreSQL database, and the EHR system backend — mastering this mental model is not optional. It is the core reasoning tool for every architectural decision you make.
 
 This week covers the foundational theory that underpins virtually every distributed database, message broker, and cloud-native system you will encounter. We start with the CAP theorem and its more practical sibling PACELC, which give you a vocabulary for the trade-offs you are constantly negotiating. We then move into concrete consistency models — eventual, strong, and causal — and examine what guarantees each one actually makes to the application layer. From there, we study Raft consensus, the algorithm behind many modern distributed datastores, in enough depth to reason about its failure modes without getting lost in the proof.
 
 The second half of the week focuses on distributed time. Clocks in distributed systems are fundamentally unreliable, and the tools we use to reason about ordering — Lamport timestamps and vector clocks — replace wall-clock time with logical causality. We then examine the failure modes that dominate operational concerns at scale: split brain and network partitions. Understanding how these manifest is what separates engineers who debug distributed failures quickly from those who spend hours in confusion.
 
-Finally, we anchor all of this theory in the technologies you work with every day: PostgreSQL replication (including Cloud SQL's streaming replication and its lag characteristics) and Apache Kafka's partition model. By the end of the week, you should be able to look at the AESF three-way sync — Salesforce trigger fires, middleware enqueues, Epic BDE processes — and name exactly what consistency model it provides, where the partition risks live, and what failure modes require manual reconciliation.
+Finally, we anchor all of this theory in the technologies you work with every day: PostgreSQL replication (including Cloud SQL's streaming replication and its lag characteristics) and Apache Kafka's partition model. By the end of the week, you should be able to look at the integration platform three-way sync — Salesforce trigger fires, middleware enqueues, EHR system BDE processes — and name exactly what consistency model it provides, where the partition risks live, and what failure modes require manual reconciliation.
 
 ---
 
@@ -52,7 +52,7 @@ The critical insight that most engineers miss on first encounter: **partition to
 | Kafka (acks=1) | AP | Low Latency preferred |
 | Salesforce platform | AP | Low Latency preferred |
 
-**AESF connection:** Salesforce is AP — it prioritizes availability and will process your Apex trigger even if its underlying infrastructure has internal replication lag. The AESF middleware PostgreSQL is configured for async replication in staging and sync in production. Epic BDE is a black box but behaves CP — it will reject duplicate or out-of-order writes. This means AESF spans all three positions on the CAP triangle simultaneously, which is exactly why manual reconciliation jobs exist.
+**Integration platform connection:** Salesforce is AP — it prioritizes availability and will process your Apex trigger even if its underlying infrastructure has internal replication lag. The crm-middleware PostgreSQL is configured for async replication in staging and sync in production. The EHR system BDE is a black box but behaves CP — it will reject duplicate or out-of-order writes. This means the integration platform spans all three positions on the CAP triangle simultaneously, which is exactly why manual reconciliation jobs exist.
 
 > **Common mistake:** Treating CAP as a system-level label. In practice, *different operations within the same system* can have different CAP characteristics. PostgreSQL in async replication mode is AP for reads from the replica and CP for reads from the primary. Label your operations, not your systems.
 
@@ -81,7 +81,7 @@ latency                                                 latency
 
 **Read-Your-Writes:** After a client performs a write, any subsequent reads by that same client will reflect that write. This is a session-level guarantee. PostgreSQL achieves this trivially if you always read from the primary. Cloud SQL achieves it for reads from the primary; reads from read replicas may violate it during replication lag.
 
-**AESF connection:** When the AESF middleware writes a client record to PostgreSQL and then immediately queries it back to build the Epic BDE request payload, it relies on Read-Your-Writes consistency. If that read is accidentally routed to the read replica (which happens during connection pool misconfiguration or via SQLAlchemy's `read` bind), you can get a stale result, build the wrong Epic payload, and corrupt the Epic record. This is a real class of bug in the middleware.
+**Integration platform connection:** When the crm-middleware writes a client record to PostgreSQL and then immediately queries it back to build the EHR system BDE request payload, it relies on Read-Your-Writes consistency. If that read is accidentally routed to the read replica (which happens during connection pool misconfiguration or via SQLAlchemy's `read` bind), you can get a stale result, build the wrong EHR payload, and corrupt the EHR record. This is a real class of bug in the middleware.
 
 > **Common mistake:** Conflating ACID isolation levels with distributed consistency models. PostgreSQL `SERIALIZABLE` isolation is a single-node guarantee about transaction anomalies. It says nothing about what a replica will return. Distributed consistency is about what multiple nodes agree on, which is orthogonal to isolation levels.
 
@@ -123,7 +123,7 @@ A write is committed once acknowledged by a MAJORITY (3/5).
 
 **Safety property:** Raft guarantees that committed entries are never lost. If an entry is committed (majority acknowledged), any future leader will have that entry. This is the property that makes it safe to build databases on top of Raft.
 
-**AESF connection:** GKE's etcd cluster backs all Kubernetes API state. When a GKE zone fails during an AESF deployment, Kubernetes will stop scheduling new pods until etcd achieves quorum — typically within seconds as the other zones' nodes are still present. If two zones fail simultaneously in a 3-zone cluster, the entire Kubernetes control plane blocks until a zone recovers. Understanding this explains why AESF's GKE setup uses 3 zones (n=3, quorum=2, tolerates 1 failure) rather than 2 zones.
+**Integration platform connection:** GKE's etcd cluster backs all Kubernetes API state. When a GKE zone fails during an integration platform deployment, Kubernetes will stop scheduling new pods until etcd achieves quorum — typically within seconds as the other zones' nodes are still present. If two zones fail simultaneously in a 3-zone cluster, the entire Kubernetes control plane blocks until a zone recovers. Understanding this explains why the integration platform's GKE setup uses 3 zones (n=3, quorum=2, tolerates 1 failure) rather than 2 zones.
 
 > **Common mistake:** Assuming Raft means zero data loss. Raft commits are durable only if a majority acknowledged. If a leader commits an entry and then all 5 nodes crash before the commit propagates to disk (power failure), the entry may be lost. Raft's durability depends on fsync, and many deployments disable fsync for performance — trading durability for speed.
 
@@ -181,7 +181,7 @@ To compare two vector clocks V1 and V2:
 
 Vector clocks are used in: DynamoDB (versioning), Riak, CRDTs (Conflict-free Replicated Data Types), and distributed debugging tools.
 
-**AESF connection:** When Salesforce fires an Apex trigger that calls the AESF middleware, and simultaneously Epic BDE fires a webhook back to the middleware, both events carry a "last modified" timestamp from their respective systems. But Salesforce's clock and Epic's clock are not synchronized. Using wall-clock timestamps to determine which update "wins" is wrong — you need a causal ordering mechanism. The AESF middleware uses database sequence numbers (PostgreSQL sequences) as a Lamport-style logical clock for its sync queue, which is correct. A common bug would be to use `updated_at` timestamps from both systems to resolve conflicts — this will silently corrupt data during NTP drift or clock skew events.
+**Integration platform connection:** When Salesforce fires an Apex trigger that calls the crm-middleware, and simultaneously the EHR system BDE fires a webhook back to the middleware, both events carry a "last modified" timestamp from their respective systems. But Salesforce's clock and the EHR system's clock are not synchronized. Using wall-clock timestamps to determine which update "wins" is wrong — you need a causal ordering mechanism. The crm-middleware uses database sequence numbers (PostgreSQL sequences) as a Lamport-style logical clock for its sync queue, which is correct. A common bug would be to use `updated_at` timestamps from both systems to resolve conflicts — this will silently corrupt data during NTP drift or clock skew events.
 
 > **Common mistake:** Thinking that because your cloud provider uses atomic clocks (Google TrueTime, AWS Time Sync Service), you can use wall-clock time for ordering. These reduce uncertainty but do not eliminate it. TrueTime gives you a confidence interval; you still need logic to handle cases where intervals overlap.
 
@@ -230,7 +230,7 @@ t=4: Both A and B claim to be primary with diverged logs.
 - **Quorum-based promotion:** A replica only promotes itself if it can contact a majority of nodes. In a 3-node cluster, a single replica cannot form a majority alone, so it will wait rather than promote.
 - **Fencing tokens:** Every primary holds a fencing token (monotonically increasing integer). Any operation to shared storage must include the token. Storage rejects operations with stale tokens.
 
-**AESF connection:** PostgreSQL's Cloud SQL high-availability setup uses a quorum-based failover with Google's internal Paxos implementation. If the primary zone fails, the standby promotes only after confirming the primary is inaccessible — preventing split brain. However, if a GKE pod loses connectivity to Cloud SQL for 30 seconds (a network partition), the pod's SQLAlchemy connection pool will have stale connections. Those connections will error on next use, not silently serve stale data — this is the safe behavior. The dangerous scenario is if a caching layer (Redis, or even SQLAlchemy's in-process cache) serves stale reads after a partition heals, which is a real source of AESF consistency bugs.
+**Integration platform connection:** PostgreSQL's Cloud SQL high-availability setup uses a quorum-based failover with Google's internal Paxos implementation. If the primary zone fails, the standby promotes only after confirming the primary is inaccessible — preventing split brain. However, if a GKE pod loses connectivity to Cloud SQL for 30 seconds (a network partition), the pod's SQLAlchemy connection pool will have stale connections. Those connections will error on next use, not silently serve stale data — this is the safe behavior. The dangerous scenario is if a caching layer (Redis, or even SQLAlchemy's in-process cache) serves stale reads after a partition heals, which is a real source of integration platform consistency bugs.
 
 > **Common mistake:** Assuming that because you use a managed database (Cloud SQL, RDS), split brain is someone else's problem. The database itself may avoid split brain, but your application layer — connection pools, ORM-level caches, application-level write buffers — can create application-level split brain where different pods have different views of reality.
 
@@ -271,13 +271,13 @@ PostgreSQL Streaming Replication
 
 **Read replicas and consistency:**
 
-Cloud SQL read replicas serve reads with potential lag. If AESF middleware reads from a read replica immediately after writing to the primary, it may observe:
+Cloud SQL read replicas serve reads with potential lag. If the crm-middleware reads from a read replica immediately after writing to the primary, it may observe:
 - **Stale reads:** The write has not yet propagated.
 - **Non-monotonic reads:** Two sequential reads of the same row, both from replicas, may return newer-then-older values if the reads hit replicas with different lag.
 
-The safe pattern for AESF: write-then-read operations that must be consistent (e.g., write to sync queue, then immediately read back to build Epic request) must read from the primary. SQLAlchemy's `execution_options(postgresql_readonly=True)` or the use of a separate read engine should be applied carefully.
+The safe pattern for the integration platform: write-then-read operations that must be consistent (e.g., write to sync queue, then immediately read back to build EHR request) must read from the primary. SQLAlchemy's `execution_options(postgresql_readonly=True)` or the use of a separate read engine should be applied carefully.
 
-**AESF connection:** The AESF middleware's `app/core/config.py` configures a single `DATABASE_URL` (primary) and an optional `DATABASE_READONLY_URL` (replica). Queries that are safe for replica lag (reporting, list endpoints, admin panel reads) should use the readonly engine. Queries that must reflect the most recent write (sync queue processing, conflict resolution) must use the primary engine. Mixing these up is the root cause of a class of "ghost" sync failures where the middleware reads a record as "pending" even though it was just committed.
+**Integration platform connection:** The crm-middleware's `app/core/config.py` configures a single `DATABASE_URL` (primary) and an optional `DATABASE_READONLY_URL` (replica). Queries that are safe for replica lag (reporting, list endpoints, admin panel reads) should use the readonly engine. Queries that must reflect the most recent write (sync queue processing, conflict resolution) must use the primary engine. Mixing these up is the root cause of a class of "ghost" sync failures where the middleware reads a record as "pending" even though it was just committed.
 
 > **Common mistake:** Using `pg_sleep` or application-side retry loops to "wait for replication" instead of reading from the primary or using synchronous commit for critical writes. Sleep-based waiting is both fragile (how long is long enough?) and inefficient.
 
@@ -312,31 +312,31 @@ Producer writes:
 
 Kafka consumers commit offsets to track their position in the log. The default is `enable.auto.commit=true`, which commits offsets periodically. If a consumer processes a message but crashes before the offset is committed, it will reprocess the message on restart — **at-least-once delivery**. This means Kafka consumers must be idempotent: processing the same message twice should produce the same result as processing it once.
 
-**AESF connection:** If AESF were to introduce Kafka as a message bus between Salesforce webhook receivers and the Epic sync workers (a reasonable architecture for decoupling), the Epic sync worker must be idempotent. The Epic BDE API rejects duplicate requests with a specific error code — the sync worker can treat that error as success, achieving at-least-once delivery with idempotent semantics (effectively exactly-once from the business perspective). The sync queue table in the AESF PostgreSQL database already implements a version of this: the `status` column with states `pending → processing → completed/failed` is a manual Kafka-style offset mechanism.
+**Integration platform connection:** If the integration platform were to introduce Kafka as a message bus between Salesforce webhook receivers and the EHR sync workers (a reasonable architecture for decoupling), the EHR sync worker must be idempotent. The EHR system BDE API rejects duplicate requests with a specific error code — the sync worker can treat that error as success, achieving at-least-once delivery with idempotent semantics (effectively exactly-once from the business perspective). The sync queue table in the integration platform's PostgreSQL database already implements a version of this: the `status` column with states `pending → processing → completed/failed` is a manual Kafka-style offset mechanism.
 
 > **Common mistake:** Assuming Kafka's log retention means "nothing is ever lost." Kafka log segments are deleted based on `retention.ms` or `retention.bytes`. If a consumer group falls so far behind that the segments it needs have been deleted, the consumer will see an `OffsetOutOfRangeException` and must reset — either losing messages or reprocessing from the beginning. Monitor consumer lag proactively.
 
 ---
 
-## 8. The AESF Three-Way Sync — A Distributed Systems Case Study
+## 8. The Integration Platform Three-Way Sync — A Distributed Systems Case Study
 
-The AESF integration is a three-way distributed system. Let us apply every concept from this week to reason about it systematically.
+The CRM-EHR Integration Platform integration is a three-way distributed system. Let us apply every concept from this week to reason about it systematically.
 
 ```
-THE AESF DISTRIBUTED SYSTEM
+THE INTEGRATION PLATFORM DISTRIBUTED SYSTEM
 
 +------------------+      Apex Trigger       +------------------+
-|   Salesforce     |  ===================>  |  AESF Middleware  |
+|   Salesforce     |  ===================>  |  crm-middleware   |
 |  (AP system)     |  HTTP (sync, ~200ms)   |  FastAPI + PG     |
 |  Eventual cons.  |                         |  (CP primary,     |
 |  Apex triggers   |  <==================   |   AP replica)     |
 |  Platform Events |  Webhook callbacks      +------------------+
 +------------------+                               |
-                                                   | Epic SDK
+                                                   | EHR SDK
                                                    | HTTP (sync)
                                                    v
                                          +------------------+
-                                         |   Epic BDE       |
+                                         |   EHR BDE        |
                                          |  (CP system)     |
                                          |  Rejects dupes   |
                                          |  Rejects OOO*    |
@@ -345,21 +345,21 @@ THE AESF DISTRIBUTED SYSTEM
 
 Consistency model of the overall system: CAUSAL AT BEST
 - Salesforce → Middleware: at-least-once (Apex retries on failure)
-- Middleware → Epic: at-most-once (no retry on Epic 200 OK lost)
-- Epic → Middleware → Salesforce: eventual (polling-based sync)
+- Middleware → EHR: at-most-once (no retry on EHR 200 OK lost)
+- EHR → Middleware → Salesforce: eventual (polling-based sync)
 ```
 
 **Failure scenarios by category:**
 
-| Failure | CAP category | AESF manifestation | Resolution |
+| Failure | CAP category | Integration platform manifestation | Resolution |
 |---|---|---|---|
-| Middleware pod crash mid-request | Network partition (partial) | Salesforce got 200 OK, Epic never received | Reconciliation job detects missing Epic record |
+| Middleware pod crash mid-request | Network partition (partial) | Salesforce got 200 OK, EHR system never received | Reconciliation job detects missing EHR record |
 | PostgreSQL replica lag 30s | Consistency degradation | Middleware reads stale sync queue, skips ready records | Read from primary for sync queue queries |
-| Epic BDE timeout | Availability failure | Middleware marks record as failed | Retry with exponential backoff |
-| Salesforce trigger fires twice | At-least-once delivery | Duplicate Epic records | Epic dedup logic + middleware idempotency key |
+| EHR system BDE timeout | Availability failure | Middleware marks record as failed | Retry with exponential backoff |
+| Salesforce trigger fires twice | At-least-once delivery | Duplicate EHR records | EHR dedup logic + middleware idempotency key |
 | GKE zone failure | Network partition | Active middleware pods reduced, leader election delay | 3-zone deployment tolerates 1 zone failure |
 
-**The fundamental consistency guarantee of AESF:** The system provides **causal consistency at the application level** with manual reconciliation to recover from failures. It is not linearizable (the three systems are too far apart in the CAP space), and it is not even eventual (without the reconciliation jobs, failures leave permanent inconsistencies). The reconciliation job is the consistency mechanism — without it, AESF is an eventually inconsistent system that does not converge automatically.
+**The fundamental consistency guarantee of the integration platform:** The system provides **causal consistency at the application level** with manual reconciliation to recover from failures. It is not linearizable (the three systems are too far apart in the CAP space), and it is not even eventual (without the reconciliation jobs, failures leave permanent inconsistencies). The reconciliation job is the consistency mechanism — without it, the integration platform is an eventually inconsistent system that does not converge automatically.
 
 > **Common mistake:** Treating reconciliation jobs as "nice to have" cleanup tasks rather than mandatory correctness mechanisms. In a system that spans AP and CP components, reconciliation is the only way to achieve convergence. Disabling or delaying reconciliation degrades the system's consistency model from eventual to permanently inconsistent.
 
@@ -405,7 +405,7 @@ Distributed Systems
 │   └── Split Brain — two nodes both believe they are primary
 │       Prevention: quorum, STONITH, fencing tokens
 │
-└── Applied Systems
+└── Applied Concepts
     ├── PostgreSQL Replication
     │   ├── WAL streaming = distributed log
     │   ├── LSN = Lamport timestamp
@@ -427,7 +427,7 @@ Distributed Systems
 
 **2.** How does PACELC improve on CAP for reasoning about production system behavior?
 
-**3.** A PostgreSQL Cloud SQL instance is configured with `synchronous_commit = off` for performance. A client writes a record and immediately reads it back from a read replica. What consistency model does this configuration provide, and what failure scenario does it create for AESF?
+**3.** A PostgreSQL Cloud SQL instance is configured with `synchronous_commit = off` for performance. A client writes a record and immediately reads it back from a read replica. What consistency model does this configuration provide, and what failure scenario does it create for the integration platform?
 
 **4.** Explain the difference between linearizability and causal consistency. Give an example of an anomaly that causal consistency prevents but that eventual consistency does not.
 
@@ -441,7 +441,7 @@ Distributed Systems
 
 **9.** Describe the split-brain scenario step by step. What is the primary danger, and name two mechanisms used to prevent it?
 
-**10.** In the AESF middleware, a SQLAlchemy query is accidentally routed to the Cloud SQL read replica instead of the primary. An Apex trigger just wrote a record 50ms ago. What can go wrong, and what is the safe fix?
+**10.** In the crm-middleware, a SQLAlchemy query is accidentally routed to the Cloud SQL read replica instead of the primary. An Apex trigger just wrote a record 50ms ago. What can go wrong, and what is the safe fix?
 
 **11.** Kafka is configured with `replication.factor=3`, `min.insync.replicas=2`, and a producer with `acks=all`. One broker fails. Can the producer still write? What happens if two brokers fail?
 
@@ -449,19 +449,19 @@ Distributed Systems
 
 **13.** Explain how PostgreSQL's LSN (Log Sequence Number) is conceptually equivalent to a Lamport timestamp.
 
-**14.** Why is wall-clock time insufficient for determining event ordering in a distributed system like AESF, even with NTP synchronization?
+**14.** Why is wall-clock time insufficient for determining event ordering in a distributed system like the integration platform, even with NTP synchronization?
 
 **15.** A GKE cluster has 3 zones, each with an etcd node. One zone experiences a complete outage. What happens to Kubernetes control plane operations, and why?
 
 **16.** What is the PACELC trade-off for Kafka with `acks=all` versus `acks=1`? Map each to the PACELC model.
 
-**17.** The AESF reconciliation job runs every 15 minutes. What consistency model does the overall AESF system provide between reconciliation runs, and what model does it provide after a successful reconciliation run?
+**17.** The integration platform reconciliation job runs every 15 minutes. What consistency model does the overall integration platform system provide between reconciliation runs, and what model does it provide after a successful reconciliation run?
 
 **18.** A fencing token is used to prevent split-brain in storage systems. Describe how it works and why incrementing the token on each leader election is important.
 
-**19.** An Apex trigger in Salesforce calls the AESF middleware synchronously. The middleware times out after 10 seconds (Salesforce limit). The middleware has written the record to PostgreSQL but has not yet called Epic BDE when the timeout occurs. Salesforce marks the callout as failed and will retry. What distributed systems problem does this create, and how should the middleware handle it?
+**19.** An Apex trigger in Salesforce calls the crm-middleware synchronously. The middleware times out after 10 seconds (Salesforce limit). The middleware has written the record to PostgreSQL but has not yet called the EHR system BDE when the timeout occurs. Salesforce marks the callout as failed and will retry. What distributed systems problem does this create, and how should the middleware handle it?
 
-**20.** You are asked to design the AESF sync queue to be idempotent. Using distributed systems concepts from this week, describe the key properties the queue must have and how you would implement them.
+**20.** You are asked to design the integration platform sync queue to be idempotent. Using distributed systems concepts from this week, describe the key properties the queue must have and how you would implement them.
 
 ---
 
@@ -473,7 +473,7 @@ Distributed Systems
 
     **2.** PACELC adds the "else" case: when the system is operating normally without a partition (the common case), it must still choose between lower latency (which often means weaker consistency, such as async replication) and stronger consistency (which requires coordination overhead and increases latency). CAP only addresses the partition scenario, which is rare. PACELC is more useful for daily engineering decisions because most of the time you are not in a partition — you are choosing how much latency to accept for a given consistency level on every single write.
 
-    **3.** With `synchronous_commit = off` and reads from a read replica, the system provides eventual consistency with no session guarantees. For AESF, this creates a stale-read failure mode: the middleware writes an account record to the primary (marking it as "sync pending"), then reads from the replica which has not yet received the WAL record, finds no pending record, and skips the Epic sync. The record stays out of sync until the reconciliation job runs. The safe fix is to route all reads that are functionally coupled to a recent write (particularly sync queue reads) to the primary connection.
+    **3.** With `synchronous_commit = off` and reads from a read replica, the system provides eventual consistency with no session guarantees. For the integration platform, this creates a stale-read failure mode: the middleware writes an account record to the primary (marking it as "sync pending"), then reads from the replica which has not yet received the WAL record, finds no pending record, and skips the EHR sync. The record stays out of sync until the reconciliation job runs. The safe fix is to route all reads that are functionally coupled to a recent write (particularly sync queue reads) to the primary connection.
 
     **4.** Linearizability requires every operation to appear atomic at a single real-time point — all subsequent reads, from any node, reflect the write. Causal consistency only requires that causally related operations be seen in order; concurrent operations may be seen in different orders by different nodes. An example anomaly: User A posts a comment, then User B replies to it (causally dependent). Causal consistency guarantees all nodes see A's comment before B's reply. Eventual consistency allows a node to show B's reply without A's comment — a confusing state that causal consistency prevents. However, causal consistency allows two nodes to see two concurrent, unrelated posts in different orders.
 
@@ -483,28 +483,28 @@ Distributed Systems
 
     **7.** No. Lamport timestamps establish a partial order with one-directional implication: if event e1 happened-before e2, then L(e1) < L(e2). The inverse does not hold. L(A)=5 and L(B)=3 means either A happened after B in a causal chain, OR A and B are concurrent events that happened to receive those timestamp values. Without knowing the full message history, you cannot conclude causality from Lamport timestamps alone. Vector clocks are needed to distinguish "happened-before" from "concurrent."
 
-    **8.** The events are concurrent — neither happened before the other. To compare `[2,1,0]` vs `[1,2,0]`: component 0: 2 > 1 (first is greater), component 1: 1 < 2 (first is less). Since neither vector is component-wise ≤ the other, neither happened before the other. They are concurrent events from processes that did not communicate before these events occurred. In a system like AESF, concurrent events from Salesforce and Epic happening simultaneously with no causal link would produce exactly this pattern.
+    **8.** The events are concurrent — neither happened before the other. To compare `[2,1,0]` vs `[1,2,0]`: component 0: 2 > 1 (first is greater), component 1: 1 < 2 (first is less). Since neither vector is component-wise ≤ the other, neither happened before the other. They are concurrent events from processes that did not communicate before these events occurred. In a system like the integration platform, concurrent events from Salesforce and the EHR system happening simultaneously with no causal link would produce exactly this pattern.
 
     **9.** Split brain occurs when a network partition causes a replica to believe the primary has failed and self-promote, resulting in two active primaries. Step by step: (1) Primary A and Replica B are healthy; (2) Network severs between A and B; (3) B's health check timeout fires, B cannot reach A, B promotes itself; (4) A is still running and accepting writes; (5) Both A and B accept writes independently; (6) Network heals, both claim to be primary with diverged state. The primary danger is data divergence — writes accepted by A are unknown to B and vice versa, leading to data loss or corruption when reconciling. Prevention mechanisms: quorum-based promotion (B can only promote if it can reach a majority of nodes — impossible alone in a 2-node cluster), and STONITH/fencing (B forcibly powers off or network-isolates A before promoting, ensuring only one primary exists).
 
-    **10.** The SQLAlchemy query hits the read replica, which may be 50ms to several seconds behind the primary. The record written by the Apex trigger may not yet have been applied to the replica. The middleware reads no record (or the old version), fails to build the Epic request, and the sync is silently skipped — no error is raised, the record is simply not processed. The safe fix is to use the primary connection for any query whose correctness depends on observing a write made within the last replication lag window. In SQLAlchemy, maintain two engine instances (primary and replica) and route sync-critical queries explicitly to the primary engine. Never route sync queue reads to the replica.
+    **10.** The SQLAlchemy query hits the read replica, which may be 50ms to several seconds behind the primary. The record written by the Apex trigger may not yet have been applied to the replica. The middleware reads no record (or the old version), fails to build the EHR request, and the sync is silently skipped — no error is raised, the record is simply not processed. The safe fix is to use the primary connection for any query whose correctness depends on observing a write made within the last replication lag window. In SQLAlchemy, maintain two engine instances (primary and replica) and route sync-critical queries explicitly to the primary engine. Never route sync queue reads to the replica.
 
     **11.** With one broker failed (2 of 3 remaining, ISR has 2 members): yes, the producer can still write. The ISR has 2 members, which meets `min.insync.replicas=2`, so `acks=all` will succeed with 2 acknowledgments. If two brokers fail (1 of 3 remaining, ISR has 1 member): the producer cannot write. The ISR falls below `min.insync.replicas=2`, and Kafka will respond with `NotEnoughReplicasException`. The topic becomes read-only (not unavailable for reads, only for writes). This is the CP behavior: Kafka prefers to block writes rather than risk data loss below the minimum durability threshold.
 
-    **12.** At-least-once delivery means a message may be delivered to a consumer more than once — specifically, if a consumer processes a message but crashes before committing its offset, the message will be redelivered on restart. The requirement this places on consumers is **idempotency**: processing the same message multiple times must produce the same result as processing it once. For AESF, an Epic sync consumer receiving the same "update account" message twice must detect the duplicate (via an idempotency key or by checking Epic's current state) and skip the second write rather than creating a duplicate record in Epic.
+    **12.** At-least-once delivery means a message may be delivered to a consumer more than once — specifically, if a consumer processes a message but crashes before committing its offset, the message will be redelivered on restart. The requirement this places on consumers is **idempotency**: processing the same message multiple times must produce the same result as processing it once. For the integration platform, an EHR sync consumer receiving the same "update account" message twice must detect the duplicate (via an idempotency key or by checking the EHR system's current state) and skip the second write rather than creating a duplicate record in the EHR system.
 
     **13.** PostgreSQL's LSN is a monotonically increasing 64-bit integer that identifies a specific position in the Write-Ahead Log. Every write to PostgreSQL advances the LSN. Like a Lamport timestamp, the LSN captures the happened-before relationship for writes to a single node: if write W1 has LSN X and write W2 has LSN Y, and X < Y, then W1 happened before W2. The standby's applied LSN is always ≤ the primary's current LSN, establishing the replication lag as a measure of how many "happened-before" steps the standby is behind. Also like a Lamport timestamp, comparing LSNs across completely independent PostgreSQL instances (no replication relationship) is meaningless.
 
-    **14.** NTP synchronizes clocks to within approximately 1-10 milliseconds under good conditions, but this synchronization is imperfect and variable. Two events that occur within this uncertainty window cannot be reliably ordered by wall-clock timestamp — the clocks of the two machines may disagree about which happened first. In AESF, Salesforce's servers, the GKE pods, and Epic's servers all have independent clocks. A Salesforce event at T=100ms and an Epic event at T=101ms (as measured by their respective servers) could actually be concurrent or even reversed. Using `updated_at` timestamps from different systems to resolve write conflicts will produce incorrect results during any clock skew event, which occur regularly. Logical clocks (Lamport timestamps, sequence numbers, version vectors) are necessary for reliable ordering.
+    **14.** NTP synchronizes clocks to within approximately 1-10 milliseconds under good conditions, but this synchronization is imperfect and variable. Two events that occur within this uncertainty window cannot be reliably ordered by wall-clock timestamp — the clocks of the two machines may disagree about which happened first. In the integration platform, Salesforce's servers, the GKE pods, and the EHR system's servers all have independent clocks. A Salesforce event at T=100ms and an EHR system event at T=101ms (as measured by their respective servers) could actually be concurrent or even reversed. Using `updated_at` timestamps from different systems to resolve write conflicts will produce incorrect results during any clock skew event, which occur regularly. Logical clocks (Lamport timestamps, sequence numbers, version vectors) are necessary for reliable ordering.
 
     **15.** With 3 etcd nodes across 3 zones and one zone failing, the remaining 2 nodes (in 2 zones) can form a quorum (majority of 3 = 2). Kubernetes control plane operations — API server writes, scheduler decisions, controller reconciliations — continue normally. The failed zone's etcd node is simply removed from the quorum until it recovers. Pod workloads in the failed zone are rescheduled to the remaining zones by the node controller after the node-not-ready timeout (~5 minutes by default). If two zones fail simultaneously (leaving 1 etcd node), quorum is lost and the Kubernetes API server becomes read-only — no new pods can be scheduled, no deployments can be updated, but existing running pods continue to run since they do not depend on etcd at runtime.
 
     **16.** Kafka `acks=all`: during a partition, if the ISR falls below `min.insync.replicas`, writes are rejected — this is **CP** (chooses consistency over availability). Else (normal operation), every write must be acknowledged by all ISR members before the producer receives success, adding latency — this is the PACELC **EC** (Else: Consistency over Latency). Kafka `acks=1`: during a partition, the leader alone acknowledges, writes succeed even if replicas cannot be reached — this is **AP** (chooses availability over consistency). Else (normal operation), the leader acknowledges immediately without waiting for follower replication, minimizing latency — this is the PACELC **EL** (Else: Latency over Consistency).
 
-    **17.** Between reconciliation runs, the AESF system provides **no formal convergence guarantee** — it is inconsistent in the formal sense, because failures can leave records permanently diverged without automated correction. This is weaker than eventual consistency, which guarantees convergence given no new updates. After a successful reconciliation run, the system achieves a point-in-time consistent snapshot across all three systems — but this consistency is immediately violated by any new writes that arrive during or after reconciliation. The practical model is: AESF provides **periodic consistency** (consistent at reconciliation checkpoints) with causal consistency within each individual sync transaction. This is an honest characterization that should inform SLA commitments to end users.
+    **17.** Between reconciliation runs, the integration platform system provides **no formal convergence guarantee** — it is inconsistent in the formal sense, because failures can leave records permanently diverged without automated correction. This is weaker than eventual consistency, which guarantees convergence given no new updates. After a successful reconciliation run, the system achieves a point-in-time consistent snapshot across all three systems — but this consistency is immediately violated by any new writes that arrive during or after reconciliation. The practical model is: the integration platform provides **periodic consistency** (consistent at reconciliation checkpoints) with causal consistency within each individual sync transaction. This is an honest characterization that should inform SLA commitments to end users.
 
     **18.** A fencing token is a monotonically increasing integer issued by a lock service (like ZooKeeper or etcd) each time a lock is granted. Every write to shared storage must include the current fencing token. The storage layer rejects any write with a token lower than the highest token it has seen. During split brain, the old primary holds token N. The new primary receives token N+1. When the old primary (believing it is still leader) attempts to write with token N, the storage rejects it because it has already seen N+1. The increment-on-election property is critical: if tokens were reused or not incremented, a deposed leader could forge a valid token and corrupt state. The monotonic increment ensures that any write from a previous epoch is detectable and rejectable.
 
-    **19.** This is a classic **at-least-once delivery** problem creating a potential **duplicate write** to Epic. Salesforce marks the callout as failed and will retry (at-least-once from Salesforce's perspective). The middleware has already written the record to PostgreSQL — so on retry, a second middleware invocation will attempt to write the same record to Epic. If Epic is idempotent (deduplicates on an external key), this is safe. If Epic is not idempotent, the retry creates a duplicate record. The middleware must implement idempotency: assign a stable `idempotency_key` (e.g., a hash of the Salesforce record ID and version) to each Epic request, and Epic rejects duplicate keys with a known error. Additionally, the middleware should use the PostgreSQL sync queue as a transactional outbox — write to the queue in the same transaction as the business record, and have a separate worker process the queue, enabling the middleware to safely return a timeout to Salesforce without losing the work.
+    **19.** This is a classic **at-least-once delivery** problem creating a potential **duplicate write** to the EHR system. Salesforce marks the callout as failed and will retry (at-least-once from Salesforce's perspective). The middleware has already written the record to PostgreSQL — so on retry, a second middleware invocation will attempt to write the same record to the EHR system. If the EHR system is idempotent (deduplicates on an external key), this is safe. If the EHR system is not idempotent, the retry creates a duplicate record. The middleware must implement idempotency: assign a stable `idempotency_key` (e.g., a hash of the Salesforce record ID and version) to each EHR request, and the EHR system rejects duplicate keys with a known error. Additionally, the middleware should use the PostgreSQL sync queue as a transactional outbox — write to the queue in the same transaction as the business record, and have a separate worker process the queue, enabling the middleware to safely return a timeout to Salesforce without losing the work.
 
-    **20.** An idempotent sync queue requires three key distributed systems properties. First, **stable identity**: each sync operation must have a unique, deterministic key derived from the source record (e.g., `sha256(object_type + salesforce_id + version_number)`), so that duplicate submissions produce the same key and can be detected. Second, **atomic state transitions**: queue entries must move through states (`pending → processing → completed`) using compare-and-swap semantics (PostgreSQL `UPDATE ... WHERE status = 'pending' RETURNING *`), ensuring only one worker processes each entry even with multiple concurrent workers — this is the distributed mutual exclusion property. Third, **at-least-once processing with idempotent effect**: the downstream Epic call must be retried until success, but Epic must accept the idempotency key and return success on duplicate submission. The combination of a stable key, atomic state machine, and idempotent downstream makes the overall queue exactly-once from a business semantics perspective, even though the delivery mechanism is at-least-once.
+    **20.** An idempotent sync queue requires three key distributed systems properties. First, **stable identity**: each sync operation must have a unique, deterministic key derived from the source record (e.g., `sha256(object_type + salesforce_id + version_number)`), so that duplicate submissions produce the same key and can be detected. Second, **atomic state transitions**: queue entries must move through states (`pending → processing → completed`) using compare-and-swap semantics (PostgreSQL `UPDATE ... WHERE status = 'pending' RETURNING *`), ensuring only one worker processes each entry even with multiple concurrent workers — this is the distributed mutual exclusion property. Third, **at-least-once processing with idempotent effect**: the downstream EHR call must be retried until success, but the EHR system must accept the idempotency key and return success on duplicate submission. The combination of a stable key, atomic state machine, and idempotent downstream makes the overall queue exactly-once from a business semantics perspective, even though the delivery mechanism is at-least-once.

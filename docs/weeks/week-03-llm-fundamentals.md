@@ -10,9 +10,9 @@
 
 Large Language Models have crossed a threshold that should matter deeply to every senior and staff engineer: they are no longer just research curiosities or hype—they are production infrastructure. The same way you once had to understand TCP/IP to build reliable networked systems, you now need to understand how LLMs actually work to build reliable AI-assisted applications and avoid the class of bugs that comes from treating them like magic black boxes.
 
-For you specifically, the AESF stack sits at a compelling intersection. Your FastAPI middleware orchestrates data flows between Salesforce, Epic EHR, and GCP. Every one of those flows involves parsing semi-structured data, classifying intent, generating summaries, or making routing decisions—all tasks where LLMs can provide enormous leverage if integrated correctly. But "integrated correctly" requires knowing what these models actually do, where they fail, and what their architectural limits are.
+For you specifically, the integration platform stack sits at a compelling intersection. Your FastAPI middleware orchestrates data flows between Salesforce, the EHR system, and GCP. Every one of those flows involves parsing semi-structured data, classifying intent, generating summaries, or making routing decisions—all tasks where LLMs can provide enormous leverage if integrated correctly. But "integrated correctly" requires knowing what these models actually do, where they fail, and what their architectural limits are.
 
-This week covers the foundations: how transformer models work at the conceptual level, what tokens and context windows really mean for your system design, how models are trained and aligned to human preferences, and the practical taxonomy of model types you'll encounter in production. By the end, you'll be able to read a model spec sheet, have an informed conversation about fine-tuning vs. prompting trade-offs, and make architectural decisions about where to add LLM capabilities in a system like AESF without introducing instability.
+This week covers the foundations: how transformer models work at the conceptual level, what tokens and context windows really mean for your system design, how models are trained and aligned to human preferences, and the practical taxonomy of model types you'll encounter in production. By the end, you'll be able to read a model spec sheet, have an informed conversation about fine-tuning vs. prompting trade-offs, and make architectural decisions about where to add LLM capabilities in a system like the integration platform without introducing instability.
 
 Think of this week as the prerequisite for Weeks 4–7 (Prompt Engineering, Claude API, RAG, and Agents). Everything we cover here will have a direct analog in those practical weeks.
 
@@ -91,7 +91,7 @@ Practical implications:
 | SOQL queries | ~200 | 0.8× |
 | Japanese/Chinese | ~500+ | 2×+ |
 
-For AESF, this matters when you're passing Salesforce JSON payloads (large, repetitive key names), Epic API responses (XML/JSON with verbose schemas), or Alembic migration files to an LLM. Those will tokenize more densely than you expect.
+For the integration platform, this matters when you're passing Salesforce JSON payloads (large, repetitive key names), EHR API responses (XML/JSON with verbose schemas), or Alembic migration files to an LLM. Those will tokenize more densely than you expect.
 
 ### Context windows
 
@@ -122,7 +122,7 @@ Because tokenization is inconsistent, models can behave unexpectedly on certain 
 # a separate token — the model has never seen the token "3141592653"
 # in contexts that encode its mathematical properties.
 
-# In AESF context: don't ask LLMs to do arithmetic on policy limits,
+# In integration platform context: don't ask LLMs to do arithmetic on policy limits,
 # claim amounts, or Salesforce IDs. Do that in Python and pass the result.
 ```
 
@@ -154,9 +154,9 @@ These are different products serving different use cases:
 | Classification | Either (fine-tune embedding; prompt generative) | depends on scale |
 | Clustering documents | Embedding model | voyage-large-2 |
 
-In AESF, embeddings are most immediately useful for:
+In the integration platform, embeddings are most immediately useful for:
 - Semantic search over policy types, activity codes, or SOQL query results
-- Clustering Epic sync error messages to detect novel failure modes
+- Clustering EHR sync error messages to detect novel failure modes
 - Matching natural language queries to predefined Salesforce reports
 
 ```python
@@ -171,7 +171,7 @@ client = anthropic.Anthropic()
 # Conceptual pseudocode (actual SDK call shape may vary):
 response = client.embeddings.create(
     model="voyage-large-2",
-    input=["AESF__Policy__c sync failed: record locked", 
+    input=["APP__Policy__c sync failed: record locked", 
            "Opportunity trigger timeout after 30s",
            "Contact upsert conflict on external ID"]
 )
@@ -203,7 +203,7 @@ probabilities = softmax(logits_scaled)
 | 0.7–1.0 | Default; balanced | General chat, summarization |
 | 1.5–2.0 | Very diverse / often incoherent | Creative writing experiments only |
 
-For AESF middleware, when you're using an LLM to extract fields from Epic API responses or generate SOQL queries, use temperature 0–0.2. You want determinism, not creativity.
+For the crm-middleware, when you're using an LLM to extract fields from EHR API responses or generate SOQL queries, use temperature 0–0.2. You want determinism, not creativity.
 
 ### Top-p (nucleus sampling)
 
@@ -263,7 +263,7 @@ The result is a **base model**: extraordinarily capable at completion but not pa
 
 The base model is fine-tuned on a curated dataset of (prompt, ideal completion) pairs written or validated by human annotators. This teaches the model to respond in the instruction-following format: answer questions directly, follow instructions, be helpful.
 
-SFT is also the mechanism for **domain fine-tuning**: training on your own data to improve performance on specific tasks. A fine-tuned model for insurance domain text will outperform a general model on AESF-specific extractions—but fine-tuning requires careful dataset curation, infrastructure, and ongoing maintenance.
+SFT is also the mechanism for **domain fine-tuning**: training on your own data to improve performance on specific tasks. A fine-tuned model for insurance domain text will outperform a general model on integration platform-specific extractions—but fine-tuning requires careful dataset curation, infrastructure, and ongoing maintenance.
 
 ### Phase 3: RLHF — Reinforcement Learning from Human Feedback
 
@@ -296,7 +296,7 @@ Anthropic's Claude models use **Constitutional AI**: instead of relying purely o
 | RLHF/CAI aligned | Pre-training + SFT + RLHF | Helpful, refuses harmful requests, consistent format | Production applications; customer-facing features |
 | Fine-tuned specialist | Any of above + domain data | Better at specific domain | High-volume domain-specific tasks after evaluation confirms ROI |
 
-In AESF, you will almost always use production-grade RLHF models (claude-sonnet-4-6, claude-haiku-4-5) rather than base models. Base models are for researchers building the alignment pipeline, not for application developers. The one exception: if you're building your own fine-tuned model for a very specific extraction task that needs to run at high volume with minimal latency, you might start from an SFT checkpoint.
+In the integration platform, you will almost always use production-grade RLHF models (claude-sonnet-4-6, claude-haiku-4-5) rather than base models. Base models are for researchers building the alignment pipeline, not for application developers. The one exception: if you're building your own fine-tuned model for a very specific extraction task that needs to run at high volume with minimal latency, you might start from an SFT checkpoint.
 
 **Common mistake:** Fine-tuning when prompting would suffice. Fine-tuning is expensive, brittle to maintain, and loses the ability to take advantage of model upgrades. Prompt engineering can close 80–90% of the gap for most domain-adaptation tasks. Fine-tune only when you have thousands of labeled examples and a performance gap that prompting can't close.
 
@@ -340,7 +340,7 @@ The error is small for individual weights but accumulates through billions of mu
 | AWQ (Activation-aware Weight Quantization) | Protects salient weights from quantization | GPU; better quality than GPTQ at same bit-width |
 | ExLlamaV2 | Dynamic quantization | Consumer GPU inference |
 
-For AESF, quantization matters when you're considering running open-source models (Llama 3, Mistral) on self-hosted GKE nodes rather than API-based models. A Q4 Llama 3.3 70B can run on 2× A100s; the FP16 version needs 4×. Cost difference: roughly 2×.
+For the integration platform, quantization matters when you're considering running open-source models (Llama 3, Mistral) on self-hosted GKE nodes rather than API-based models. A Q4 Llama 3.3 70B can run on 2× A100s; the FP16 version needs 4×. Cost difference: roughly 2×.
 
 **Common mistake:** Comparing quantized open-source models to full-precision API models without controlling for bit-width. A 4-bit Llama 70B is closer to a 7B model in effective capacity than to a FP16 70B model.
 
@@ -359,11 +359,11 @@ For AESF, quantization matters when you're considering running open-source model
 
 ### Hard limits — not "improve with better prompting"
 
-| Limit | Why it exists | Implication for AESF |
+| Limit | Why it exists | Implication for the integration platform |
 |---|---|---|
 | No real-time knowledge | Training data has a cutoff; model doesn't browse | Don't ask the model about current Salesforce API versions; give them explicitly |
 | Non-determinism | Sampling process; exact reproducibility requires temp=0 + seed | Log prompts + outputs in your middleware; don't trust outputs without logging |
-| Hallucination | Model generates plausible text, not verified facts | Never use LLM output as ground truth without validation (e.g., for Epic sync decisions) |
+| Hallucination | Model generates plausible text, not verified facts | Never use LLM output as ground truth without validation (e.g., for EHR sync decisions) |
 | Context window degradation | "Lost in the middle" problem | Keep system prompts short; don't rely on critical info buried in the middle |
 | Can't count tokens in real time | Token counting isn't an internal capability | Estimate tokens before API calls; handle `context_length_exceeded` errors explicitly |
 | No persistent memory across calls | Each API call is stateless | You must pass conversation history explicitly in the messages array |
@@ -372,7 +372,7 @@ For AESF, quantization matters when you're considering running open-source model
 
 ### The consistency trap
 
-LLMs can give different answers to the same question across runs (or even within a long context window). For AESF middleware—where a wrong sync decision can create orphaned records in Epic or Salesforce—you cannot treat LLM outputs as authoritative without a validation layer:
+LLMs can give different answers to the same question across runs (or even within a long context window). For the crm-middleware—where a wrong sync decision can create orphaned records in the EHR system or Salesforce—you cannot treat LLM outputs as authoritative without a validation layer:
 
 ```python
 from enum import Enum
@@ -519,15 +519,15 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **15.** What is Constitutional AI (CAI), and how does it differ from standard RLHF?
 
-**16.** When would you choose `claude-haiku-4-5-20251001` over `claude-sonnet-4-6` for an AESF task?
+**16.** When would you choose `claude-haiku-4-5-20251001` over `claude-sonnet-4-6` for an integration platform task?
 
 **17.** Explain what GGUF and AWQ are. Which would you use for CPU inference on a developer workstation?
 
 **18.** A fine-tuned model for insurance text returns better results on your benchmark but your team says it's too costly to maintain. What's the alternative, and when is fine-tuning actually worth it?
 
-**19.** You're building an Epic sync conflict classifier in your FastAPI middleware. The LLM sometimes returns unexpected text instead of your expected labels. How should you handle this defensively?
+**19.** You're building an EHR sync conflict classifier in your FastAPI middleware. The LLM sometimes returns unexpected text instead of your expected labels. How should you handle this defensively?
 
-**20.** What are two tasks where you should almost never rely on LLM output without a validation layer, in the context of the AESF system?
+**20.** What are two tasks where you should almost never rely on LLM output without a validation layer, in the context of the integration platform system?
 
 ---
 
@@ -555,17 +555,17 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **10.** Top-p keeps only the smallest set of tokens whose **cumulative probability exceeds p** (e.g., 0.9), then samples from that set. It's preferred over top-k because it adapts dynamically: when the model is confident, it selects from a small set; when uncertain, it expands. Top-k is a fixed number regardless of the probability distribution's shape, which means it can either be too restrictive (when the model is uncertain) or too permissive (when it's highly confident).
 
-    **11.** Not a bug—this is expected behavior. With temperature > 0, the model samples from a distribution, so outputs vary between runs. The simplest fix: set `temperature=0.0` to use greedy decoding (deterministic). For critical workflows in AESF, determinism is usually more important than output diversity.
+    **11.** Not a bug—this is expected behavior. With temperature > 0, the model samples from a distribution, so outputs vary between runs. The simplest fix: set `temperature=0.0` to use greedy decoding (deterministic). For critical workflows in the integration platform, determinism is usually more important than output diversity.
 
     **12.** 70B × 4 bytes = **280 GB** in FP32. To fit in a single A100 (80 GB), you need **INT4 quantization** (70B × 0.5 bytes = 35 GB), which leaves ample headroom. INT8 would require 70 GB, right at the A100's limit with no room for activations; INT4 is the practical choice.
 
-    **13.** When processing very long contexts (e.g., 100K+ tokens), models reliably attend to information at the **beginning and end** of the context window but perform significantly worse at retrieving information from the **middle**. Empirical studies show recall drops by 30–50% for information placed in the middle of long contexts. For AESF, this means: put critical instructions at the top of your system prompt, not buried after pages of schema.
+    **13.** When processing very long contexts (e.g., 100K+ tokens), models reliably attend to information at the **beginning and end** of the context window but perform significantly worse at retrieving information from the **middle**. Empirical studies show recall drops by 30–50% for information placed in the middle of long contexts. For the integration platform, this means: put critical instructions at the top of your system prompt, not buried after pages of schema.
 
     **14.** Bad idea because **digits are individual tokens**—the model has never seen `1234567.89` as a meaningful numeric unit. It processes digit sequences as tokens, not as numbers, and arithmetic errors compound through billions of weight multiplications. The fix: do all arithmetic in Python (or SQL), pass the computed result to the LLM in the prompt. "The calculated premium is $1,418.25" is fine; "compute the premium as X * 1.15 + Y" is not.
 
     **15.** **Constitutional AI (CAI)** trains the model against a written set of principles (a "constitution") rather than direct human preference ratings alone. A separate model (or the same model) critiques responses against these principles and generates synthetic feedback that guides RL training. The key difference: RLHF requires human annotators for every preference pair; CAI can scale synthetic feedback generation, reducing human annotation costs and enabling more consistent application of principles. Claude models use CAI as their primary alignment technique.
 
-    **16.** Choose **Haiku** for high-volume, low-complexity tasks where speed and cost matter: routing/classification decisions, field extraction from structured text, quick triage of sync conflicts, generating short summaries. Choose Sonnet when the task requires nuanced reasoning, multi-step synthesis, or complex code generation. The cost difference (~5×) makes a large real-world difference when processing thousands of Epic sync events per hour.
+    **16.** Choose **Haiku** for high-volume, low-complexity tasks where speed and cost matter: routing/classification decisions, field extraction from structured text, quick triage of sync conflicts, generating short summaries. Choose Sonnet when the task requires nuanced reasoning, multi-step synthesis, or complex code generation. The cost difference (~5×) makes a large real-world difference when processing thousands of EHR sync events per hour.
 
     **17.** **GGUF** is a file format for storing quantized model weights optimized for **CPU inference via llama.cpp**. It supports mixed-precision quantization and is the dominant format for running models on developer workstations without a GPU. **AWQ (Activation-aware Weight Quantization)** is a GPU-oriented quantization technique that identifies and protects the most "salient" weights from aggressive quantization, yielding better quality than GPTQ at the same bit-width. For CPU inference on a dev workstation: **GGUF** with llama.cpp is the right choice.
 
@@ -573,4 +573,4 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **19.** Validate defensively: parse the raw LLM output through an enum or allowlist, and treat any unexpected value as a special case (e.g., route to `MANUAL_REVIEW`). Never use `raw_output in ["sync", "skip"]` comparisons for routing decisions; use typed enums with a try/except. Log every raw LLM response with its prompt to a separate table so you can audit classification decisions. Consider adding a confidence signal: if the model's output needs heavy sanitizing before it matches your enum, that's a signal the prompt needs refinement.
 
-    **20.** Two critical cases: **(a) Epic sync decisions** — whether to create, update, or delete records in Epic based on a Salesforce change. A wrong decision creates orphaned records, broken relationships, or data loss that's difficult to reconcile. Always validate with business rules in Python after any LLM classification. **(b) Policy financial data** — premium amounts, limit values, deductible figures. LLMs hallucinate numbers, make arithmetic errors, and may silently "fill in" missing values with plausible-sounding ones. Financial figures must come from the database, not from LLM inference.
+    **20.** Two critical cases: **(a) EHR sync decisions** — whether to create, update, or delete records in the EHR system based on a Salesforce change. A wrong decision creates orphaned records, broken relationships, or data loss that's difficult to reconcile. Always validate with business rules in Python after any LLM classification. **(b) Policy financial data** — premium amounts, limit values, deductible figures. LLMs hallucinate numbers, make arithmetic errors, and may silently "fill in" missing values with plausible-sounding ones. Financial figures must come from the database, not from LLM inference.

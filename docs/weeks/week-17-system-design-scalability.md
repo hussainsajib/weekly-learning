@@ -10,11 +10,11 @@
 
 Scalability is the ability of a system to handle increasing load by adding resources, either by upgrading existing machines or by adding more of them. For engineers moving from senior to staff level, the distinction is not just knowing *what* to scale but being able to reason through *where* the bottleneck actually lives — network, compute, database, or application state — and choosing the right lever. Getting this wrong is expensive: over-engineering leads to unnecessary operational complexity, while under-engineering leads to outages under load.
 
-The AESF middleware is a real-world case study for this week. It is a FastAPI application running on GKE, synchronizing data between Salesforce and the Epic EHR backend. Every design decision explored here — horizontal scaling, stateless services, idempotency, CQRS, queue table design, and rate limiting — maps directly to problems already present or latent in that system. Reading this guide with your own codebase open will anchor the concepts.
+The crm-middleware is a real-world case study for this week. It is a FastAPI application running on GKE, synchronizing data between Salesforce and the EHR system backend. Every design decision explored here — horizontal scaling, stateless services, idempotency, CQRS, queue table design, and rate limiting — maps directly to problems already present or latent in that system. Reading this guide with your own codebase open will anchor the concepts.
 
 Modern distributed systems rarely fail because of a single overwhelming event. They fail because of accumulating small design compromises: a sync handler that assumes it is the only writer, a database query that was fast at 1,000 rows but crawls at 10 million, or an upstream API that starts throttling at exactly the moment your load is highest. Rate limiting algorithms, read replicas, and idempotency keys are the mundane engineering that prevents these slow-motion failures.
 
-This guide covers eight core scalability patterns with concrete code, diagrams, and direct AESF connections. Work through each section end to end, then attempt the quiz before revealing answers. The goal is not memorization but the ability to walk into a design review and defend trade-offs with evidence.
+This guide covers eight core scalability patterns with concrete code, diagrams, and direct connections to the integration platform. Work through each section end to end, then attempt the quiz before revealing answers. The goal is not memorization but the ability to walk into a design review and defend trade-offs with evidence.
 
 ---
 
@@ -34,7 +34,7 @@ Vertical (scale-up)          Horizontal (scale-out)
                                    └──── Load Balancer ────┘
 ```
 
-**AESF connection:** The middleware `deployment-manifests` Helm chart configures a `Deployment` with a `replicas` field. Bumping replicas from 1 to 3 is horizontal scaling — but it only works correctly if the FastAPI app holds no in-process state between requests. If any handler caches a Salesforce session token in a module-level variable, replica 2 will not have it, and half your traffic will fail.
+**Integration platform connection:** The crm-middleware infra-manifests Helm chart configures a `Deployment` with a `replicas` field. Bumping replicas from 1 to 3 is horizontal scaling — but it only works correctly if the FastAPI app holds no in-process state between requests. If any handler caches a Salesforce session token in a module-level variable, replica 2 will not have it, and half your traffic will fail.
 
 ```yaml
 # kubernetes/values.staging.yaml (simplified)
@@ -91,7 +91,7 @@ metadata:
     nginx.ingress.kubernetes.io/load-balance: "least_conn"
 spec:
   rules:
-    - host: middleware.internal.aesf.io
+    - host: middleware.internal.platform.io
       http:
         paths:
           - path: /
@@ -103,7 +103,7 @@ spec:
                   number: 8000
 ```
 
-**AESF connection:** The middleware receives Salesforce webhook callbacks (triggered by Apex). These are short, uniform HTTP calls — round-robin or random is appropriate. There is no need for sticky sessions because the app should be stateless (see Section 1). If sticky sessions were used as a workaround for stateful code, that is a red flag, not a feature.
+**Integration platform connection:** The crm-middleware receives Salesforce webhook callbacks (triggered by Apex). These are short, uniform HTTP calls — round-robin or random is appropriate. There is no need for sticky sessions because the app should be stateless (see Section 1). If sticky sessions were used as a workaround for stateful code, that is a red flag, not a feature.
 
 **Common mistake:** Choosing IP-hash load balancing to work around stateful application design. This creates hot spots when clients cluster at NAT gateways (corporate networks, Salesforce outbound IPs), overloading one replica while others sit idle.
 
@@ -159,9 +159,9 @@ async def get_db() -> AsyncSession:
         # session is scoped to this request — no shared mutable state
 ```
 
-**AESF connection:** The AESF middleware's queue tables in PostgreSQL are the canonical example of correctly externalizing state. The sync queue (`aesf_sync_queue` or equivalent) persists between replicas because it lives in Postgres, not in process memory. Each worker replica can poll and claim jobs independently.
+**Integration platform connection:** The crm-middleware's queue tables in PostgreSQL are the canonical example of correctly externalizing state. The sync queue (`sync_queue` or equivalent) persists between replicas because it lives in Postgres, not in process memory. Each worker replica can poll and claim jobs independently.
 
-**Common mistake:** Using FastAPI's `startup` event to populate a module-level dict with reference data (e.g., Epic lookup codes), then mutating it during runtime. The dict diverges across replicas. Replace with a Redis cache keyed by version hash, or re-fetch from the database per request for small tables.
+**Common mistake:** Using FastAPI's `startup` event to populate a module-level dict with reference data (e.g., EHR lookup codes), then mutating it during runtime. The dict diverges across replicas. Replace with a Redis cache keyed by version hash, or re-fetch from the database per request for small tables.
 
 ---
 
@@ -205,7 +205,7 @@ ReadSession  = sessionmaker(read_engine,  class_=AsyncSession, expire_on_commit=
 
 **Replication lag** is the key hazard. After a write completes on the primary, the replica may be milliseconds to seconds behind. If you write a record and immediately read it back from the replica, you may see the old value ("read-your-own-writes" violation). The fix is to route reads that immediately follow a write back to the primary, or to add a small intentional delay before redirecting to the replica.
 
-**AESF connection:** The sync queue is write-heavy (Salesforce events land continuously) but the admin panel and reporting queries are read-heavy. Splitting these onto separate sessions reduces primary load during high-sync periods. Any "last synced at" display in the admin panel is a good candidate for replica reads — slight staleness is acceptable.
+**Integration platform connection:** The sync queue is write-heavy (Salesforce events land continuously) but the admin panel and reporting queries are read-heavy. Splitting these onto separate sessions reduces primary load during high-sync periods. Any "last synced at" display in the admin panel is a good candidate for replica reads — slight staleness is acceptable.
 
 **Common mistake:** Pointing the read replica connection string at the primary because "it was easier during setup." The replica is never used, the primary remains the bottleneck, and the team wonders why adding replicas did not help.
 
@@ -223,8 +223,8 @@ CQRS formalizes the read/write split at the *application model* level, not just 
                     └────────────┬───────────────────-┘
                                  │ async worker
                     ┌────────────▼───────────────────-┐
-                    │         Epic BDE Backend         │
-                    │   PUT /clients (Epic API)        │
+                    │         EHR System Backend       │
+                    │   PUT /clients (EHR API)         │
                     └────────────┬───────────────────-┘
                                  │ result written back
                     ┌────────────▼───────────────────-┐
@@ -234,13 +234,13 @@ CQRS formalizes the read/write split at the *application model* level, not just 
                     └────────────────────────────────-┘
 ```
 
-In the AESF middleware, a natural CQRS boundary already exists: the Apex trigger fires a POST (command) that enqueues a sync job, and the admin panel displays sync status (query). If these share the same model, changes to the write model for performance (adding JSON blobs, splitting tables) break the read model. Separating them explicitly gives each side freedom to evolve independently.
+In the integration platform's crm-middleware, a natural CQRS boundary already exists: the Apex trigger fires a POST (command) that enqueues a sync job, and the admin panel displays sync status (query). If these share the same model, changes to the write model for performance (adding JSON blobs, splitting tables) break the read model. Separating them explicitly gives each side freedom to evolve independently.
 
 ```python
 # Command model — validates and enqueues
 class SyncAccountCommand(BaseModel):
     salesforce_id: str
-    epic_client_id: Optional[str]
+    ehr_client_id: Optional[str]
     payload: dict
     triggered_at: datetime
 
@@ -288,7 +288,7 @@ Shard Key: salesforce_org_id % 4
 
 Sharding is complex to operate: cross-shard joins require application-level logic, schema migrations must run on every shard in coordination, and rebalancing shards when adding new instances is expensive. It is the option of last resort after connection pooling, read replicas, caching, and query optimization are exhausted.
 
-For AESF's scale today, PostgreSQL table partitioning (a single-server feature) is far more appropriate than true multi-server sharding. Partition the sync queue by `created_at` month — Postgres handles the routing, and old partitions can be detached and archived cleanly.
+For the integration platform's scale today, PostgreSQL table partitioning (a single-server feature) is far more appropriate than true multi-server sharding. Partition the sync queue by `created_at` month — Postgres handles the routing, and old partitions can be detached and archived cleanly.
 
 ```sql
 -- Partitioned sync queue (by month)
@@ -368,7 +368,7 @@ async def check_idempotency(
     raise HTTPException(status_code=500, detail="Previous attempt failed; use a new key")
 ```
 
-**AESF connection:** Salesforce Apex triggers can fire multiple times for the same record change (e.g., during bulk DML or re-runs). The Epic BDE API is not idempotent on its own — sending `PUT /clients` twice with the same payload can cause duplicate records in some versions. The middleware must deduplicate using the Salesforce record ID + last-modified timestamp as the idempotency key before forwarding to Epic.
+**Integration platform connection:** Salesforce Apex triggers can fire multiple times for the same record change (e.g., during bulk DML or re-runs). The EHR system API is not idempotent on its own — sending `PUT /clients` twice with the same payload can cause duplicate records in some versions. The crm-middleware must deduplicate using the Salesforce record ID + last-modified timestamp as the idempotency key before forwarding to the EHR system.
 
 ```python
 def make_sync_key(sf_id: str, last_modified: datetime) -> str:
@@ -382,7 +382,7 @@ def make_sync_key(sf_id: str, last_modified: datetime) -> str:
 
 ## 8. Rate Limiting Algorithms
 
-Rate limiting protects both your own service (from abuse or accidental hammering) and upstream APIs (Epic imposes rate limits; exceeding them causes 429 errors and potential account suspension).
+Rate limiting protects both your own service (from abuse or accidental hammering) and upstream APIs (the EHR system imposes rate limits; exceeding them causes 429 errors and potential account suspension).
 
 ### Token Bucket
 
@@ -417,11 +417,11 @@ class TokenBucket:
             return True
         return False
 
-# Usage: limit Epic API calls to 10/s with burst of 20
-epic_limiter = TokenBucket(capacity=20, refill_rate=10)
+# Usage: limit EHR API calls to 10/s with burst of 20
+ehr_limiter = TokenBucket(capacity=20, refill_rate=10)
 
-async def call_epic_api(endpoint: str, payload: dict):
-    while not epic_limiter.consume():
+async def call_ehr_api(endpoint: str, payload: dict):
+    while not ehr_limiter.consume():
         await asyncio.sleep(0.05)  # back off briefly
     return await http_client.put(endpoint, json=payload)
 ```
@@ -456,7 +456,7 @@ A hybrid that tracks request counts in a rolling time window. More accurate than
 | Leaky bucket | No | High | Low |
 | Sliding window | Controlled | High | Medium |
 
-**AESF connection:** The Epic BDE API has documented rate limits per client. The middleware worker that pulls jobs from the sync queue and calls Epic should use a token bucket per Epic endpoint family. If the bucket is empty, the worker should re-enqueue the job with a short delay rather than blocking, keeping other workers free.
+**Integration platform connection:** The EHR system API has documented rate limits per client. The crm-middleware worker that pulls jobs from the sync queue and calls the EHR system should use a token bucket per EHR endpoint family. If the bucket is empty, the worker should re-enqueue the job with a short delay rather than blocking, keeping other workers free.
 
 ```python
 # Distributed rate limiter using Redis (required for multi-replica)
@@ -493,7 +493,7 @@ async def redis_token_bucket_consume(
 
 ---
 
-## 9. Analyzing the AESF Middleware Architecture
+## 9. Analyzing the crm-middleware Architecture
 
 Applying the patterns above to the actual middleware:
 
@@ -529,11 +529,11 @@ Salesforce Apex Trigger
                            │
               ┌────────────▼──────────────┐
               │  Token Bucket             │
-              │  (Epic API rate limiter)  │
+              │  (EHR API rate limiter)   │
               └────────────┬──────────────┘
                            │
               ┌────────────▼──────────────┐
-              │  Epic BDE Backend         │
+              │  EHR System Backend       │
               │  PUT /clients             │
               └───────────────────────────┘
 ```
@@ -541,7 +541,7 @@ Salesforce Apex Trigger
 **Current risks to evaluate:**
 1. Are any Pydantic models holding mutable state at module level?
 2. Is the sync queue polling loop distributed correctly? If only one replica polls, it is a single point of failure.
-3. Are idempotency keys enforced before forwarding to Epic?
+3. Are idempotency keys enforced before forwarding to the EHR system?
 4. Is the Redis-backed rate limiter in place, or is each replica independently throttling?
 
 A useful exercise: open `app/core/config.py` and `app/api/` and identify every place a module-level mutable variable exists. Each one is a horizontal scaling hazard.
@@ -587,19 +587,19 @@ Scalability Patterns
 
 **3.** Your GKE `Service` uses the default `iptables` round-robin load balancing, but one replica consistently receives 60% of traffic. What is the most likely cause?
 
-**4.** Explain replication lag in the context of PostgreSQL read replicas and describe a concrete scenario where it causes a correctness bug in the AESF middleware.
+**4.** Explain replication lag in the context of PostgreSQL read replicas and describe a concrete scenario where it causes a correctness bug in the crm-middleware.
 
 **5.** What is the difference between CQRS and simply having separate read/write database connections?
 
-**6.** A sync worker calls `PUT /clients` on the Epic API. The HTTP call times out after 30 seconds with no response. The worker retries. What must be true of the PUT handler for this retry to be safe?
+**6.** A sync worker calls `PUT /clients` on the EHR system API. The HTTP call times out after 30 seconds with no response. The worker retries. What must be true of the PUT handler for this retry to be safe?
 
 **7.** Describe the token bucket algorithm. What distinguishes it from the leaky bucket algorithm?
 
-**8.** You implement a token bucket rate limiter in Python at the module level in a FastAPI app. The app has 3 replicas. The Epic API allows 30 requests/second. What effective limit does your module-level limiter enforce?
+**8.** You implement a token bucket rate limiter in Python at the module level in a FastAPI app. The app has 3 replicas. The EHR system API allows 30 requests/second. What effective limit does your module-level limiter enforce?
 
 **9.** What is a shard key, and what property must it have to avoid hotspots?
 
-**10.** When is database table partitioning a better choice than multi-server sharding for the AESF middleware?
+**10.** When is database table partitioning a better choice than multi-server sharding for the crm-middleware?
 
 **11.** You have a sync queue table with 50 million rows. `SELECT * FROM sync_queue WHERE status = 'pending'` is slow. What is the most direct fix, and what risk comes with it on a high-write table?
 
@@ -607,7 +607,7 @@ Scalability Patterns
 
 **13.** What HTTP status code should a server return when it receives a request with an `Idempotency-Key` that is currently being processed by another worker?
 
-**14.** Describe the CQRS pattern and give one concrete example of where it applies in the AESF middleware.
+**14.** Describe the CQRS pattern and give one concrete example of where it applies in the crm-middleware.
 
 **15.** You add a read replica to PostgreSQL and route all `SELECT` queries to it. You notice that the admin panel sometimes shows a sync job as "pending" even after it has been completed. What is happening?
 
@@ -617,9 +617,9 @@ Scalability Patterns
 
 **18.** A new engineer suggests sharding the sync queue by `status` column to improve performance. Evaluate this suggestion.
 
-**19.** The middleware sync worker runs as a Deployment with 3 replicas. Each replica polls `sync_queue WHERE status = 'pending' LIMIT 10`. What race condition exists, and how do you fix it?
+**19.** The crm-middleware sync worker runs as a Deployment with 3 replicas. Each replica polls `sync_queue WHERE status = 'pending' LIMIT 10`. What race condition exists, and how do you fix it?
 
-**20.** You are asked to design the rate limiting for the AESF middleware's outbound Epic API calls in a way that is correct across all replicas and survives replica restarts. Describe the architecture.
+**20.** You are asked to design the rate limiting for the crm-middleware's outbound EHR system API calls in a way that is correct across all replicas and survives replica restarts. Describe the architecture.
 
 ---
 
@@ -633,19 +633,19 @@ Scalability Patterns
 
     **3.** The most likely cause is connection keep-alive. If some clients maintain long-lived HTTP connections to specific replicas, those connections are not redistributed by round-robin — new connections are distributed evenly, but established ones stick. This is especially common with Salesforce outbound webhooks if they reuse connections. The fix is to enable connection draining and rotation, or to switch to least-connections balancing.
 
-    **4.** Replication lag is the delay between a write being committed on the primary and that write becoming visible on the read replica. In the AESF middleware, a concrete bug: a sync job is marked `status = 'complete'` on the primary, and then an admin panel request immediately reads from the replica. If the replica has not yet received the WAL record for that update, it returns `status = 'pending'`. This is stale data, not an error, but it misleads operators. The fix is to route the read to the primary for the short window after a write, or to accept that the admin panel is eventually consistent.
+    **4.** Replication lag is the delay between a write being committed on the primary and that write becoming visible on the read replica. In the crm-middleware, a concrete bug: a sync job is marked `status = 'complete'` on the primary, and then an admin panel request immediately reads from the replica. If the replica has not yet received the WAL record for that update, it returns `status = 'pending'`. This is stale data, not an error, but it misleads operators. The fix is to route the read to the primary for the short window after a write, or to accept that the admin panel is eventually consistent.
 
     **5.** Separate read/write connections is an infrastructure concern — two connection pools pointing to different database endpoints. CQRS is an application architecture concern — two entirely separate domain models, one optimized for write validation and business logic (commands), one optimized for read presentation and query performance (queries). CQRS can be implemented with a single database; it does not require read replicas. The value is that the read model can be denormalized or pre-aggregated independently of the write model without either constraining the other.
 
-    **6.** The PUT handler on the Epic side must be idempotent: calling it twice with the same payload must produce the same result as calling it once, with no duplicate records created. In practice this means the handler must use the client's stable identifier (e.g., Salesforce ID or Epic client ID) as a natural key, and an upsert or conditional create must be used rather than an unconditional insert. The middleware must also send a stable idempotency key header if the Epic API supports it.
+    **6.** The PUT handler on the EHR system side must be idempotent: calling it twice with the same payload must produce the same result as calling it once, with no duplicate records created. In practice this means the handler must use the client's stable identifier (e.g., Salesforce ID or EHR client ID) as a natural key, and an upsert or conditional create must be used rather than an unconditional insert. The crm-middleware must also send a stable idempotency key header if the EHR system API supports it.
 
     **7.** The token bucket maintains a pool of tokens that refills at a constant rate up to a maximum capacity. Each request consumes one token; if none remain, the request is rejected or queued. The key property is that it allows bursting — if the bucket is full, a spike of requests up to the capacity can be served immediately before the bucket is drained. The leaky bucket, by contrast, queues incoming requests and processes them at a fixed output rate with no burst. The token bucket is better for upstream API calls where you want to use available quota fully; the leaky bucket is better for downstream request acceptance where you need a smooth, predictable output rate.
 
-    **8.** Each replica maintains its own independent token bucket with capacity for 30 req/s. Since there are 3 replicas and the load balancer distributes traffic across them, each replica may send up to 30 req/s to Epic, for a combined total of up to 90 req/s — three times the allowed limit. Epic will respond with 429 errors. The rate limiter must be backed by a shared atomic store (Redis) and use a distributed algorithm (e.g., a Lua script for atomic check-and-decrement) so that the total across all replicas never exceeds 30 req/s.
+    **8.** Each replica maintains its own independent token bucket with capacity for 30 req/s. Since there are 3 replicas and the load balancer distributes traffic across them, each replica may send up to 30 req/s to the EHR system, for a combined total of up to 90 req/s — three times the allowed limit. The EHR system will respond with 429 errors. The rate limiter must be backed by a shared atomic store (Redis) and use a distributed algorithm (e.g., a Lua script for atomic check-and-decrement) so that the total across all replicas never exceeds 30 req/s.
 
     **9.** A shard key is the field used to determine which shard a given row belongs to, typically by hashing or range-partitioning the value. To avoid hotspots, the shard key must have high cardinality (many distinct values) and its distribution across rows must be approximately uniform. Fields like `status` (three values) or `created_at` (clustered in time during business hours) make poor shard keys. Fields like `account_id` (UUID or high-cardinality integer) are good choices because rows distribute evenly.
 
-    **10.** Table partitioning is almost always better for AESF's scale because it operates on a single PostgreSQL instance, requires no application-level routing, supports standard SQL joins across partitions, and can be added to an existing table with minimal disruption. Multi-server sharding is only warranted when a single PostgreSQL instance — even a very large one — cannot handle the write throughput or storage volume, typically at hundreds of millions of rows per day or terabytes of data. The AESF sync queue is high frequency but not at a scale that a well-tuned single Postgres instance with partitioning and connection pooling (PgBouncer) cannot handle.
+    **10.** Table partitioning is almost always better for the integration platform's scale because it operates on a single PostgreSQL instance, requires no application-level routing, supports standard SQL joins across partitions, and can be added to an existing table with minimal disruption. Multi-server sharding is only warranted when a single PostgreSQL instance — even a very large one — cannot handle the write throughput or storage volume, typically at hundreds of millions of rows per day or terabytes of data. The crm-middleware sync queue is high frequency but not at a scale that a well-tuned single Postgres instance with partitioning and connection pooling (PgBouncer) cannot handle.
 
     **11.** The most direct fix is to add an index: `CREATE INDEX CONCURRENTLY idx_sync_queue_pending ON sync_queue (id) WHERE status = 'pending'`. This partial index covers only pending rows, keeping it small and fast even as the table grows. The risk on a high-write table is index bloat and write amplification — every INSERT and UPDATE to `sync_queue` must also update the index, which adds latency under high write load. Monitor index bloat (`pg_stat_user_indexes`) and consider `REINDEX CONCURRENTLY` periodically.
 
@@ -653,7 +653,7 @@ Scalability Patterns
 
     **13.** The server should return HTTP `409 Conflict`. This signals to the caller that the request is valid but cannot be processed at this moment due to a conflict with the current state — specifically, an in-flight operation with the same idempotency key. The caller should wait and retry rather than assuming the operation failed. `429 Too Many Requests` would be incorrect here because this is not a rate limit violation; it is a concurrency control signal.
 
-    **14.** CQRS separates the model that handles writes (commands) from the model that handles reads (queries), allowing each to be optimized independently. In the AESF middleware, a concrete example: the command side accepts POST webhooks from Salesforce, validates the payload, enforces business rules (e.g., "do not sync if Epic client ID is missing"), and writes to the `sync_queue` table. The query side serves the admin panel's sync status dashboard, reading from a pre-aggregated view (`sync_status_view`) that joins queue entries with outcome records and formats them for display. Changes to the write model (e.g., splitting the payload into normalized columns) do not require changes to the read model, and vice versa.
+    **14.** CQRS separates the model that handles writes (commands) from the model that handles reads (queries), allowing each to be optimized independently. In the crm-middleware, a concrete example: the command side accepts POST webhooks from Salesforce, validates the payload, enforces business rules (e.g., "do not sync if EHR client ID is missing"), and writes to the `sync_queue` table. The query side serves the admin panel's sync status dashboard, reading from a pre-aggregated view (`sync_status_view`) that joins queue entries with outcome records and formats them for display. Changes to the write model (e.g., splitting the payload into normalized columns) do not require changes to the read model, and vice versa.
 
     **15.** This is the replication lag problem. The worker updated the sync job status to `complete` on the primary, but the WAL record for that change has not yet been applied to the read replica when the admin panel query runs. The replica returns the old value. This is expected behavior for an asynchronous replica; it is eventually consistent, not strongly consistent. A practical fix is to route admin panel reads that display recently-modified records (within the last 5 seconds, for example) to the primary, and route historical and aggregated reads to the replica.
 
@@ -663,6 +663,6 @@ Scalability Patterns
 
     **18.** This is a poor suggestion. `status` has low cardinality — typically three to five values (`pending`, `in_progress`, `complete`, `failed`). Sharding on a low-cardinality field creates severe hotspots: the `pending` shard receives nearly all inserts (every new job starts as pending) and the `complete` shard receives most updates (most jobs eventually succeed). Two of the four shards would be severely overloaded. The correct solution for a large sync queue table is range partitioning by `created_at` (time-series data ages naturally, old partitions can be archived) combined with a partial index on pending rows.
 
-    **19.** The race condition is a classic queue worker double-take: two replicas execute `SELECT ... WHERE status = 'pending' LIMIT 10` simultaneously and both read overlapping sets of rows. Both then attempt to process the same jobs, potentially sending duplicate requests to the Epic API. The fix is pessimistic locking with `SELECT ... FOR UPDATE SKIP LOCKED`. `SKIP LOCKED` causes a worker to skip rows that another worker has already locked, ensuring each job is claimed by exactly one worker: `SELECT id FROM sync_queue WHERE status = 'pending' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`.
+    **19.** The race condition is a classic queue worker double-take: two replicas execute `SELECT ... WHERE status = 'pending' LIMIT 10` simultaneously and both read overlapping sets of rows. Both then attempt to process the same jobs, potentially sending duplicate requests to the EHR system API. The fix is pessimistic locking with `SELECT ... FOR UPDATE SKIP LOCKED`. `SKIP LOCKED` causes a worker to skip rows that another worker has already locked, ensuring each job is claimed by exactly one worker: `SELECT id FROM sync_queue WHERE status = 'pending' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED`.
 
-    **20.** The correct architecture uses Redis as the shared atomic counter. Each replica, when it is about to call an Epic endpoint, checks a Redis-backed token bucket using a Lua script that atomically reads the current token count, computes the refill based on elapsed time, and either decrements the count and returns "allowed" or returns "denied" — all in one atomic operation, safe across all replicas. Token state persists in Redis, so a replica restart does not reset the bucket. The TTL on the Redis key should be set to slightly longer than the full-refill time (e.g., `capacity / refill_rate + 1` seconds) so that an idle period naturally expires the key and it reinitializes on next use without manual cleanup.
+    **20.** The correct architecture uses Redis as the shared atomic counter. Each replica, when it is about to call an EHR system endpoint, checks a Redis-backed token bucket using a Lua script that atomically reads the current token count, computes the refill based on elapsed time, and either decrements the count and returns "allowed" or returns "denied" — all in one atomic operation, safe across all replicas. Token state persists in Redis, so a replica restart does not reset the bucket. The TTL on the Redis key should be set to slightly longer than the full-refill time (e.g., `capacity / refill_rate + 1` seconds) so that an idle period naturally expires the key and it reinitializes on next use without manual cleanup.

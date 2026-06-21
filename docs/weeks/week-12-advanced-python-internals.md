@@ -10,7 +10,7 @@
 
 Most Python engineers spend years writing production code without ever looking at what CPython is actually doing on their behalf. That gap becomes a liability when you're diagnosing a slow FastAPI endpoint, hunting a memory leak in a long-running Kubernetes pod, or deciding whether `asyncio` will actually parallelize your CPU-bound database fan-out. This week closes that gap by walking through the CPython execution model from source to bytecode to object lifecycle.
 
-The AESF middleware is a particularly good lens for these topics. It runs as a persistent Kubernetes service handling thousands of Epic-to-Salesforce sync events per day. Each request touches SQLAlchemy ORM objects, serializes Pydantic models, and often fans out to multiple downstream HTTP calls. Understanding how CPython manages the memory for those objects, how the GIL interacts with `asyncio`'s event loop, and where cycles accumulate in long-lived services gives you a concrete return on the two hours you'll spend here.
+The crm-middleware is a particularly good lens for these topics. It runs as a persistent Kubernetes service handling thousands of EHR-to-Salesforce sync events per day. Each request touches SQLAlchemy ORM objects, serializes Pydantic models, and often fans out to multiple downstream HTTP calls. Understanding how CPython manages the memory for those objects, how the GIL interacts with `asyncio`'s event loop, and where cycles accumulate in long-lived services gives you a concrete return on the two hours you'll spend here.
 
 Python 3.13 introduces the experimental free-threaded build (PEP 703), which disables the GIL entirely. This is not yet production-ready for most workloads, but it changes the calculus for CPU-bound parallelism significantly, and it's worth understanding what the GIL was actually protecting before celebrating its removal. We'll cover the GIL's real scope — and the surprising things it does *not* protect.
 
@@ -28,7 +28,7 @@ Every function, class body, and module is compiled into a **code object** (`type
 import dis
 
 def compute_sync_delay(queue_depth: int, base_ms: float = 50.0) -> float:
-    """Estimate Epic sync delay from queue depth."""
+    """Estimate EHR sync delay from queue depth."""
     return base_ms * (1 + queue_depth / 100)
 
 dis.dis(compute_sync_delay)
@@ -56,13 +56,13 @@ You can inspect a code object directly:
 ```python
 code = compute_sync_delay.__code__
 print(code.co_varnames)   # ('queue_depth', 'base_ms')
-print(code.co_consts)     # (None, 1, 100, 'Estimate Epic sync delay from queue depth.')
+print(code.co_consts)     # (None, 1, 100, 'Estimate EHR sync delay from queue depth.')
 print(code.co_argcount)   # 2
 ```
 
 **Common mistake:** Assuming that Python's compilation step is equivalent to a "build" in a compiled language. CPython's bytecode is not optimized across function boundaries; the interpreter evaluates each opcode at runtime, making Python fundamentally interpreter-bound. Specializations introduced in Python 3.11–3.13 (adaptive interpreter) provide limited inline caching, but Python is still orders of magnitude slower than native code for CPU-heavy loops.
 
-**AESF connection:** When a sync endpoint deserializes a large Epic payload into nested Pydantic models, every attribute access, dict lookup, and list append goes through the bytecode interpreter. This is why moving heavy transformation logic out of the hot path — e.g., offloading to background Celery tasks — can matter more than micro-optimizing the Python code itself.
+**Integration platform connection:** When a sync endpoint deserializes a large EHR payload into nested Pydantic models, every attribute access, dict lookup, and list append goes through the bytecode interpreter. This is why moving heavy transformation logic out of the hot path — e.g., offloading to background Celery tasks — can matter more than micro-optimizing the Python code itself.
 
 ---
 
@@ -106,10 +106,10 @@ Useful `dis` attributes to know:
 **Inspecting a FastAPI route's code object:**
 
 ```python
-from app.api.v2.sync import sync_epic_client  # your actual route handler
+from app.api.v2.sync import sync_ehr_client  # your actual route handler
 
 import dis
-dis.dis(sync_epic_client)
+dis.dis(sync_ehr_client)
 
 # For async functions, bytecode includes GET_AWAITABLE, SEND, YIELD_VALUE
 # showing exactly where coroutine suspension points are
@@ -159,7 +159,7 @@ Even with the free-threaded build, shared mutable Python objects require explici
 
 **Common mistake:** Writing `threading.Thread` code expecting CPU parallelism. In standard CPython, two threads running a pure-Python number-crunching loop will not run faster than one — they'll actually be slower due to GIL contention and context-switch overhead. Use `multiprocessing.Pool` or `concurrent.futures.ProcessPoolExecutor` for CPU parallelism.
 
-**AESF connection:** The AESF middleware uses `asyncio` (FastAPI). The GIL is essentially irrelevant here because `asyncio` runs on a single thread — its concurrency comes from cooperative yielding at `await` points, not from threading. The real risk is *blocking the event loop* with synchronous SQLAlchemy calls, which holds the single thread and prevents all other coroutines from running. Use `asyncio.to_thread()` or `run_in_executor()` to move synchronous DB work off the event loop.
+**Integration platform connection:** The crm-middleware uses `asyncio` (FastAPI). The GIL is essentially irrelevant here because `asyncio` runs on a single thread — its concurrency comes from cooperative yielding at `await` points, not from threading. The real risk is *blocking the event loop* with synchronous SQLAlchemy calls, which holds the single thread and prevents all other coroutines from running. Use `asyncio.to_thread()` or `run_in_executor()` to move synchronous DB work off the event loop.
 
 ---
 
@@ -200,7 +200,7 @@ print(a is b)   # False (usually) — different objects
 
 **Common mistake:** Relying on `__del__` for critical cleanup (e.g., closing a DB connection). If a reference cycle exists, `__del__` may never be called promptly or at all. Always use context managers (`with` statements) for resource management.
 
-**AESF connection:** In the middleware, SQLAlchemy `Session` objects should always be acquired via the `get_db` FastAPI dependency (which uses `yield` and a `finally` block), not held as module-level globals. A module-level session that accumulates references from circular imports could live indefinitely, holding a PostgreSQL connection.
+**Integration platform connection:** In the crm-middleware, SQLAlchemy `Session` objects should always be acquired via the `get_db` FastAPI dependency (which uses `yield` and a `finally` block), not held as module-level globals. A module-level session that accumulates references from circular imports could live indefinitely, holding a PostgreSQL connection.
 
 ---
 
@@ -259,7 +259,7 @@ for stat in top_stats[:10]:
 
 **Common mistake:** Disabling the GC (`gc.disable()`) for performance without understanding the consequences. Some high-throughput servers do this and rely on not creating cycles. This is safe only if you can guarantee cycle-free data structures — which SQLAlchemy ORM objects are *not* (they contain backreferences to the session and mapper).
 
-**AESF connection:** Long-running middleware pods that process thousands of requests can accumulate cycles from Pydantic model instances that reference each other (e.g., nested response models that include a back-reference to the parent). Enabling `tracemalloc` in staging and watching RSS growth over time is a standard way to catch this.
+**Integration platform connection:** Long-running middleware pods that process thousands of requests can accumulate cycles from Pydantic model instances that reference each other (e.g., nested response models that include a back-reference to the parent). Enabling `tracemalloc` in staging and watching RSS growth over time is a standard way to catch this.
 
 ---
 
@@ -300,7 +300,7 @@ job.queue_depth = -1     # raises ValueError
 **`__slots__`** replaces the per-instance `__dict__` with a fixed-layout C array of slots, saving memory and speeding up attribute access:
 
 ```python
-class EpicRecord:
+class EHRRecord:
     __slots__ = ("client_id", "policy_number", "timestamp")
 
     def __init__(self, client_id: str, policy_number: str, timestamp: float):
@@ -311,7 +311,7 @@ class EpicRecord:
 
 # No __dict__ → ~40–50% less memory per instance for attribute-heavy classes
 import sys
-print(sys.getsizeof(EpicRecord("C001", "P001", 0.0)))  # smaller than dict-backed class
+print(sys.getsizeof(EHRRecord("C001", "P001", 0.0)))  # smaller than dict-backed class
 ```
 
 **Metaclasses** control class *creation*. The default metaclass is `type`. You can intercept `__new__` to validate or transform a class at definition time:
@@ -407,7 +407,7 @@ spec.loader.exec_module(mod)
 
 **Common mistake:** Importing at module level inside a frequently-called function. Each `import` statement still checks `sys.modules`, which is a dict lookup — fast, but not free. Move module-level imports to the top of the file. The exception is avoiding circular imports or importing optional heavy dependencies lazily.
 
-**AESF connection:** The middleware's `app/core/config.py` is imported at startup and cached in `sys.modules`. If you accidentally trigger a re-import (e.g., via `importlib.reload` in a middleware hook), you'll get a second `Settings` instance, breaking singleton config assumptions. This is a subtle production footgun.
+**Integration platform connection:** The crm-middleware's `app/core/config.py` is imported at startup and cached in `sys.modules`. If you accidentally trigger a re-import (e.g., via `importlib.reload` in a middleware hook), you'll get a second `Settings` instance, breaking singleton config assumptions. This is a subtle production footgun.
 
 ---
 
@@ -426,7 +426,7 @@ def profile_sync_batch(records: list[dict]) -> None:
 
     # --- code under test ---
     for record in records:
-        process_epic_record(record)
+        process_ehr_record(record)
     # -----------------------
 
     pr.disable()
@@ -499,7 +499,7 @@ The flamegraph SVG is interactive: click a frame to zoom, hover for time percent
 
 ```bash
 # Exec into the pod
-kubectl exec -it aesf-middleware-xyz -- bash
+kubectl exec -it crm-middleware-xyz -- bash
 
 # Inside the pod, attach to uvicorn worker
 py-spy top --pid $(pgrep -f uvicorn)
@@ -507,9 +507,9 @@ py-spy top --pid $(pgrep -f uvicorn)
 
 Note: you may need to add `SYS_PTRACE` capability to the pod's security context for `py-spy` to work.
 
-**Common mistake:** Running `py-spy` on a process that's already at 100% CPU and concluding that the slowest frame *in py-spy* is the bottleneck. If the process is I/O-bound (waiting on Postgres, Epic API), `py-spy` will mostly sample idle time in the event loop, not your slow code. Check `async with asyncio.timeout()` and Postgres query plans first.
+**Common mistake:** Running `py-spy` on a process that's already at 100% CPU and concluding that the slowest frame *in py-spy* is the bottleneck. If the process is I/O-bound (waiting on Postgres, the EHR system API), `py-spy` will mostly sample idle time in the event loop, not your slow code. Check `async with asyncio.timeout()` and Postgres query plans first.
 
-**AESF connection:** During an Epic sync backlog incident, attach `py-spy top` to the middleware pod in staging. If the flamegraph shows wide bands in SQLAlchemy's `execute()` → `psycopg2._psycopg.cursor.execute()`, the bottleneck is query time, not Python. If it shows wide bands in Pydantic's `model_validate()`, you have a schema complexity problem worth optimizing.
+**Integration platform connection:** During an EHR sync backlog incident, attach `py-spy top` to the crm-middleware pod in staging. If the flamegraph shows wide bands in SQLAlchemy's `execute()` → `psycopg2._psycopg.cursor.execute()`, the bottleneck is query time, not Python. If it shows wide bands in Pydantic's `model_validate()`, you have a schema complexity problem worth optimizing.
 
 ---
 
@@ -588,7 +588,7 @@ CPython Execution Model
 
 **15.** What is the adaptive interpreter introduced in Python 3.11 and refined in 3.13, and how does it affect the bytecode you see with `dis`?
 
-**16.** You suspect a memory leak in the AESF middleware. Walk through the steps you'd take to confirm it and identify the source.
+**16.** You suspect a memory leak in the crm-middleware. Walk through the steps you'd take to confirm it and identify the source.
 
 **17.** Why is `gc.disable()` dangerous in a service that uses SQLAlchemy ORM objects?
 
@@ -596,7 +596,7 @@ CPython Execution Model
 
 **19.** In Python 3.13 free-threaded mode (PEP 703), the GIL is disabled. Does this mean you no longer need to worry about thread safety for shared mutable Python objects? Explain.
 
-**20.** You want to profile a specific AESF sync endpoint under realistic load without modifying the running container. What command do you run, and what are you looking for in the output?
+**20.** You want to profile a specific integration platform sync endpoint under realistic load without modifying the running container. What command do you run, and what are you looking for in the output?
 
 ---
 
@@ -630,7 +630,7 @@ CPython Execution Model
 
     **13.** `tottime` is the time spent *inside* the function itself, excluding time spent in functions it called. `cumtime` is the total time from the function's start to its return, including all callees. For finding the actual bottleneck (the "leaf" doing real work), sort by **`tottime`** — high `tottime` means that function itself is slow, not just passing work to something deeper. `cumtime` is useful for tracing call chains (why is the top-level function slow?) but misleading for pinpointing the root cause. A function with `cumtime=5s` and `tottime=0.001s` is just an orchestrator; the real work is happening in its callees.
 
-    **14.** `select()` is the OS-level system call that blocks until a file descriptor (socket, pipe) is readable or writable. Seeing most time in `select()` means the process is **I/O-bound and waiting** — it's spending its time blocked on network or disk I/O, not burning CPU. For the AESF middleware, this is actually *normal and healthy* during light load: the event loop is sleeping in `select()` waiting for the next request or database response. If you see this during a period of high backlog, it suggests the process is waiting on upstream systems (Epic API, Postgres) and adding more Python concurrency won't help — investigate query latency or Epic API response times instead.
+    **14.** `select()` is the OS-level system call that blocks until a file descriptor (socket, pipe) is readable or writable. Seeing most time in `select()` means the process is **I/O-bound and waiting** — it's spending its time blocked on network or disk I/O, not burning CPU. For the crm-middleware, this is actually *normal and healthy* during light load: the event loop is sleeping in `select()` waiting for the next request or database response. If you see this during a period of high backlog, it suggests the process is waiting on upstream systems (the EHR system API, Postgres) and adding more Python concurrency won't help — investigate query latency or EHR system API response times instead.
 
     **15.** The **adaptive interpreter** (PEP 659, Python 3.11+) makes CPython self-optimizing. After a code path executes enough times ("warms up"), the interpreter replaces generic opcodes with **specialized** variants tailored to the observed types. For example, `BINARY_OP` operating on two integers may be replaced with `BINARY_OP_ADD_INT`, which skips type-dispatch overhead. In Python 3.13, the specialization is more aggressive and covers more opcode families. When you use `dis.dis()`, you may see the specialized opcode names. Importantly, specializations are per-code-object and can be de-optimized if the types change (e.g., first calling with `int, int` then with `float, int`), falling back to the generic opcode. This is transparent to user code.
 

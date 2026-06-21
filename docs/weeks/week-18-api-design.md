@@ -10,7 +10,7 @@
 
 API design is one of the highest-leverage skills a senior engineer can master. Unlike internal code, an API is a public contract: once consumers are wired to it, changes become expensive coordination problems. For engineers targeting the staff level, the question is rarely "how do I make an endpoint work?" but rather "how do I design a surface that survives years of evolution, heterogeneous consumers, and distributed teams?" This week covers the three dominant paradigms — REST, gRPC, and GraphQL — through that lens.
 
-In the AESF ecosystem, this is not academic. The `aesf-py-middleware` exposes v1 and v2 REST APIs consumed by two very different clients: Salesforce Apex callouts (strict JSON, no streaming, hard callout timeout at 120 seconds) and ETL pipelines (batch-oriented, schema-stable, latency-tolerant). Those two consumers have almost opposite needs, and the design decisions you make — versioning strategy, OpenAPI contract discipline, response shape — directly determine how painful the next breaking change will be.
+In the CRM-EHR Integration Platform ecosystem, this is not academic. The `crm-middleware` exposes v1 and v2 REST APIs consumed by two very different clients: Salesforce Apex callouts (strict JSON, no streaming, hard callout timeout at 120 seconds) and ETL pipelines (batch-oriented, schema-stable, latency-tolerant). Those two consumers have almost opposite needs, and the design decisions you make — versioning strategy, OpenAPI contract discipline, response shape — directly determine how painful the next breaking change will be.
 
 REST is the lingua franca of web APIs but is frequently misimplemented. The Richardson Maturity Model gives a precise vocabulary for how "RESTful" an API actually is, and most production systems live at Level 2 rather than the theoretically ideal Level 3. gRPC trades human-readability for performance and strong typing; it excels at internal service-to-service calls and streaming workloads, but is a poor fit where the consumer is a browser or a platform like Salesforce. GraphQL inverts the query model: instead of the server deciding response shape, the client does — which solves over-fetching but introduces its own operational complexity (N+1 queries, authorization surface, caching challenges).
 
@@ -22,17 +22,17 @@ By the end of this week you will be able to articulate the right tool for a give
 
 Leonard Richardson's maturity model defines four levels of REST adoption. Most engineers can recite "Level 2" without knowing what it costs to not be there.
 
-| Level | Name | What it means | AESF relevance |
+| Level | Name | What it means | Platform relevance |
 |-------|------|---------------|----------------|
 | 0 | The Swamp of POX | Single URI, all verbs tunnel through POST | Pre-REST SOAP style |
-| 1 | Resources | Multiple URIs, one per resource type | `/clients`, `/policies` — AESF is here minimum |
-| 2 | HTTP Verbs | GET/POST/PUT/DELETE carry semantic meaning; status codes are meaningful | AESF v2 target |
+| 1 | Resources | Multiple URIs, one per resource type | `/clients`, `/policies` — the integration platform is here minimum |
+| 2 | HTTP Verbs | GET/POST/PUT/DELETE carry semantic meaning; status codes are meaningful | the integration platform v2 target |
 | 3 | Hypermedia (HATEOAS) | Responses embed links to valid next actions | Rarely implemented in practice |
 
 Level 2 is the practical target for most production APIs. Status codes matter: `200` for success, `201` for created, `204` for no-content deletes, `400` for client validation failures, `404` for missing resources, `409` for conflict (e.g., concurrent sync collision), `422` for unprocessable entity (FastAPI's default for Pydantic validation errors), and `500` only when something is genuinely unexpected.
 
 ```python
-# FastAPI Level 2 example: AESF client endpoint
+# FastAPI Level 2 example: integration platform client endpoint
 from fastapi import APIRouter, HTTPException, status
 from app.schemas.client import ClientCreate, ClientRead
 
@@ -40,7 +40,7 @@ router = APIRouter(prefix="/clients", tags=["clients"])
 
 @router.post("/", response_model=ClientRead, status_code=status.HTTP_201_CREATED)
 async def create_client(payload: ClientCreate, db: AsyncSession = Depends(get_db)):
-    existing = await db.scalar(select(Client).where(Client.epic_id == payload.epic_id))
+    existing = await db.scalar(select(Client).where(Client.ehr_id == payload.ehr_id))
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Client already exists")
     client = Client(**payload.model_dump())
@@ -58,13 +58,13 @@ async def create_client(payload: ClientCreate, db: AsyncSession = Depends(get_db
 
 Versioning is about managing change without breaking existing consumers. Three main strategies exist, each with real trade-offs.
 
-**URI path versioning** (`/v1/clients`, `/v2/clients`) is explicit, easy to route in Kubernetes ingress rules, and easy for Apex to call. It is the strategy used in `aesf-py-middleware` and is the right choice when consumers are external platforms you do not control.
+**URI path versioning** (`/v1/clients`, `/v2/clients`) is explicit, easy to route in Kubernetes ingress rules, and easy for Apex to call. It is the strategy used in `crm-middleware` and is the right choice when consumers are external platforms you do not control.
 
-**Header versioning** (`Accept: application/vnd.aesf.v2+json`) keeps URIs clean but requires consumers to set custom headers — something Apex named credentials and standard `HttpRequest` can do but which adds configuration overhead.
+**Header versioning** (`Accept: application/vnd.platform.v2+json`) keeps URIs clean but requires consumers to set custom headers — something Apex named credentials and standard `HttpRequest` can do but which adds configuration overhead.
 
 **Query parameter versioning** (`/clients?version=2`) is convenient for browser exploration but semantically odd (versioning is not a filter) and can create caching problems.
 
-For the AESF middleware, URI versioning is correct. The challenge is managing divergence between v1 and v2 in a single FastAPI codebase without duplicating business logic.
+For the integration platform middleware, URI versioning is correct. The challenge is managing divergence between v1 and v2 in a single FastAPI codebase without duplicating business logic.
 
 ```python
 # app/api/v1/router.py
@@ -93,12 +93,12 @@ The pattern for v1→v2 migration is to keep shared service-layer functions and 
 ```python
 # Shared service, forked schemas
 # app/services/client_service.py (shared)
-async def get_client(epic_id: str, db: AsyncSession) -> Client:
-    return await db.scalar(select(Client).where(Client.epic_id == epic_id))
+async def get_client(ehr_id: str, db: AsyncSession) -> Client:
+    return await db.scalar(select(Client).where(Client.ehr_id == ehr_id))
 
 # v1 schema — flat, legacy field names
 class ClientReadV1(BaseModel):
-    epic_client_id: str
+    ehr_client_id: str
     client_name: str
 
 # v2 schema — nested, renamed fields
@@ -108,7 +108,7 @@ class ClientReadV2(BaseModel):
     address: AddressSchema
 ```
 
-**AESF connection:** The v1 → v2 migration in the middleware is exactly this scenario. Apex callouts in Staging and PRD org still reference `/v1/` paths (hardcoded in named credentials or in Apex constants). Deprecating v1 safely means: (1) keep v1 alive while Apex is updated, (2) use the OpenAPI spec to communicate the deprecation timeline, (3) monitor v1 call volume in Datadog before cutting over.
+**Integration platform connection:** The v1 → v2 migration in the middleware is exactly this scenario. Apex callouts in Staging and PRD org still reference `/v1/` paths (hardcoded in named credentials or in Apex constants). Deprecating v1 safely means: (1) keep v1 alive while Apex is updated, (2) use the OpenAPI spec to communicate the deprecation timeline, (3) monitor v1 call volume in Datadog before cutting over.
 
 **Common mistake:** Adding a new required field to an existing response schema without bumping the version. Apex classes that deserialize the response with strict JSON parsing will silently mismap or throw a `JSONException` at runtime.
 
@@ -166,7 +166,7 @@ gRPC is a high-performance RPC framework built on HTTP/2 and Protocol Buffers. I
 // client.proto
 syntax = "proto3";
 
-package aesf.v1;
+package platform.v1;
 
 service ClientService {
   rpc GetClient (GetClientRequest) returns (ClientResponse);
@@ -174,7 +174,7 @@ service ClientService {
 }
 
 message GetClientRequest {
-  string epic_id = 1;
+  string ehr_id = 1;
 }
 
 message ClientResponse {
@@ -197,14 +197,14 @@ import client_pb2_grpc, client_pb2
 
 class ClientServicer(client_pb2_grpc.ClientServiceServicer):
     async def GetClient(self, request, context):
-        client = await fetch_client(request.epic_id)
+        client = await fetch_client(request.ehr_id)
         if not client:
             context.set_code(grpc.StatusCode.NOT_FOUND)
             return client_pb2.ClientResponse()
-        return client_pb2.ClientResponse(id=client.epic_id, name=client.name)
+        return client_pb2.ClientResponse(id=client.ehr_id, name=client.name)
 ```
 
-**When gRPC beats REST in the AESF context:** ETL pipelines (Python → middleware) could theoretically benefit from gRPC for large batch syncs — Protobuf binary payloads for 50,000 policy records would be meaningfully smaller. However, Salesforce Apex cannot make gRPC calls (no HTTP/2 support in platform callouts), so the external-facing API must remain REST. gRPC is appropriate for **internal** service-to-service calls, such as a future microservice split within the middleware.
+**When gRPC beats REST in the integration platform context:** ETL pipelines (Python → middleware) could theoretically benefit from gRPC for large batch syncs — Protobuf binary payloads for 50,000 policy records would be meaningfully smaller. However, Salesforce Apex cannot make gRPC calls (no HTTP/2 support in platform callouts), so the external-facing API must remain REST. gRPC is appropriate for **internal** service-to-service calls, such as a future microservice split within the middleware.
 
 | Factor | REST | gRPC |
 |--------|------|------|
@@ -301,7 +301,7 @@ class Client:
         return await info.context["policy_loader"].load(self.id)
 ```
 
-**AESF connection:** GraphQL would be a poor fit for the current Apex-facing API (Apex requires explicit JSON structures with known shapes). However, a GraphQL layer could be valuable for a future internal analytics API or an admin panel querying policy/client/contact data with flexible filtering.
+**Integration platform connection:** GraphQL would be a poor fit for the current Apex-facing API (Apex requires explicit JSON structures with known shapes). However, a GraphQL layer could be valuable for a future internal analytics API or an admin panel querying policy/client/contact data with flexible filtering.
 
 **Common mistake:** Deploying GraphQL without depth limiting or query complexity analysis. A malicious or careless client can craft a deeply nested query (`client { policies { lines { endorsements { ... } } } }`) that triggers exponential resolver chains and takes down the server.
 
@@ -309,7 +309,7 @@ class Client:
 
 ## 6. OpenAPI/Swagger Spec Design as a Contract
 
-The OpenAPI spec is not just documentation — it is a **machine-readable contract** between the middleware and its consumers. For AESF, the Apex classes that call the middleware are hand-written to match the spec. When the spec drifts from the implementation, Apex callouts break in production.
+The OpenAPI spec is not just documentation — it is a **machine-readable contract** between the middleware and its consumers. For the integration platform, the Apex classes that call the middleware are hand-written to match the spec. When the spec drifts from the implementation, Apex callouts break in production.
 
 FastAPI auto-generates an OpenAPI spec from your route definitions and Pydantic schemas. The discipline is in annotating it correctly.
 
@@ -325,7 +325,7 @@ class PolicyStatus(str, Enum):
     EXPIRED = "expired"
 
 class PolicyRead(BaseModel):
-    policy_number: str = Field(..., description="Epic policy number", example="POL-2026-00123")
+    policy_number: str = Field(..., description="EHR policy number", example="POL-2026-00123")
     status: PolicyStatus = Field(..., description="Current policy status")
     effective_date: str = Field(..., description="ISO 8601 date", example="2026-01-01")
     expiration_date: Optional[str] = Field(None, description="ISO 8601 date, null if open-ended")
@@ -342,7 +342,7 @@ router = APIRouter()
 @router.get(
     "/policies/{policy_number}",
     response_model=PolicyRead,
-    summary="Fetch a single policy by Epic policy number",
+    summary="Fetch a single policy by EHR policy number",
     description="Returns the full policy record. Used by Apex PolicyComponentController.",
     responses={
         404: {"description": "Policy not found in middleware"},
@@ -441,7 +441,7 @@ router = APIRouter(
 )
 ```
 
-**Background tasks for async Epic sync:**
+**Background tasks for async EHR sync:**
 
 ```python
 from fastapi import BackgroundTasks
@@ -453,12 +453,12 @@ async def create_contact(
     db: AsyncSession = Depends(get_db),
 ):
     contact = await contact_service.create(payload, db)
-    # Don't block the Apex callout on the Epic sync — Apex has a 120s timeout
-    background_tasks.add_task(sync_contact_to_epic, contact.id)
+    # Don't block the Apex callout on the EHR sync — Apex has a 120s timeout
+    background_tasks.add_task(sync_contact_to_ehr, contact.id)
     return contact
 ```
 
-**Pydantic v2 model patterns for AESF:**
+**Pydantic v2 model patterns for the integration platform:**
 
 ```python
 from pydantic import BaseModel, field_validator, model_validator
@@ -470,7 +470,7 @@ class ContactCreate(BaseModel):
     last_name: str
     email: Optional[str] = None
     phone: Optional[str] = None
-    epic_contact_id: Optional[str] = None
+    ehr_contact_id: Optional[str] = None
 
     @field_validator("email")
     @classmethod
@@ -483,7 +483,7 @@ class ContactCreate(BaseModel):
     @classmethod
     def normalize_phone(cls, v: Optional[str]) -> Optional[str]:
         if v:
-            return re.sub(r"\D", "", v)  # Strip non-digits for Epic compatibility
+            return re.sub(r"\D", "", v)  # Strip non-digits for EHR compatibility
         return v
 
     @model_validator(mode="after")
@@ -536,7 +536,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 ```
 
-**AESF connection:** Apex callouts parse the error body to determine if a retry is warranted. A consistent `{"error": "...", "code": "..."}` shape lets Apex implement a single `parseErrorResponse` method rather than per-endpoint error parsing.
+**Integration platform connection:** Apex callouts parse the error body to determine if a retry is warranted. A consistent `{"error": "...", "code": "..."}` shape lets Apex implement a single `parseErrorResponse` method rather than per-endpoint error parsing.
 
 **Common mistake:** Letting FastAPI's default 422 Unprocessable Entity response (which has a Pydantic-specific nested `detail` array) reach Apex uncustomized. The Apex JSON parser expects your documented error shape, not FastAPI's internal schema.
 
@@ -583,7 +583,7 @@ async def create_client(
     return client
 ```
 
-**Common mistake:** Making write endpoints non-idempotent without documenting it, then discovering that Apex's retry-on-timeout behavior is creating duplicate records in both Salesforce and Epic.
+**Common mistake:** Making write endpoints non-idempotent without documenting it, then discovering that Apex's retry-on-timeout behavior is creating duplicate records in both Salesforce and the EHR system.
 
 ---
 
@@ -595,7 +595,7 @@ API Design — Core Concepts
 ├── REST
 │   ├── Richardson Maturity Model (L0 → L3)
 │   ├── HTTP semantics (verbs, status codes)
-│   ├── Versioning: URI path (preferred for AESF), header, query param
+│   ├── Versioning: URI path (preferred for the integration platform), header, query param
 │   └── HATEOAS: useful for pagination links; rarely full Level 3
 │
 ├── gRPC
@@ -619,7 +619,7 @@ API Design — Core Concepts
 └── Cross-cutting Concerns
     ├── Idempotency keys: safe retries for Apex timeouts
     ├── Rate limiting: protect against Apex trigger loop storms
-    ├── Background tasks: decouple Epic sync from Apex callout timeout
+    ├── Background tasks: decouple EHR sync from Apex callout timeout
     └── Service/Repository layers: HTTP-agnostic, reusable across CLI/tasks
 ```
 
@@ -631,7 +631,7 @@ API Design — Core Concepts
 
 **1.** What are the four levels of the Richardson Maturity Model, and what distinguishes Level 2 from Level 3?
 
-**2.** Which HTTP status code should the AESF middleware return when an Apex callout tries to create a client that already exists in the middleware database?
+**2.** Which HTTP status code should the integration platform middleware return when an Apex callout tries to create a client that already exists in the middleware database?
 
 **3.** You are adding a new `broker_code` field to the `/v2/clients/` response. The field is optional and new Apex code will use it, but old Apex code should not break. What is the correct approach?
 
@@ -639,9 +639,9 @@ API Design — Core Concepts
 
 **5.** Why is gRPC a poor fit for Salesforce Apex callouts, even though it has strong performance advantages over REST?
 
-**6.** What is the difference between `response_model` and `response_model_exclude_none=True` in FastAPI, and why is the latter important for AESF?
+**6.** What is the difference between `response_model` and `response_model_exclude_none=True` in FastAPI, and why is the latter important for the integration platform?
 
-**7.** An Apex trigger fires `POST /v2/contacts/` and the middleware times out (the Epic sync takes 130 seconds). Apex retries the callout. How should the middleware be designed to prevent duplicate contact records?
+**7.** An Apex trigger fires `POST /v2/contacts/` and the middleware times out (the EHR sync takes 130 seconds). Apex retries the callout. How should the middleware be designed to prevent duplicate contact records?
 
 **8.** What is HATEOAS and why is it rarely implemented fully in practice, even for APIs targeting Level 3 REST maturity?
 
@@ -651,13 +651,13 @@ API Design — Core Concepts
 
 **11.** What HTTP verb and status code should be used for a full replacement of a resource versus a partial update?
 
-**12.** In the AESF context, why is exporting the OpenAPI spec as a static JSON file and committing it to the repository valuable?
+**12.** In the integration platform context, why is exporting the OpenAPI spec as a static JSON file and committing it to the repository valuable?
 
 **13.** What is query complexity analysis in GraphQL and when would you need it?
 
-**14.** A FastAPI route handler is doing: (1) validate input, (2) call Epic API, (3) write to database, (4) return response. An ETL batch job needs to call the same logic without HTTP. What refactor resolves this?
+**14.** A FastAPI route handler is doing: (1) validate input, (2) call the EHR system API, (3) write to database, (4) return response. An ETL batch job needs to call the same logic without HTTP. What refactor resolves this?
 
-**15.** Explain the difference between URI path versioning, header versioning, and query parameter versioning. Which is most appropriate for the AESF middleware and why?
+**15.** Explain the difference between URI path versioning, header versioning, and query parameter versioning. Which is most appropriate for the integration platform middleware and why?
 
 **16.** What Pydantic v2 decorator replaces the `@validator` decorator from v1, and what is the key behavioral difference when it comes to the `mode` parameter?
 
@@ -667,7 +667,7 @@ API Design — Core Concepts
 
 **19.** An Apex callout receives a `422 Unprocessable Entity` with FastAPI's default Pydantic error body. The Apex JSON parser fails. What is the correct fix?
 
-**20.** Describe one scenario in the AESF platform where gRPC would be a better choice than REST, and one where REST must be used regardless of gRPC's performance advantages.
+**20.** Describe one scenario in the integration platform where gRPC would be a better choice than REST, and one where REST must be used regardless of gRPC's performance advantages.
 
 ---
 
@@ -685,17 +685,17 @@ API Design — Core Concepts
 
     **5.** Salesforce Apex platform callouts are limited to HTTP/1.1 over HTTPS. gRPC requires HTTP/2 for its multiplexing and streaming features. Without HTTP/2 support, Apex cannot establish a gRPC connection. Additionally, gRPC uses binary Protobuf framing that Apex's `HttpRequest`/`HttpResponse` classes cannot natively serialize or deserialize. A gRPC-HTTP transcoding proxy could bridge this, but adds operational complexity and latency, defeating gRPC's performance advantage.
 
-    **6.** `response_model` tells FastAPI which Pydantic model to use for serializing and validating the response, providing automatic documentation and type safety. `response_model_exclude_none=True` additionally strips any fields whose value is `None` from the JSON output. For AESF this matters because Apex classes that strictly parse JSON may interpret an unexpected null field as an error or map it incorrectly. Excluding nulls produces a leaner, more predictable response that matches what the OpenAPI spec documents as "present when relevant."
+    **6.** `response_model` tells FastAPI which Pydantic model to use for serializing and validating the response, providing automatic documentation and type safety. `response_model_exclude_none=True` additionally strips any fields whose value is `None` from the JSON output. For the integration platform this matters because Apex classes that strictly parse JSON may interpret an unexpected null field as an error or map it incorrectly. Excluding nulls produces a leaner, more predictable response that matches what the OpenAPI spec documents as "present when relevant."
 
-    **7.** The middleware should support idempotency keys via an `X-Idempotency-Key` request header. On the first call, the middleware processes the request, stores the response in a short-lived cache (Redis or a database table) keyed by the idempotency key, and returns the response. On retry with the same key, the middleware returns the cached prior response without re-processing. Apex should generate a UUID per logical operation and include it as the idempotency key, ensuring that retries caused by the 120-second callout timeout do not create duplicate contacts in either the middleware or Epic.
+    **7.** The middleware should support idempotency keys via an `X-Idempotency-Key` request header. On the first call, the middleware processes the request, stores the response in a short-lived cache (Redis or a database table) keyed by the idempotency key, and returns the response. On retry with the same key, the middleware returns the cached prior response without re-processing. Apex should generate a UUID per logical operation and include it as the idempotency key, ensuring that retries caused by the 120-second callout timeout do not create duplicate contacts in either the middleware or the EHR system.
 
     **8.** HATEOAS embeds hypermedia links in responses to describe valid state transitions, allowing a client to navigate the API without out-of-band documentation. It is rarely implemented fully because the vast majority of API clients — Apex callouts, code-generated SDKs, ETL pipeline consumers — are written against a known spec and will never dynamically follow response links at runtime. The implementation overhead (generating correct link URIs, handling link evolution across versions) is high relative to the practical benefit when consumers are not hypermedia-aware. Pagination links are the common partial adoption.
 
     **9.** In Protobuf, you must never reuse a field number, even for a removed field. The correct approach is to mark field 2 as `reserved` both by number and by name: `reserved 2; reserved "old_field_name";`. This prevents future `.proto` updates from accidentally reusing field number 2 with a different type, which would cause silent data corruption in clients that still parse the old binary format. The field is logically removed but its number is permanently tombstoned in the schema.
 
-    **10.** The pattern is to split at the API layer (separate `api/v1/` and `api/v2/` router modules with different schemas) while sharing a single service and repository layer. `ClientServiceV1` and `ClientServiceV2` can both call `ClientRepository.get_by_epic_id()` — the repository is version-agnostic. Only the request/response schemas and any version-specific field transformations live in the versioned layer. This keeps business logic DRY while allowing independent evolution of each API version's contract.
+    **10.** The pattern is to split at the API layer (separate `api/v1/` and `api/v2/` router modules with different schemas) while sharing a single service and repository layer. `ClientServiceV1` and `ClientServiceV2` can both call `ClientRepository.get_by_ehr_id()` — the repository is version-agnostic. Only the request/response schemas and any version-specific field transformations live in the versioned layer. This keeps business logic DRY while allowing independent evolution of each API version's contract.
 
-    **11.** Full replacement uses `PUT` and returns `200 OK` (or `204 No Content` if no body is returned). Partial update uses `PATCH` and also returns `200 OK` with the updated resource. The distinction matters because `PUT` semantically replaces the entire resource — any fields not included in the payload should revert to defaults or nulls. `PATCH` only modifies the provided fields. For AESF, Epic sync operations that send the full client record should use `PUT`; operations that update a single field (e.g., marking a policy as cancelled) should use `PATCH`.
+    **11.** Full replacement uses `PUT` and returns `200 OK` (or `204 No Content` if no body is returned). Partial update uses `PATCH` and also returns `200 OK` with the updated resource. The distinction matters because `PUT` semantically replaces the entire resource — any fields not included in the payload should revert to defaults or nulls. `PATCH` only modifies the provided fields. For the integration platform, EHR sync operations that send the full client record should use `PUT`; operations that update a single field (e.g., marking a policy as cancelled) should use `PATCH`.
 
     **12.** A static OpenAPI spec committed to the repository serves as a durable, version-controlled contract artifact. Apex developers can reference `openapi-v2.json` without running the middleware locally. CI pipelines can diff the spec on every pull request to catch unintended breaking changes (renamed fields, removed endpoints, changed types). The spec file can be tagged alongside a release to provide a precise historical record of what the API contract was at any given deployment — essential for debugging Apex callout failures in production after a middleware deployment.
 
@@ -703,7 +703,7 @@ API Design — Core Concepts
 
     **14.** Extract the logic into a service function that accepts a database session (or repository) and a data payload, with no dependency on `Request`, `Response`, or any FastAPI HTTP primitives. The route handler becomes a thin adapter: validate the HTTP input with Pydantic, call the service function, return the result. The ETL batch job calls the same service function directly with a database session from the shared session factory. This is the service/repository pattern and is the fundamental architectural requirement for testability and reuse across HTTP, CLI, and task contexts.
 
-    **15.** URI path versioning embeds the version in the URL (`/v1/clients`), making it visible in logs, easy to route at the ingress/load-balancer level, and trivial to call from any HTTP client including Apex. Header versioning uses a custom `Accept` header and keeps URLs clean but requires consumers to set non-standard headers. Query parameter versioning appends `?version=2` but is semantically odd and complicates caching. URI path versioning is most appropriate for AESF because Salesforce named credentials and Apex `HttpRequest.setEndpoint()` are URL-based, Kubernetes ingress rules can route `/v1/` and `/v2/` to different service versions if needed, and it is unambiguous in access logs.
+    **15.** URI path versioning embeds the version in the URL (`/v1/clients`), making it visible in logs, easy to route at the ingress/load-balancer level, and trivial to call from any HTTP client including Apex. Header versioning uses a custom `Accept` header and keeps URLs clean but requires consumers to set non-standard headers. Query parameter versioning appends `?version=2` but is semantically odd and complicates caching. URI path versioning is most appropriate for the integration platform because Salesforce named credentials and Apex `HttpRequest.setEndpoint()` are URL-based, Kubernetes ingress rules can route `/v1/` and `/v2/` to different service versions if needed, and it is unambiguous in access logs.
 
     **16.** In Pydantic v2, `@validator` is replaced by `@field_validator`. The key behavioral difference is the `mode` parameter: `mode="before"` runs the validator before Pydantic's own type coercion (equivalent to v1's `pre=True`), and `mode="after"` (the default) runs after coercion on the already-typed value. There is also `@model_validator` for cross-field validation, with `mode="before"` operating on raw dict input and `mode="after"` operating on the fully constructed model instance. The explicit `mode` parameter makes validation ordering unambiguous compared to v1's `pre`/`always`/`each_item` flags.
 
@@ -713,4 +713,4 @@ API Design — Core Concepts
 
     **19.** The correct fix is to register a custom `RequestValidationError` exception handler on the FastAPI app that catches Pydantic's validation errors and re-serializes them into your documented error schema (e.g., `{"error": "...", "details": [...], "code": "validation_error"}`). The handler should return a `JSONResponse` with status `422` and a body that matches the `ErrorResponse` Pydantic model documented in your OpenAPI spec. This ensures every error response — validation errors, not-found errors, conflict errors — has the same shape that Apex's single `parseErrorResponse()` method can handle.
 
-    **20.** A scenario where gRPC would be better: a future internal service split where a dedicated "Epic sync worker" microservice communicates with `aesf-py-middleware` at high throughput to batch-sync thousands of policy records. The binary Protobuf payload would be significantly smaller than JSON, the strongly-typed schema enforced by the `.proto` file would prevent sync contract drift, and bidirectional streaming would allow the worker to push sync results back without polling. A scenario where REST must be used: any endpoint called directly by Salesforce Apex, including all current AESF trigger handlers (`AccountTriggerHandler`, `ContactTriggerHandler`, etc.). Apex platform callouts are HTTP/1.1 only, with no gRPC support, making REST with JSON the only viable option regardless of performance considerations.
+    **20.** A scenario where gRPC would be better: a future internal service split where a dedicated "EHR sync worker" microservice communicates with `crm-middleware` at high throughput to batch-sync thousands of policy records. The binary Protobuf payload would be significantly smaller than JSON, the strongly-typed schema enforced by the `.proto` file would prevent sync contract drift, and bidirectional streaming would allow the worker to push sync results back without polling. A scenario where REST must be used: any endpoint called directly by Salesforce Apex, including all current integration platform trigger handlers (`AccountTriggerHandler`, `ContactTriggerHandler`, etc.). Apex platform callouts are HTTP/1.1 only, with no gRPC support, making REST with JSON the only viable option regardless of performance considerations.

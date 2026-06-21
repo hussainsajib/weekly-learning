@@ -10,11 +10,11 @@
 
 PostgreSQL is not just a database — it is a carefully engineered system where every decision about durability, concurrency, and storage has cascading consequences on application behavior. Most engineers interact with Postgres at the SQL surface, but understanding the engine beneath that surface is what separates a developer who can write a query from one who can diagnose a production incident at 2 AM. This week you will learn how the engine actually works: how transactions maintain isolation without locks, how dead rows accumulate and get reclaimed, how the WAL protects your data through crashes, and how storage is physically arranged on disk.
 
-For the AESF middleware, PostgreSQL is not just a data store — it is the queue backbone for Epic sync jobs. Rows are inserted, claimed, processed, and deleted at high frequency. This pattern is one of the most demanding workloads for MVCC: every deleted queue row leaves a dead tuple that VACUUM must eventually reclaim. Without a firm understanding of autovacuum tuning, table bloat will silently erode query performance until an index scan degrades to a sequential scan and sync latency spikes. These are not hypothetical concerns — they are the exact failure modes that have caused incidents in queue-heavy systems built on Postgres.
+For the crm-middleware, PostgreSQL is not just a data store — it is the queue backbone for EHR sync jobs. Rows are inserted, claimed, processed, and deleted at high frequency. This pattern is one of the most demanding workloads for MVCC: every deleted queue row leaves a dead tuple that VACUUM must eventually reclaim. Without a firm understanding of autovacuum tuning, table bloat will silently erode query performance until an index scan degrades to a sequential scan and sync latency spikes. These are not hypothetical concerns — they are the exact failure modes that have caused incidents in queue-heavy systems built on Postgres.
 
 The operational side of Postgres is equally important. Connection pooling with PgBouncer is non-negotiable for any Kubernetes-hosted application where pods scale horizontally, because each PostgreSQL connection is a forked OS process consuming 5–10 MB of RAM. Without a pool, a burst of 50 pods each opening 5 connections will saturate a Cloud SQL instance far faster than the application logic ever could. Understanding how PgBouncer's three pooling modes interact with transaction-scoped features like prepared statements and advisory locks will save you from subtle bugs.
 
-Finally, schema evolution on a live system is a discipline in itself. Alembic is a powerful migration tool, but Postgres's locking model means that innocent-looking DDL statements — adding a non-nullable column, creating an index, altering a column type — can take an `AccessExclusiveLock` that blocks all reads and writes for minutes on a large table. This week you will learn the safe patterns: `CREATE INDEX CONCURRENTLY`, multi-step nullable/backfill/not-null migrations, and how to write Alembic operations that are safe to run against a live AESF production instance.
+Finally, schema evolution on a live system is a discipline in itself. Alembic is a powerful migration tool, but Postgres's locking model means that innocent-looking DDL statements — adding a non-nullable column, creating an index, altering a column type — can take an `AccessExclusiveLock` that blocks all reads and writes for minutes on a large table. This week you will learn the safe patterns: `CREATE INDEX CONCURRENTLY`, multi-step nullable/backfill/not-null migrations, and how to write Alembic operations that are safe to run against a live CRM-EHR Integration Platform production instance.
 
 ---
 
@@ -27,7 +27,7 @@ Each row version carries two hidden system columns: `xmin` (the transaction ID t
 ```sql
 -- Inspect the hidden system columns directly
 SELECT ctid, xmin, xmax, id, status
-FROM aesf_queue
+FROM app_queue
 WHERE status = 'pending'
 LIMIT 5;
 ```
@@ -43,7 +43,7 @@ The `ctid` column is the physical location: `(page, tuple_offset)`. After an upd
 
 **Isolation levels** control snapshot timing. `READ COMMITTED` (the default) takes a fresh snapshot at the start of each statement. `REPEATABLE READ` and `SERIALIZABLE` take one snapshot at the start of the entire transaction, making them immune to non-repeatable reads but more sensitive to serialization conflicts.
 
-**AESF connection:** Every queue row that transitions from `pending` → `processing` → `done` → deleted leaves dead tuple debris. On a table receiving 10,000 inserts/deletes per hour, you will accumulate millions of dead tuples per day without proper autovacuum configuration.
+**Integration platform connection:** Every queue row that transitions from `pending` → `processing` → `done` → deleted leaves dead tuple debris. On a table receiving 10,000 inserts/deletes per hour, you will accumulate millions of dead tuples per day without proper autovacuum configuration.
 
 > **Common mistake:** Assuming that `DELETE FROM queue WHERE status = 'done'` immediately frees disk space. It does not. It only marks rows as dead. Disk space is only reclaimed after VACUUM runs and, in some cases, only after `VACUUM FULL` (which rewrites the entire table). Use `pg_stat_user_tables.n_dead_tup` to monitor this.
 
@@ -62,7 +62,7 @@ n_dead_tup > autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * n_li
 With defaults of `threshold=50` and `scale_factor=0.2`, a 100,000-row table triggers autovacuum when dead tuples exceed 20,050. For a small, high-churn queue table with 500 live rows, autovacuum triggers at just 150 dead tuples — which is good. For a large 10M-row history table, the threshold is 2,000,050 dead tuples before autovacuum even starts.
 
 ```sql
--- Check autovacuum health for AESF tables
+-- Check autovacuum health for integration platform tables
 SELECT
     schemaname,
     relname,
@@ -76,10 +76,10 @@ WHERE schemaname = 'public'
 ORDER BY n_dead_tup DESC;
 ```
 
-For the AESF queue pattern, override the defaults at the table level to trigger more aggressively:
+For the integration platform queue pattern, override the defaults at the table level to trigger more aggressively:
 
 ```sql
-ALTER TABLE aesf_queue SET (
+ALTER TABLE app_queue SET (
     autovacuum_vacuum_scale_factor = 0.01,   -- trigger at 1% dead tuples
     autovacuum_vacuum_threshold = 100,        -- or 100 dead tuples minimum
     autovacuum_analyze_scale_factor = 0.005
@@ -126,14 +126,14 @@ FROM pg_stat_replication;
 
 **Checkpoints** periodically flush dirty data pages from shared_buffers to disk, creating a "safe point" from which recovery can start. The WAL before a checkpoint can be archived or discarded. The `checkpoint_completion_target` setting (default 0.9) spreads the checkpoint I/O over 90% of the `checkpoint_timeout` interval to avoid I/O spikes.
 
-**WAL and Cloud SQL:** On GCP Cloud SQL, WAL is handled internally for high availability and read replicas. You do not directly access `pg_wal/`, but understanding LSN lag helps you diagnose replica staleness when AESF reads from a read replica for reporting queries.
+**WAL and Cloud SQL:** On GCP Cloud SQL, WAL is handled internally for high availability and read replicas. You do not directly access `pg_wal/`, but understanding LSN lag helps you diagnose replica staleness when the integration platform reads from a read replica for reporting queries.
 
 **`wal_level` settings:**
 - `minimal` — enough for crash recovery only; replication not possible
 - `replica` — default; supports streaming replication and base backups
 - `logical` — enables logical decoding (needed for CDC tools like Debezium)
 
-> **Common mistake:** Setting `synchronous_commit = off` to improve write throughput without understanding the trade-off. With async commit, up to `wal_writer_delay` (default 200ms) of committed transactions can be lost on crash. This is acceptable for low-value queue status updates but catastrophic for financial records. In AESF, consider per-transaction `SET LOCAL synchronous_commit = off` only for idempotent queue heartbeat updates.
+> **Common mistake:** Setting `synchronous_commit = off` to improve write throughput without understanding the trade-off. With async commit, up to `wal_writer_delay` (default 200ms) of committed transactions can be lost on crash. This is acceptable for low-value queue status updates but catastrophic for financial records. In the integration platform, consider per-transaction `SET LOCAL synchronous_commit = off` only for idempotent queue heartbeat updates.
 
 ---
 
@@ -144,7 +144,7 @@ Postgres stores table data in **heap files** — fixed-size pages (8 KB by defau
 When a row's data exceeds approximately 2 KB (one-quarter of a page), Postgres transparently compresses and/or chunks the oversized attribute into a separate **TOAST table** (`pg_toast.pg_toast_<oid>`). Each oversized value is split into 2 KB chunks and stored as multiple rows in the TOAST table. The main table row contains only a pointer.
 
 ```sql
--- Find TOAST tables for AESF tables
+-- Find TOAST tables for integration platform tables
 SELECT
     c.relname AS main_table,
     t.relname AS toast_table,
@@ -164,7 +164,7 @@ ORDER BY pg_total_relation_size(c.oid) DESC;
 | `EXTERNAL` | TOAST without compression (faster access, larger storage) |
 | `MAIN` | Compress in-line, TOAST only as last resort |
 
-**AESF connection:** If the `payload` column on the queue table is `jsonb` and Epic sync payloads exceed 2 KB, every row access requires an extra TOAST fetch. Benchmark with `EXPLAIN (ANALYZE, BUFFERS)` to see if TOAST access (`... on toast table`) is appearing in query plans.
+**Integration platform connection:** If the `payload` column on the queue table is `jsonb` and EHR sync payloads exceed 2 KB, every row access requires an extra TOAST fetch. Benchmark with `EXPLAIN (ANALYZE, BUFFERS)` to see if TOAST access (`... on toast table`) is appearing in query plans.
 
 > **Common mistake:** Running `SELECT *` on tables with large TOAST columns when only a subset of columns is needed. Fetching unneeded TOASTed columns adds I/O for each row. Always select only the columns you need.
 
@@ -177,7 +177,7 @@ ORDER BY pg_total_relation_size(c.oid) DESC;
 ```sql
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, FORMAT TEXT)
 SELECT id, payload, created_at
-FROM aesf_queue
+FROM app_queue
 WHERE status = 'pending'
   AND created_at < NOW() - INTERVAL '5 minutes'
 ORDER BY created_at
@@ -214,7 +214,7 @@ SELECT
     rows / calls AS avg_rows,
     stddev_exec_time AS stddev_ms
 FROM pg_stat_statements
-WHERE query ILIKE '%aesf_queue%'
+WHERE query ILIKE '%app_queue%'
 ORDER BY avg_ms DESC
 LIMIT 10;
 ```
@@ -285,8 +285,8 @@ SELECT
 FROM pg_statio_user_tables;
 ```
 
-**AESF diagnostic runbook:**
-1. Queue latency spike → check `pg_stat_user_tables` for `n_dead_tup` on `aesf_queue`; check `last_autovacuum`
+**Integration platform diagnostic runbook:**
+1. Queue latency spike → check `pg_stat_user_tables` for `n_dead_tup` on `app_queue`; check `last_autovacuum`
 2. Connection exhaustion → `pg_stat_activity` grouped by `state`; look for idle-in-transaction sessions
 3. Slow query → `pg_stat_statements` ordered by `avg_ms`; then `EXPLAIN ANALYZE` the culprit
 4. Replication lag → `pg_stat_replication` for `replay_lsn` delta
@@ -297,7 +297,7 @@ FROM pg_statio_user_tables;
 
 ## 7. Connection Pooling with PgBouncer
 
-Every PostgreSQL backend connection is a forked OS process consuming ~5–10 MB of RAM and file descriptors. A Cloud SQL instance with 8 GB RAM can support roughly 200–400 connections before connection overhead itself becomes the bottleneck. In a GKE deployment where AESF middleware pods scale from 3 to 30 replicas, each with a SQLAlchemy pool of 5, you need 150 database connections at peak — before autovacuum workers, Cloud SQL internal processes, and monitoring agents consume their share.
+Every PostgreSQL backend connection is a forked OS process consuming ~5–10 MB of RAM and file descriptors. A Cloud SQL instance with 8 GB RAM can support roughly 200–400 connections before connection overhead itself becomes the bottleneck. In a GKE deployment where crm-middleware pods scale from 3 to 30 replicas, each with a SQLAlchemy pool of 5, you need 150 database connections at peak — before autovacuum workers, Cloud SQL internal processes, and monitoring agents consume their share.
 
 PgBouncer sits between your application and Postgres, multiplexing many application connections onto a smaller number of actual database connections.
 
@@ -309,13 +309,13 @@ PgBouncer sits between your application and Postgres, multiplexing many applicat
 | `transaction` | Server connection returned to pool after each transaction | Most features work; no `SET` persistence |
 | `statement` | Server connection returned after each statement | Breaks multi-statement transactions entirely |
 
-For AESF, `transaction` mode is the sweet spot: it multiplexes aggressively while remaining compatible with SQLAlchemy's standard usage patterns.
+For the integration platform, `transaction` mode is the sweet spot: it multiplexes aggressively while remaining compatible with SQLAlchemy's standard usage patterns.
 
 **PgBouncer config for GKE (`pgbouncer.ini`):**
 
 ```ini
 [databases]
-aesf = host=10.0.0.5 port=5432 dbname=aesf_db
+appdb = host=10.0.0.5 port=5432 dbname=app_db
 
 [pgbouncer]
 listen_port = 5432
@@ -340,7 +340,7 @@ server_tls_sslmode = require
 from sqlalchemy import create_engine
 
 engine = create_engine(
-    "postgresql+psycopg2://user:pass@pgbouncer:5432/aesf_db",
+    "postgresql+psycopg2://user:pass@pgbouncer:5432/app_db",
     pool_size=5,           # per-process pool; PgBouncer multiplexes further
     max_overflow=10,
     pool_pre_ping=True,    # detect stale connections
@@ -366,7 +366,7 @@ Alembic is the standard migration tool for SQLAlchemy projects, but its default 
 # migrations/versions/0042_add_retry_count.py
 def upgrade():
     op.add_column(
-        'aesf_queue',
+        'app_queue',
         sa.Column('retry_count', sa.Integer(), nullable=True)
     )
 ```
@@ -376,32 +376,32 @@ def upgrade():
 ```python
 # Step 1: Add nullable (fast)
 def upgrade():
-    op.add_column('aesf_queue',
+    op.add_column('app_queue',
         sa.Column('priority', sa.Integer(), nullable=True))
 
 # Step 2 (separate migration, after backfill): Set default + NOT NULL
 # BUT first backfill in batches from application code or a separate script:
-#   UPDATE aesf_queue SET priority = 0 WHERE priority IS NULL;
+#   UPDATE app_queue SET priority = 0 WHERE priority IS NULL;
 # Use batches of 10,000 rows to avoid long-running transactions.
 
 # Step 3 (separate migration): Set NOT NULL constraint
 def upgrade():
     # Use NOT VALID to skip scanning existing rows, then VALIDATE separately
     op.execute("""
-        ALTER TABLE aesf_queue
+        ALTER TABLE app_queue
         ALTER COLUMN priority SET DEFAULT 0
     """)
     op.execute("""
-        ALTER TABLE aesf_queue
-        ADD CONSTRAINT aesf_queue_priority_not_null
+        ALTER TABLE app_queue
+        ADD CONSTRAINT app_queue_priority_not_null
         CHECK (priority IS NOT NULL) NOT VALID
     """)
 
 # Step 4 (separate migration, off-peak): Validate
 def upgrade():
     op.execute("""
-        ALTER TABLE aesf_queue
-        VALIDATE CONSTRAINT aesf_queue_priority_not_null
+        ALTER TABLE app_queue
+        VALIDATE CONSTRAINT app_queue_priority_not_null
     """)
 ```
 
@@ -415,14 +415,14 @@ def upgrade():
     # Use raw SQL with CONCURRENTLY instead
     op.execute("""
         CREATE INDEX CONCURRENTLY IF NOT EXISTS
-        idx_aesf_queue_status_created
-        ON aesf_queue (status, created_at)
+        idx_app_queue_status_created
+        ON app_queue (status, created_at)
         WHERE status IN ('pending', 'processing')
     """)
 
 def downgrade():
     op.execute("""
-        DROP INDEX CONCURRENTLY IF EXISTS idx_aesf_queue_status_created
+        DROP INDEX CONCURRENTLY IF EXISTS idx_app_queue_status_created
     """)
 ```
 
@@ -461,13 +461,13 @@ The cleanest pattern is a migration that explicitly calls `op.execute` with `CON
 
 ## 9. Queue Table Patterns and Bloat Management
 
-The AESF queue pattern — high-insert, high-delete, relatively small live set — is one of the most demanding for MVCC. Here is a consolidated set of recommendations for managing it in production.
+The integration platform queue pattern — high-insert, high-delete, relatively small live set — is one of the most demanding for MVCC. Here is a consolidated set of recommendations for managing it in production.
 
 **Partitioning by status or date** eliminates historical bloat:
 
 ```sql
 -- Partition queue by processing date (new rows always in current partition)
-CREATE TABLE aesf_queue (
+CREATE TABLE app_queue (
     id          BIGSERIAL,
     status      TEXT NOT NULL DEFAULT 'pending',
     payload     JSONB NOT NULL,
@@ -475,12 +475,12 @@ CREATE TABLE aesf_queue (
     processed_at TIMESTAMPTZ
 ) PARTITION BY RANGE (created_at);
 
-CREATE TABLE aesf_queue_2026_09
-    PARTITION OF aesf_queue
+CREATE TABLE app_queue_2026_09
+    PARTITION OF app_queue
     FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
 
 -- Old partitions can be dropped instantly (no VACUUM needed, just DROP TABLE)
-DROP TABLE aesf_queue_2026_07;  -- instant, no lock on parent
+DROP TABLE app_queue_2026_07;  -- instant, no lock on parent
 ```
 
 **Monitoring bloat ratio:**
@@ -580,13 +580,13 @@ PostgreSQL Internals
 
 **10.** Why can `CREATE INDEX` block production traffic, and what is the safe alternative?
 
-**11.** What `pg_stat_*` view would you query to find the table with the highest number of dead tuples in the AESF database?
+**11.** What `pg_stat_*` view would you query to find the table with the highest number of dead tuples in the integration platform database?
 
 **12.** What does the autovacuum trigger formula `n_dead_tup > autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * n_live_tup` mean in practice for a 500-row queue table with default settings?
 
 **13.** Why is `op.alter_column(..., nullable=False)` dangerous on a large live table, and what is the safe multi-step alternative?
 
-**14.** What is `synchronous_commit = off` and when is it appropriate to use it in AESF?
+**14.** What is `synchronous_commit = off` and when is it appropriate to use it in the integration platform?
 
 **15.** How does `pg_stat_statements` help diagnose performance regressions, and what must be done to enable it on Cloud SQL?
 
@@ -596,7 +596,7 @@ PostgreSQL Internals
 
 **18.** What is the WAL `wal_level` setting `logical` used for, and how does it differ from `replica`?
 
-**19.** How does table partitioning help manage bloat in the AESF queue table pattern?
+**19.** How does table partitioning help manage bloat in the integration platform queue table pattern?
 
 **20.** What is `pg_repack` and how does it differ from `VACUUM FULL` for reclaiming bloated space?
 
@@ -620,7 +620,7 @@ PostgreSQL Internals
 
     **7.** A large discrepancy between estimated rows and actual rows indicates that the query planner's statistics are stale or inaccurate. The planner uses statistics collected by `ANALYZE` (stored in `pg_statistic`) to estimate selectivity. If estimates are far off, the planner may choose a suboptimal plan — for example, using a Nested Loop join expecting 10 rows from the inner side, but actually getting 50,000. This causes catastrophic performance. Fix by running `ANALYZE table_name` to refresh statistics, or by increasing `default_statistics_target` for columns with skewed distributions.
 
-    **8.** `shared hit` means the data page was found in `shared_buffers` (PostgreSQL's in-memory buffer cache) — effectively free from a latency perspective. `read` means the page had to be fetched from the OS page cache or physical disk. A high `read` count on a frequently-queried table means the working set exceeds `shared_buffers` size. For AESF, if the queue table's active pages consistently appear as `read` rather than `hit`, increasing `shared_buffers` (Cloud SQL memory configuration) or ensuring the table is compact (via VACUUM) will improve performance.
+    **8.** `shared hit` means the data page was found in `shared_buffers` (PostgreSQL's in-memory buffer cache) — effectively free from a latency perspective. `read` means the page had to be fetched from the OS page cache or physical disk. A high `read` count on a frequently-queried table means the working set exceeds `shared_buffers` size. For the integration platform, if the queue table's active pages consistently appear as `read` rather than `hit`, increasing `shared_buffers` (Cloud SQL memory configuration) or ensuring the table is compact (via VACUUM) will improve performance.
 
     **9.** In `session` mode, a client gets one dedicated server connection for its entire session lifetime — equivalent to no pooling from Postgres's perspective. In `transaction` mode, the server connection is returned to the pool after each transaction commits or rolls back, allowing many more clients to share fewer server connections. Features that rely on persistent per-connection server state break in transaction mode: `SET` commands (except those in a transaction), `PREPARE` (prepared statements), `LISTEN`/`NOTIFY`, advisory locks held across transactions, and `DECLARE CURSOR` outside a transaction. SQLAlchemy's standard ORM usage is compatible with transaction mode.
 
@@ -628,7 +628,7 @@ PostgreSQL Internals
 
     **11.** `pg_stat_user_tables` is the view to query. It has columns `n_live_tup` and `n_dead_tup` showing live and dead tuple counts per table, along with `last_autovacuum` and `last_vacuum` timestamps. Sort by `n_dead_tup DESC` to find the most bloated tables. Combine with `pg_class` to get table sizes via `pg_total_relation_size(oid)`. A high `n_dead_tup` combined with a stale `last_autovacuum` timestamp indicates autovacuum is not keeping up, which may require tuning `autovacuum_vacuum_scale_factor` at the table level.
 
-    **12.** With default `autovacuum_vacuum_threshold = 50` and `autovacuum_vacuum_scale_factor = 0.2`, the trigger for a 500-row table is `50 + 0.2 * 500 = 150` dead tuples. This means autovacuum fires relatively quickly for this small table — after just 150 deletions or updates without VACUUM. This is actually appropriate for the AESF queue pattern. However, if the queue grows temporarily to 100,000 rows, the trigger jumps to 20,050 dead tuples, which may allow significant bloat to accumulate. Setting `autovacuum_vacuum_scale_factor = 0.01` at the table level keeps the threshold proportionally tight as the table grows.
+    **12.** With default `autovacuum_vacuum_threshold = 50` and `autovacuum_vacuum_scale_factor = 0.2`, the trigger for a 500-row table is `50 + 0.2 * 500 = 150` dead tuples. This means autovacuum fires relatively quickly for this small table — after just 150 deletions or updates without VACUUM. This is actually appropriate for the integration platform queue pattern. However, if the queue grows temporarily to 100,000 rows, the trigger jumps to 20,050 dead tuples, which may allow significant bloat to accumulate. Setting `autovacuum_vacuum_scale_factor = 0.01` at the table level keeps the threshold proportionally tight as the table grows.
 
     **13.** `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` scans the entire table to verify no existing row has a NULL value, and holds an `AccessExclusiveLock` throughout — blocking all reads and writes. On a million-row table, this could take minutes. The safe pattern is: (1) add the column as nullable, (2) backfill existing rows in small batches from the application to avoid long transactions, (3) add a `CHECK (col IS NOT NULL) NOT VALID` constraint (which only locks briefly to record the constraint, skipping existing rows), then (4) `VALIDATE CONSTRAINT` in a separate migration during off-peak hours. `VALIDATE CONSTRAINT` only requires a `ShareUpdateExclusiveLock`, which does not block reads or writes.
 

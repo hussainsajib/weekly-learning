@@ -10,11 +10,11 @@
 
 Google Cloud Platform organizes everything under a strict resource hierarchy — Organization → Folders → Projects → Resources. This hierarchy is not cosmetic; it is the foundation of every IAM binding, billing boundary, and network security decision you make. Understanding it deeply means you can reason about *why* a permission works (or doesn't), *where* a policy should live to minimize blast radius, and *how* your infrastructure scales without becoming a security audit nightmare.
 
-For AESF, this matters concretely. The middleware, ETL containers, and BigQuery datasets all live in distinct GCP projects under the same organization. A misconfigured folder-level IAM binding can silently grant a service account in the BDE ETL project read access to production secrets — something that would sail past a code review entirely. The hierarchy is your first line of defense.
+For the integration platform, this matters concretely. The middleware, ETL containers, and BigQuery datasets all live in distinct GCP projects under the same organization. A misconfigured folder-level IAM binding can silently grant a service account in the BDE ETL project read access to production secrets — something that would sail past a code review entirely. The hierarchy is your first line of defense.
 
 This week covers the full GCP architecture picture: resource hierarchy, networking (VPC, Cloud NAT, firewall rules), IAM and service accounts, compute options (Cloud Run vs. GKE vs. Compute Engine), data and messaging services (Cloud SQL, Memorystore, Pub/Sub), Workload Identity Federation, and the Vault vs. Secrets Manager trade-off. These are not independent topics — they form a single integrated system, and the goal is to understand how they compose.
 
-By the end of this guide you should be able to justify every GCP architectural decision in AESF's stack: why GKE over Cloud Run for the middleware, why Workload Identity Federation over key-based service accounts, and why Vault sits alongside Secrets Manager rather than replacing it. These are staff-level conversations, and fluency here is a forcing function for moving from "I can deploy it" to "I can design it."
+By the end of this guide you should be able to justify every GCP architectural decision in the integration platform's stack: why GKE over Cloud Run for the middleware, why Workload Identity Federation over key-based service accounts, and why Vault sits alongside Secrets Manager rather than replacing it. These are staff-level conversations, and fluency here is a forcing function for moving from "I can deploy it" to "I can design it."
 
 ---
 
@@ -25,17 +25,17 @@ The GCP resource hierarchy has four levels: **Organization** (your Google Worksp
 IAM policies are **additive and inherited downward**. A binding at the folder level grants that role to every project in the folder. There is no deny — only grant (unless you use IAM Deny policies, a newer feature). This means the safest place to put a binding is as low as possible: at the project or resource level.
 
 ```
-Organization: appliedsystems.com
-├── Folder: AESF Production
-│   ├── Project: aesf-middleware-prod
-│   ├── Project: aesf-etl-prod
-│   └── Project: aesf-bq-prod
-├── Folder: AESF Staging
-│   ├── Project: aesf-middleware-staging
-│   └── Project: aesf-etl-staging
-└── Folder: AESF Dev
-    ├── Project: aesf-middleware-dev
-    └── Project: aesf-etl-dev
+Organization: the-company.com
+├── Folder: Integration Platform Production
+│   ├── Project: crm-middleware-prod
+│   ├── Project: etl-pipeline-prod
+│   └── Project: bq-analytics-prod
+├── Folder: Integration Platform Staging
+│   ├── Project: crm-middleware-staging
+│   └── Project: etl-pipeline-staging
+└── Folder: Integration Platform Dev
+    ├── Project: crm-middleware-dev
+    └── Project: etl-pipeline-dev
 ```
 
 **gcloud: Create a folder and project**
@@ -43,38 +43,38 @@ Organization: appliedsystems.com
 ```bash
 # Create a folder under the org
 gcloud resource-manager folders create \
-  --display-name="AESF Production" \
+  --display-name="Integration Platform Production" \
   --organization=123456789012
 
 # Create a project inside the folder
-gcloud projects create aesf-middleware-prod \
+gcloud projects create crm-middleware-prod \
   --folder=FOLDER_ID \
-  --name="AESF Middleware Production"
+  --name="CRM Middleware Production"
 
 # Link billing account
-gcloud billing projects link aesf-middleware-prod \
+gcloud billing projects link crm-middleware-prod \
   --billing-account=BILLING_ACCOUNT_ID
 ```
 
 **Terraform (CDKTF-style in HCL for clarity)**
 
 ```hcl
-resource "google_folder" "aesf_prod" {
-  display_name = "AESF Production"
+resource "google_folder" "platform_prod" {
+  display_name = "Integration Platform Production"
   parent       = "organizations/123456789012"
 }
 
 resource "google_project" "middleware_prod" {
-  name            = "AESF Middleware Production"
-  project_id      = "aesf-middleware-prod"
-  folder_id       = google_folder.aesf_prod.id
+  name            = "CRM Middleware Production"
+  project_id      = "crm-middleware-prod"
+  folder_id       = google_folder.platform_prod.id
   billing_account = var.billing_account_id
 }
 ```
 
 **Common mistake:** Granting `roles/editor` at the folder level for "convenience" during initial setup and forgetting to remove it. An editor on the folder can read every secret, modify every firewall rule, and delete every Cloud SQL instance across all child projects. Always use project-scoped, resource-scoped bindings in production.
 
-**AESF connection:** AESF's deployment-manifests repo manages projects under the AESF org. Keeping ETL and middleware in separate projects means a compromised ETL service account cannot touch middleware Cloud SQL credentials.
+**Platform connection:** The integration platform's infra-manifests repo manages projects under the platform org. Keeping ETL and middleware in separate projects means a compromised ETL service account cannot touch middleware Cloud SQL credentials.
 
 ---
 
@@ -86,12 +86,12 @@ A **VPC (Virtual Private Cloud)** in GCP is a global resource — one VPC can sp
 
 ```bash
 # Create a VPC with a subnet for GKE
-gcloud compute networks create aesf-vpc \
+gcloud compute networks create platform-vpc \
   --subnet-mode=custom \
   --bgp-routing-mode=regional
 
-gcloud compute networks subnets create aesf-gke-subnet \
-  --network=aesf-vpc \
+gcloud compute networks subnets create platform-gke-subnet \
+  --network=platform-vpc \
   --region=us-east1 \
   --range=10.0.0.0/20 \
   --secondary-range=pods=10.4.0.0/14,services=10.0.16.0/20
@@ -100,12 +100,12 @@ gcloud compute networks subnets create aesf-gke-subnet \
 **Cloud NAT** provides outbound internet access for resources without public IPs (GKE nodes, Cloud SQL private IPs). It is regional and attached to a Cloud Router.
 
 ```bash
-gcloud compute routers create aesf-router \
-  --network=aesf-vpc \
+gcloud compute routers create platform-router \
+  --network=platform-vpc \
   --region=us-east1
 
-gcloud compute routers nats create aesf-nat \
-  --router=aesf-router \
+gcloud compute routers nats create platform-nat \
+  --router=platform-router \
   --region=us-east1 \
   --auto-allocate-nat-external-ips \
   --nat-all-subnet-ip-ranges
@@ -116,10 +116,10 @@ gcloud compute routers nats create aesf-nat \
 ```bash
 # Allow GKE pods to reach Cloud SQL on port 5432
 gcloud compute firewall-rules create allow-gke-to-cloudsql \
-  --network=aesf-vpc \
+  --network=platform-vpc \
   --direction=INGRESS \
   --priority=1000 \
-  --source-service-accounts=gke-workload@aesf-middleware-prod.iam.gserviceaccount.com \
+  --source-service-accounts=gke-workload@crm-middleware-prod.iam.gserviceaccount.com \
   --target-tags=cloudsql-proxy \
   --rules=tcp:5432 \
   --action=ALLOW
@@ -127,7 +127,7 @@ gcloud compute firewall-rules create allow-gke-to-cloudsql \
 
 **Common mistake:** Leaving the default `allow-internal` firewall rule (which allows all traffic between all instances in the VPC on all ports) in place for production. Audit and tighten ingress/egress rules to explicit allow lists.
 
-**AESF connection:** The Epic BDE backend (Epic server on `de21web`) is reached over VPC peering or VPN from the GKE cluster. Firewall rules on the AESF VPC must explicitly allow egress on the Epic API port to the Epic server's IP range. Cloud NAT handles the return path for services without public IPs.
+**Platform connection:** The EHR system backend (EHR server on `ehr-server-prod`) is reached over VPC peering or VPN from the GKE cluster. Firewall rules on the platform VPC must explicitly allow egress on the EHR API port to the EHR server's IP range. Cloud NAT handles the return path for services without public IPs.
 
 ---
 
@@ -139,19 +139,19 @@ GCP IAM is **role-based**. Roles bundle permissions. There are three types: **Ba
 
 ```bash
 # Create a least-privilege service account for the middleware
-gcloud iam service-accounts create aesf-middleware-sa \
-  --display-name="AESF Middleware Service Account" \
-  --project=aesf-middleware-prod
+gcloud iam service-accounts create platform-middleware-sa \
+  --display-name="CRM Middleware Service Account" \
+  --project=crm-middleware-prod
 
 # Grant only Cloud SQL client access (not admin)
-gcloud projects add-iam-policy-binding aesf-middleware-prod \
-  --member="serviceAccount:aesf-middleware-sa@aesf-middleware-prod.iam.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding crm-middleware-prod \
+  --member="serviceAccount:platform-middleware-sa@crm-middleware-prod.iam.gserviceaccount.com" \
   --role="roles/cloudsql.client"
 
 # Grant Pub/Sub publish access on a specific topic (resource-level, not project-level)
-gcloud pubsub topics add-iam-policy-binding aesf-sync-events \
-  --project=aesf-middleware-prod \
-  --member="serviceAccount:aesf-middleware-sa@aesf-middleware-prod.iam.gserviceaccount.com" \
+gcloud pubsub topics add-iam-policy-binding platform-sync-events \
+  --project=crm-middleware-prod \
+  --member="serviceAccount:platform-middleware-sa@crm-middleware-prod.iam.gserviceaccount.com" \
   --role="roles/pubsub.publisher"
 ```
 
@@ -159,27 +159,27 @@ gcloud pubsub topics add-iam-policy-binding aesf-sync-events \
 
 ```hcl
 resource "google_project_iam_member" "middleware_sql" {
-  project = "aesf-middleware-prod"
+  project = "crm-middleware-prod"
   role    = "roles/cloudsql.client"
   member  = "serviceAccount:${google_service_account.middleware.email}"
 
   condition {
     title       = "only-prod-sql-instance"
     description = "Restrict to the production Cloud SQL instance"
-    expression  = "resource.name == 'projects/aesf-middleware-prod/instances/aesf-postgres-prod'"
+    expression  = "resource.name == 'projects/crm-middleware-prod/instances/platform-postgres-prod'"
   }
 }
 ```
 
 **Common mistake:** Binding `roles/iam.serviceAccountUser` on a project rather than on a specific service account. This allows the grantee to impersonate *every* service account in the project, not just the intended one.
 
-**AESF connection:** The middleware service account needs `roles/cloudsql.client` to authenticate via the Cloud SQL Auth Proxy. The ETL service account needs `roles/bigquery.dataEditor` on specific datasets, not the whole project. Review these bindings quarterly.
+**Platform connection:** The middleware service account needs `roles/cloudsql.client` to authenticate via the Cloud SQL Auth Proxy. The ETL service account needs `roles/bigquery.dataEditor` on specific datasets, not the whole project. Review these bindings quarterly.
 
 ---
 
 ## 4. Cloud Run vs. GKE vs. Compute Engine
 
-Choosing the right compute primitive is an architecture decision, not an ops decision. Here is how they compare for AESF-style workloads:
+Choosing the right compute primitive is an architecture decision, not an ops decision. Here is how they compare for integration platform-style workloads:
 
 | Dimension | Cloud Run | GKE | Compute Engine |
 |---|---|---|---|
@@ -191,32 +191,32 @@ Choosing the right compute primitive is an architecture decision, not an ops dec
 | Best for | Stateless APIs, event-driven, low-traffic | Long-running services, stateful workloads, complex networking | Legacy apps, GPU, specific OS requirements |
 | Cost model | Per request + CPU/memory when active | Node VMs always running | VM always running |
 
-For AESF's `aesf-py-middleware` (FastAPI, long-running, Pub/Sub consumer, Alembic migrations): **GKE is the right choice**. Cloud Run would work for the API surface but struggles with background workers that consume Pub/Sub without a triggering HTTP request (Cloud Run scales to 0 and kills consumers). GKE keeps pods alive for the pull subscriber loop.
+For the integration platform's crm-middleware (FastAPI, long-running, Pub/Sub consumer, Alembic migrations): **GKE is the right choice**. Cloud Run would work for the API surface but struggles with background workers that consume Pub/Sub without a triggering HTTP request (Cloud Run scales to 0 and kills consumers). GKE keeps pods alive for the pull subscriber loop.
 
 ```yaml
 # GKE Deployment for middleware
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: aesf-middleware
-  namespace: aesf
+  name: crm-middleware
+  namespace: platform
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: aesf-middleware
+      app: crm-middleware
   template:
     metadata:
       labels:
-        app: aesf-middleware
+        app: crm-middleware
       annotations:
         # Workload Identity annotation — maps k8s SA to GCP SA
-        iam.gke.io/gcp-service-account: aesf-middleware-sa@aesf-middleware-prod.iam.gserviceaccount.com
+        iam.gke.io/gcp-service-account: platform-middleware-sa@crm-middleware-prod.iam.gserviceaccount.com
     spec:
-      serviceAccountName: aesf-middleware-ksa
+      serviceAccountName: platform-middleware-ksa
       containers:
         - name: middleware
-          image: us-east1-docker.pkg.dev/aesf-middleware-prod/aesf/middleware:latest
+          image: us-east1-docker.pkg.dev/crm-middleware-prod/platform/middleware:latest
           ports:
             - containerPort: 8000
 ```
@@ -227,7 +227,7 @@ spec:
 
 ## 5. Cloud SQL — Configuration and Best Practices
 
-Cloud SQL is GCP's managed relational database service. For AESF, it runs PostgreSQL. Key configuration decisions:
+Cloud SQL is GCP's managed relational database service. For the integration platform, it runs PostgreSQL. Key configuration decisions:
 
 - **Private IP only** — no public IP on production instances. Connect via Cloud SQL Auth Proxy or Private Service Connect.
 - **Deletion protection** — always enabled in prod to prevent accidental `terraform destroy` from deleting the DB.
@@ -235,12 +235,12 @@ Cloud SQL is GCP's managed relational database service. For AESF, it runs Postgr
 - **Maintenance window** — schedule it during off-peak hours (Sunday 2–4 AM).
 
 ```bash
-gcloud sql instances create aesf-postgres-prod \
+gcloud sql instances create platform-postgres-prod \
   --database-version=POSTGRES_15 \
   --tier=db-custom-4-16384 \
   --region=us-east1 \
   --no-assign-ip \
-  --network=projects/aesf-middleware-prod/global/networks/aesf-vpc \
+  --network=projects/crm-middleware-prod/global/networks/platform-vpc \
   --enable-google-private-path \
   --backup-start-time=03:00 \
   --enable-point-in-time-recovery \
@@ -258,7 +258,7 @@ gcloud sql instances create aesf-postgres-prod \
   args:
     - "--structured-logs"
     - "--port=5432"
-    - "aesf-middleware-prod:us-east1:aesf-postgres-prod"
+    - "crm-middleware-prod:us-east1:platform-postgres-prod"
   securityContext:
     runAsNonRoot: true
   resources:
@@ -269,19 +269,19 @@ gcloud sql instances create aesf-postgres-prod \
 
 **Common mistake:** Connecting to Cloud SQL using the public IP with an authorized network CIDR. This works but bypasses IAM authentication, exposes the DB to the internet, and doesn't rotate credentials. Use the Auth Proxy.
 
-**AESF connection:** The middleware's Cloud SQL connection goes through the sidecar proxy. The proxy authenticates using the GKE pod's Workload Identity (the GCP service account annotated on the Kubernetes service account). No key file is needed.
+**Platform connection:** The middleware's Cloud SQL connection goes through the sidecar proxy. The proxy authenticates using the GKE pod's Workload Identity (the GCP service account annotated on the Kubernetes service account). No key file is needed.
 
 ---
 
 ## 6. Memorystore and Pub/Sub
 
-**Memorystore** is GCP's managed Redis (and Memcached). AESF could use it for API response caching, rate limiting, or session storage. It lives inside your VPC — no public endpoint.
+**Memorystore** is GCP's managed Redis (and Memcached). The integration platform could use it for API response caching, rate limiting, or session storage. It lives inside your VPC — no public endpoint.
 
 ```bash
-gcloud redis instances create aesf-cache \
+gcloud redis instances create platform-cache \
   --size=2 \
   --region=us-east1 \
-  --network=projects/aesf-middleware-prod/global/networks/aesf-vpc \
+  --network=projects/crm-middleware-prod/global/networks/platform-vpc \
   --redis-version=redis_7_0 \
   --tier=STANDARD_HA
 ```
@@ -299,22 +299,22 @@ r = redis.Redis(
 r.set("sync_lock:account:001XX000003GYn2", "1", ex=300)
 ```
 
-**Pub/Sub** is GCP's fully managed message queue. AESF uses it to decouple Salesforce trigger events from the middleware processing pipeline. Key concepts:
+**Pub/Sub** is GCP's fully managed message queue. The integration platform uses it to decouple Salesforce trigger events from the middleware processing pipeline. Key concepts:
 
-- **Topics** — logical channels (e.g., `aesf-sync-events`)
-- **Subscriptions** — consumers pull from or GCP pushes to (e.g., `aesf-middleware-sub`)
+- **Topics** — logical channels (e.g., `platform-sync-events`)
+- **Subscriptions** — consumers pull from or GCP pushes to (e.g., `platform-middleware-sub`)
 - **Acknowledgment deadline** — if a message isn't acked within the deadline (default 10s, max 600s), it's redelivered
 - **Dead-letter topics** — messages that exceed `max_delivery_attempts` are forwarded here for inspection
 
 ```bash
-gcloud pubsub topics create aesf-sync-events --project=aesf-middleware-prod
+gcloud pubsub topics create platform-sync-events --project=crm-middleware-prod
 
-gcloud pubsub subscriptions create aesf-middleware-sub \
-  --topic=aesf-sync-events \
+gcloud pubsub subscriptions create platform-middleware-sub \
+  --topic=platform-sync-events \
   --ack-deadline=60 \
   --max-delivery-attempts=5 \
-  --dead-letter-topic=projects/aesf-middleware-prod/topics/aesf-sync-dlq \
-  --project=aesf-middleware-prod
+  --dead-letter-topic=projects/crm-middleware-prod/topics/platform-sync-dlq \
+  --project=crm-middleware-prod
 ```
 
 **Common mistake:** Not setting a dead-letter topic. A message that causes a processing exception will be retried indefinitely until the retention period expires (7 days default), clogging the queue and potentially causing out-of-order processing for subsequent messages.
@@ -329,24 +329,24 @@ gcloud pubsub subscriptions create aesf-middleware-sub \
 
 ```bash
 # Enable Workload Identity on the GKE cluster
-gcloud container clusters update aesf-cluster \
-  --workload-pool=aesf-middleware-prod.svc.id.goog \
+gcloud container clusters update platform-cluster \
+  --workload-pool=crm-middleware-prod.svc.id.goog \
   --region=us-east1
 
 # Create the Kubernetes ServiceAccount
-kubectl create serviceaccount aesf-middleware-ksa \
-  --namespace=aesf
+kubectl create serviceaccount platform-middleware-ksa \
+  --namespace=platform
 
 # Bind the KSA to the GSA
 gcloud iam service-accounts add-iam-policy-binding \
-  aesf-middleware-sa@aesf-middleware-prod.iam.gserviceaccount.com \
+  platform-middleware-sa@crm-middleware-prod.iam.gserviceaccount.com \
   --role=roles/iam.workloadIdentityUser \
-  --member="serviceAccount:aesf-middleware-prod.svc.id.goog[aesf/aesf-middleware-ksa]"
+  --member="serviceAccount:crm-middleware-prod.svc.id.goog[platform/platform-middleware-ksa]"
 
 # Annotate the KSA
-kubectl annotate serviceaccount aesf-middleware-ksa \
-  --namespace=aesf \
-  iam.gke.io/gcp-service-account=aesf-middleware-sa@aesf-middleware-prod.iam.gserviceaccount.com
+kubectl annotate serviceaccount platform-middleware-ksa \
+  --namespace=platform \
+  iam.gke.io/gcp-service-account=platform-middleware-sa@crm-middleware-prod.iam.gserviceaccount.com
 ```
 
 **For GitHub Actions (WIF to GCP):**
@@ -357,32 +357,32 @@ kubectl annotate serviceaccount aesf-middleware-ksa \
   uses: google-github-actions/auth@v2
   with:
     workload_identity_provider: "projects/123456789/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
-    service_account: "github-deploy-sa@aesf-middleware-prod.iam.gserviceaccount.com"
+    service_account: "github-deploy-sa@crm-middleware-prod.iam.gserviceaccount.com"
 ```
 
 ```bash
 # Set up the WIF pool and provider
 gcloud iam workload-identity-pools create github-pool \
   --location=global \
-  --project=aesf-middleware-prod
+  --project=crm-middleware-prod
 
 gcloud iam workload-identity-pools providers create-oidc github-provider \
   --location=global \
   --workload-identity-pool=github-pool \
   --issuer-uri=https://token.actions.githubusercontent.com \
   --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
-  --project=aesf-middleware-prod
+  --project=crm-middleware-prod
 ```
 
 **Common mistake:** Creating service account keys instead of using Workload Identity, then committing the key file to the repo. Service account keys never expire by default, are hard to rotate, and represent a persistent credential. WIF tokens are short-lived (1 hour) and auto-rotated.
 
-**AESF connection:** Every GKE workload (middleware, ETL sidecar) should use Workload Identity to access Cloud SQL, Pub/Sub, and Secrets Manager. No JSON key files should exist in AESF's Kubernetes secrets. The deployment-manifests repo should enforce this in Helm chart values.
+**Platform connection:** Every GKE workload (middleware, ETL sidecar) should use Workload Identity to access Cloud SQL, Pub/Sub, and Secrets Manager. No JSON key files should exist in the integration platform's Kubernetes secrets. The infra-manifests repo should enforce this in Helm chart values.
 
 ---
 
 ## 8. Secrets Manager vs. Vault
 
-AESF uses both Vault (HashiCorp) and GCP Secrets Manager. Understanding the trade-off helps you decide where a secret should live.
+The integration platform uses both Vault (HashiCorp) and GCP Secrets Manager. Understanding the trade-off helps you decide where a secret should live.
 
 | Dimension | GCP Secrets Manager | HashiCorp Vault |
 |---|---|---|
@@ -397,19 +397,19 @@ AESF uses both Vault (HashiCorp) and GCP Secrets Manager. Understanding the trad
 
 **When to use Secrets Manager:** GCP-native secrets (Cloud SQL passwords, API keys for GCP services), secrets accessed by Cloud Run or Cloud Functions, simple key-value secrets with no rotation requirement.
 
-**When to use Vault:** Dynamic database credentials (Vault generates a unique user/password per pod, auto-expires), cross-cloud secrets (Epic API keys used by both GKE and the on-prem ETL Pentaho jobs), PKI certificate issuance, encryption-as-a-service.
+**When to use Vault:** Dynamic database credentials (Vault generates a unique user/password per pod, auto-expires), cross-cloud secrets (EHR API keys used by both GKE and the on-prem ETL Pentaho jobs), PKI certificate issuance, encryption-as-a-service.
 
 ```bash
 # GCP Secrets Manager: create and access a secret
-echo -n "supersecretpassword" | gcloud secrets create aesf-db-password \
+echo -n "supersecretpassword" | gcloud secrets create platform-db-password \
   --data-file=- \
-  --project=aesf-middleware-prod \
+  --project=crm-middleware-prod \
   --replication-policy=user-managed \
   --locations=us-east1
 
 gcloud secrets versions access latest \
-  --secret=aesf-db-password \
-  --project=aesf-middleware-prod
+  --secret=platform-db-password \
+  --project=crm-middleware-prod
 ```
 
 ```python
@@ -417,7 +417,7 @@ gcloud secrets versions access latest \
 from google.cloud import secretmanager
 
 client = secretmanager.SecretManagerServiceClient()
-name = "projects/aesf-middleware-prod/secrets/aesf-db-password/versions/latest"
+name = "projects/crm-middleware-prod/secrets/platform-db-password/versions/latest"
 response = client.access_secret_version(request={"name": name})
 password = response.payload.data.decode("utf-8")
 ```
@@ -428,15 +428,15 @@ password = response.payload.data.decode("utf-8")
 # Configure Vault PostgreSQL secrets engine
 vault secrets enable database
 
-vault write database/config/aesf-postgres \
+vault write database/config/platform-postgres \
   plugin_name=postgresql-database-plugin \
-  connection_url="postgresql://{{username}}:{{password}}@10.0.0.5:5432/aesf_db" \
+  connection_url="postgresql://{{username}}:{{password}}@10.0.0.5:5432/platform_db" \
   allowed_roles="middleware-role" \
   username="vault-admin" \
   password="$VAULT_ADMIN_PASSWORD"
 
 vault write database/roles/middleware-role \
-  db_name=aesf-postgres \
+  db_name=platform-postgres \
   creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
   default_ttl="1h" \
   max_ttl="24h"
@@ -444,31 +444,31 @@ vault write database/roles/middleware-role \
 
 **Common mistake:** Using Secrets Manager for secrets that should be dynamically generated (DB credentials). A static DB password in Secrets Manager means all pods share one credential — a compromised pod exposes credentials that work until someone manually rotates them. Vault's dynamic credentials limit the blast radius to one TTL window (e.g., 1 hour).
 
-**AESF connection:** AESF's current stack uses Vault for secrets injected into GKE pods via the Vault Agent Injector. Secrets Manager is appropriate for secrets consumed by Cloud Run or Cloud Functions (where Vault Agent doesn't run). For Cloud SQL passwords used by the middleware, Vault's dynamic PostgreSQL credentials would be a significant security improvement over the current static password approach.
+**Platform connection:** The integration platform's current stack uses Vault for secrets injected into GKE pods via the Vault Agent Injector. Secrets Manager is appropriate for secrets consumed by Cloud Run or Cloud Functions (where Vault Agent doesn't run). For Cloud SQL passwords used by the middleware, Vault's dynamic PostgreSQL credentials would be a significant security improvement over the current static password approach.
 
 ---
 
-## 9. Putting It Together — AESF Architecture Walkthrough
+## 9. Putting It Together — Platform Architecture Walkthrough
 
-Here is how all the pieces connect in AESF's production architecture:
+Here is how all the pieces connect in the integration platform's production architecture:
 
 ```
 Salesforce (Apex Trigger)
     │ HTTPS POST
     ▼
-aesf-middleware (GKE, aesf namespace)
+crm-middleware (GKE, platform namespace)
     │ KSA → GSA via Workload Identity
-    ├── Cloud SQL Auth Proxy (sidecar) → Cloud SQL PostgreSQL (private IP, aesf-vpc)
-    ├── Pub/Sub publisher → aesf-sync-events topic
+    ├── Cloud SQL Auth Proxy (sidecar) → Cloud SQL PostgreSQL (private IP, platform-vpc)
+    ├── Pub/Sub publisher → platform-sync-events topic
     └── Vault Agent (sidecar) → Vault cluster (GKE, vault namespace)
 
-aesf-etl-bde (GKE, separate project)
+etl-bde-pipeline (GKE, separate project)
     │ KSA → GSA via Workload Identity
-    ├── Pub/Sub subscriber → aesf-sync-events
-    ├── Egress via Cloud NAT → Epic BDE server (de21web, on-prem or GCP VPC peer)
+    ├── Pub/Sub subscriber → platform-sync-events
+    ├── Egress via Cloud NAT → EHR system backend (ehr-server-prod, on-prem or GCP VPC peer)
     └── Vault Agent → Vault cluster
 
-aesf-etl-bq (GKE, separate project)
+etl-bq-pipeline (GKE, separate project)
     │ KSA → GSA via Workload Identity
     ├── BigQuery client → BigQuery datasets (IAM: roles/bigquery.dataEditor on specific datasets)
     └── Vault Agent → Vault cluster
@@ -482,11 +482,11 @@ Firewall rules enforce that the ETL project's service accounts can reach Cloud S
 
 ```
 GCP Resource Hierarchy
-├── Organization (appliedsystems.com)
+├── Organization (the-company.com)
 │   └── IAM policies inherited by all below
-├── Folders (AESF Prod / Staging / Dev)
+├── Folders (Integration Platform Prod / Staging / Dev)
 │   └── Billing and policy boundaries
-├── Projects (aesf-middleware-prod, aesf-etl-prod, ...)
+├── Projects (crm-middleware-prod, etl-pipeline-prod, ...)
 │   └── API enablement, service accounts, quotas
 └── Resources (GKE clusters, Cloud SQL, Pub/Sub topics, ...)
     └── Resource-level IAM bindings (most granular)
@@ -495,7 +495,7 @@ Networking
 ├── VPC (global, custom subnet mode)
 │   ├── Subnets (regional, primary + secondary ranges for GKE)
 │   ├── Firewall rules (network tags or SA targets, no stateful inspection)
-│   └── VPC Peering / VPN (to Epic server)
+│   └── VPC Peering / VPN (to EHR server)
 └── Cloud NAT (outbound for private instances, via Cloud Router)
 
 IAM
@@ -558,11 +558,11 @@ Secrets
 
 **16.** What is the `iam.gke.io/gcp-service-account` annotation on a Kubernetes ServiceAccount, and what must be configured on the GCP side for it to work?
 
-**17.** Describe the resource hierarchy binding that would be required if you want the AESF ETL service account to access BigQuery datasets in a *different project* (the BQ analytics project).
+**17.** Describe the resource hierarchy binding that would be required if you want the ETL service account to access BigQuery datasets in a *different project* (the BQ analytics project).
 
 **18.** Cloud SQL PITR (Point-in-Time Recovery) is enabled but you discover the oldest available recovery point is only 3 days ago, not the expected 7 days. What are two possible causes?
 
-**19.** You are designing a system where the on-prem Pentaho ETL job needs to write to a Cloud SQL database in AESF's VPC. The job runs on a server that is not in GCP. What are two connectivity options?
+**19.** You are designing a system where the on-prem Pentaho ETL job needs to write to a Cloud SQL database in the integration platform's VPC. The job runs on a server that is not in GCP. What are two connectivity options?
 
 **20.** Explain the trade-off between `--subnet-mode=auto` and `--subnet-mode=custom` when creating a GCP VPC. Which should you use for a production GKE cluster and why?
 
@@ -598,16 +598,16 @@ Secrets
 
     **13.** Cloud Run requires a **Serverless VPC Access connector** (a small managed VM-based connector in your VPC) to reach VPC-internal resources like Memorystore. The newer alternative is **Direct VPC Egress**, which gives Cloud Run services an IP in your VPC subnet directly without requiring a connector VM, reducing latency and cost. You configure it with `--network` and `--subnet` flags on the Cloud Run service.
 
-    **14.** Messages whose processing time exceeds the acknowledgment deadline are treated as unacknowledged and redelivered to another subscriber (or the same one). This means the message will be processed twice, causing duplicate side effects (duplicate writes to Cloud SQL, duplicate API calls to Epic). The fix is to increase the acknowledgment deadline to 300 or 600 seconds to cover the longest expected processing time, or to use **acknowledgment deadline extension** — the subscriber calls `modifyAckDeadline` during processing to extend the deadline before it expires, keeping the message checked out until processing completes.
+    **14.** Messages whose processing time exceeds the acknowledgment deadline are treated as unacknowledged and redelivered to another subscriber (or the same one). This means the message will be processed twice, causing duplicate side effects (duplicate writes to Cloud SQL, duplicate API calls to the EHR system). The fix is to increase the acknowledgment deadline to 300 or 600 seconds to cover the longest expected processing time, or to use **acknowledgment deadline extension** — the subscriber calls `modifyAckDeadline` during processing to extend the deadline before it expires, keeping the message checked out until processing completes.
 
     **15.** The custom role should include: `pubsub.topics.publish` (to publish messages), `pubsub.topics.get` (to retrieve topic metadata, required by the client library), and optionally `pubsub.snapshots.seek` if snapshots are used. It should explicitly exclude: `pubsub.topics.create`, `pubsub.topics.delete`, `pubsub.topics.update`, `pubsub.subscriptions.create`, `pubsub.subscriptions.delete`. The predefined `roles/pubsub.publisher` already scopes correctly to publish + get at the topic level and is the simpler choice unless you need to restrict further.
 
     **16.** The `iam.gke.io/gcp-service-account` annotation on a Kubernetes ServiceAccount tells GKE's metadata server which GCP service account this KSA maps to. When a pod using this KSA requests a token from the metadata server, the server returns a short-lived GCP access token for the annotated GSA. For this to work, the GCP side must be configured with an IAM binding: the principal `serviceAccount:PROJECT.svc.id.goog[NAMESPACE/KSA_NAME]` must have `roles/iam.workloadIdentityUser` on the target GSA. Without this binding, the annotation is ignored and token requests will fail with a permission error.
 
-    **17.** The ETL service account lives in `aesf-etl-prod`. The BigQuery datasets live in `aesf-bq-prod`. You need a cross-project IAM binding: on the *BigQuery project* (`aesf-bq-prod`), grant `roles/bigquery.dataEditor` (or dataset-level access) to the ETL service account from `aesf-etl-prod`. The format is `serviceAccount:etl-sa@aesf-etl-prod.iam.gserviceaccount.com`. Dataset-level bindings are preferred over project-level to restrict access to specific datasets. The ETL project also needs `roles/bigquery.jobUser` on its own project to run BigQuery jobs.
+    **17.** The ETL service account lives in `etl-pipeline-prod`. The BigQuery datasets live in `bq-analytics-prod`. You need a cross-project IAM binding: on the *BigQuery project* (`bq-analytics-prod`), grant `roles/bigquery.dataEditor` (or dataset-level access) to the ETL service account from `etl-pipeline-prod`. The format is `serviceAccount:etl-sa@etl-pipeline-prod.iam.gserviceaccount.com`. Dataset-level bindings are preferred over project-level to restrict access to specific datasets. The ETL project also needs `roles/bigquery.jobUser` on its own project to run BigQuery jobs.
 
     **18.** Two possible causes: (1) The Cloud SQL instance was recreated or restored from backup within the last 7 days — PITR log chain starts from the last full restore point, not the instance creation date. (2) The transaction log storage is full or write volume is very high, causing older log files to be purged earlier than the 7-day retention window. Check the `database/disk/bytes_used` metric in Cloud Monitoring for log growth rate, and verify the `backupRetentionSettings.retainedBackups` and `backupRetentionSettings.retentionUnit` settings on the instance.
 
-    **19.** Two options: (1) **Cloud VPN** — establish an IPsec VPN tunnel between the on-prem network and AESF's VPC. The Pentaho server gets a route to the Cloud SQL private IP over the tunnel. This is straightforward but adds VPN infrastructure. (2) **Cloud SQL Auth Proxy running on the on-prem server** — the proxy authenticates via a service account key file (or WIF if the on-prem server can obtain OIDC tokens) and tunnels the connection over HTTPS to Cloud SQL's public endpoint with TLS. This avoids VPN but requires a service account key on the on-prem machine, which is a credential management concern. For AESF's Pentaho jobs, Cloud VPN is the better long-term answer; the Auth Proxy with a key file is an acceptable temporary solution with compensating controls (key rotation, audit logging).
+    **19.** Two options: (1) **Cloud VPN** — establish an IPsec VPN tunnel between the on-prem network and the integration platform's VPC. The Pentaho server gets a route to the Cloud SQL private IP over the tunnel. This is straightforward but adds VPN infrastructure. (2) **Cloud SQL Auth Proxy running on the on-prem server** — the proxy authenticates via a service account key file (or WIF if the on-prem server can obtain OIDC tokens) and tunnels the connection over HTTPS to Cloud SQL's public endpoint with TLS. This avoids VPN but requires a service account key on the on-prem machine, which is a credential management concern. For the on-prem Pentaho jobs, Cloud VPN is the better long-term answer; the Auth Proxy with a key file is an acceptable temporary solution with compensating controls (key rotation, audit logging).
 
-    **20.** `--subnet-mode=auto` creates one subnet per region automatically with pre-assigned CIDR ranges — convenient but inflexible. You cannot control the CIDR ranges, which causes problems when ranges conflict with on-prem networks or when you need secondary ranges for GKE pod/service CIDRs. `--subnet-mode=custom` gives you full control over subnet CIDRs, regions, and secondary ranges. For a production GKE cluster you must use `custom` mode: GKE requires explicitly defined secondary ranges for pod IPs (e.g., `/14`) and service IPs (e.g., `/20`), and you need to ensure those ranges do not overlap with your on-prem network (important for AESF's VPN to the Epic server). Custom mode is the production standard.
+    **20.** `--subnet-mode=auto` creates one subnet per region automatically with pre-assigned CIDR ranges — convenient but inflexible. You cannot control the CIDR ranges, which causes problems when ranges conflict with on-prem networks or when you need secondary ranges for GKE pod/service CIDRs. `--subnet-mode=custom` gives you full control over subnet CIDRs, regions, and secondary ranges. For a production GKE cluster you must use `custom` mode: GKE requires explicitly defined secondary ranges for pod IPs (e.g., `/14`) and service IPs (e.g., `/20`), and you need to ensure those ranges do not overlap with your on-prem network (important for VPN connectivity to the EHR server). Custom mode is the production standard.

@@ -10,11 +10,11 @@
 
 Event-driven architecture (EDA) is a design paradigm where system components communicate by producing and consuming events rather than by calling each other directly. Instead of Service A asking Service B "what is the current state of X?", Service A broadcasts "X changed" and any interested party reacts. This inversion of control leads to systems that are naturally decoupled, independently scalable, and resilient to partial failures — qualities that become critical as distributed systems grow.
 
-Request-driven (synchronous) systems are simple and predictable: you call an endpoint, you get a response, you move on. The cost is tight coupling: the caller must know the callee's address, the callee must be available right now, and failure propagates instantly back to the caller. Most web APIs and microservice-to-microservice HTTP calls are request-driven. AESF's Apex triggers calling `aesf-py-middleware` REST endpoints are a textbook example.
+Request-driven (synchronous) systems are simple and predictable: you call an endpoint, you get a response, you move on. The cost is tight coupling: the caller must know the callee's address, the callee must be available right now, and failure propagates instantly back to the caller. Most web APIs and microservice-to-microservice HTTP calls are request-driven. The integration platform's Apex triggers calling `crm-middleware` REST endpoints are a textbook example.
 
-Queue-table-based async patterns sit in between. AESF today stores work items in PostgreSQL tables (essentially a homegrown message queue), which decouples the producer from the consumer in time — the Apex trigger writes a row, the ETL polls and processes it later. This is battle-tested and requires no additional infrastructure. The trade-off is that it puts queue-management complexity (polling, locking, dead-letter handling, ordering, fan-out) onto application code that was never designed for it, and PostgreSQL's MVCC engine pays a real cost for high-frequency updates to the same rows.
+Queue-table-based async patterns sit in between. The integration platform today stores work items in PostgreSQL tables (essentially a homegrown message queue), which decouples the producer from the consumer in time — the Apex trigger writes a row, the ETL polls and processes it later. This is battle-tested and requires no additional infrastructure. The trade-off is that it puts queue-management complexity (polling, locking, dead-letter handling, ordering, fan-out) onto application code that was never designed for it, and PostgreSQL's MVCC engine pays a real cost for high-frequency updates to the same rows.
 
-Apache Kafka occupies the far end of the spectrum: a distributed commit log purpose-built for high-throughput, ordered, durable, replayable event streams. This week you will learn Kafka's internals deeply enough to reason about whether — and where — it would improve AESF, how exactly-once semantics work, and how event sourcing plus CQRS compose on top of Kafka to fundamentally change how you model state.
+Apache Kafka occupies the far end of the spectrum: a distributed commit log purpose-built for high-throughput, ordered, durable, replayable event streams. This week you will learn Kafka's internals deeply enough to reason about whether — and where — it would improve the integration platform, how exactly-once semantics work, and how event sourcing plus CQRS compose on top of Kafka to fundamentally change how you model state.
 
 ---
 
@@ -25,7 +25,7 @@ The core question is: who knows about whom?
 ```
 Request-Driven (tight coupling)
 ────────────────────────────────
-  Apex Trigger ──HTTP POST──► aesf-py-middleware /sync
+  Apex Trigger ──HTTP POST──► crm-middleware /sync
        ▲                              │
        └──────── 200 OK / 500 ────────┘
   Caller must know URL, must retry on failure, blocked until response.
@@ -40,7 +40,7 @@ Queue-Table Async (loose in time, tight in schema)
 
 Event-Driven (loose in time AND in coupling)
 ─────────────────────────────────────────────
-  Apex Change Event ──produce──► Kafka topic: aesf.account.changed
+  Apex Change Event ──produce──► Kafka topic: platform.account.changed
                                         │
                               ┌─────────┴──────────┐
                          BDE Sync Consumer    BQ Sync Consumer
@@ -57,7 +57,7 @@ In the queue-table model, the producer (middleware API) and consumer (ETL) share
 A Kafka **cluster** is a group of **brokers** — JVM processes that store and serve messages. A **topic** is a logical stream of records, physically split into **partitions**. Each partition is an append-only, ordered log stored on disk.
 
 ```
-Topic: aesf.opportunity.events   (4 partitions)
+Topic: platform.opportunity.events   (4 partitions)
 
 Broker 1                   Broker 2                   Broker 3
 ┌──────────────┐           ┌──────────────┐           ┌──────────────┐
@@ -84,7 +84,7 @@ producer = Producer({
 
 def publish_account_event(account_id: str, payload: dict):
     producer.produce(
-        topic='aesf.account.events',
+        topic='platform.account.events',
         key=account_id.encode('utf-8'),   # same account → same partition
         value=json.dumps(payload).encode('utf-8'),
         callback=delivery_report,
@@ -109,7 +109,7 @@ def delivery_report(err, msg):
 A **consumer group** is a set of consumers that collectively read a topic. Kafka assigns each partition to exactly one consumer in the group — this is the **partition assignment**. Adding consumers to a group scales throughput; adding consumer groups adds independent readers without any producer changes.
 
 ```
-Topic: aesf.account.events (3 partitions)
+Topic: platform.account.events (3 partitions)
 
 Consumer Group: bde-sync-workers (3 consumers)
   Consumer-0 ─► Partition 0
@@ -136,7 +136,7 @@ consumer = Consumer({
     'max.poll.interval.ms': 300000,        # 5 min: time allowed between polls
 })
 
-consumer.subscribe(['aesf.account.events'])
+consumer.subscribe(['platform.account.events'])
 
 try:
     while True:
@@ -155,7 +155,7 @@ finally:
     consumer.close()
 ```
 
-Contrast with the AESF queue-table pattern:
+Contrast with the integration platform queue-table pattern:
 
 ```sql
 -- PostgreSQL queue-table equivalent: manual "offset" via status column
@@ -212,10 +212,10 @@ def process_with_exactly_once(consumer, msg):
     producer.begin_transaction()
     try:
         payload = json.loads(msg.value())
-        transformed = transform_for_epic(payload)
+        transformed = transform_for_ehr(payload)
 
         producer.produce(
-            topic='aesf.epic.sync.commands',
+            topic='platform.ehr.sync.commands',
             key=msg.key(),
             value=json.dumps(transformed).encode(),
         )
@@ -231,9 +231,9 @@ def process_with_exactly_once(consumer, msg):
         raise
 ```
 
-For AESF's Epic sync, exactly-once matters when an Epic API call is non-idempotent (e.g., creating a contact creates a duplicate if called twice). The current queue-table approach handles this via the `status` column plus application-level duplicate checks — functionally equivalent to at-least-once with idempotent consumers.
+For the integration platform's EHR sync, exactly-once matters when an EHR system API call is non-idempotent (e.g., creating a contact creates a duplicate if called twice). The current queue-table approach handles this via the `status` column plus application-level duplicate checks — functionally equivalent to at-least-once with idempotent consumers.
 
-**Common Mistake:** Believing exactly-once applies end-to-end including your downstream API calls. Kafka's exactly-once guarantee covers Kafka-to-Kafka operations. Calling an external API (like Epic's REST endpoints) still requires idempotency keys or duplicate-check logic at the application layer.
+**Common Mistake:** Believing exactly-once applies end-to-end including your downstream API calls. Kafka's exactly-once guarantee covers Kafka-to-Kafka operations. Calling an external API (like the EHR system's REST endpoints) still requires idempotency keys or duplicate-check logic at the application layer.
 
 ---
 
@@ -267,7 +267,7 @@ class AccountState:
     id: str = ""
     name: str = ""
     status: str = "inactive"
-    epic_client_id: str = ""
+    ehr_client_id: str = ""
 
 def apply_event(state: AccountState, event: dict) -> AccountState:
     etype = event["type"]
@@ -278,8 +278,8 @@ def apply_event(state: AccountState, event: dict) -> AccountState:
         state.name = data["name"]
     elif etype == "AccountRenamed":
         state.name = data["new_name"]
-    elif etype == "EpicClientLinked":
-        state.epic_client_id = data["epic_client_id"]
+    elif etype == "EHRClientLinked":
+        state.ehr_client_id = data["ehr_client_id"]
     elif etype == "AccountDeactivated":
         state.status = "inactive"
     return state
@@ -291,7 +291,7 @@ def rebuild_account(events: List[dict]) -> AccountState:
     return state
 ```
 
-For AESF, event sourcing would mean that every Salesforce change event (Account updated, Opportunity created) becomes an immutable record. The ETL never reads "current state" from Salesforce — it processes events. Debugging sync failures becomes trivial: replay the event stream from any point.
+For the integration platform, event sourcing would mean that every Salesforce change event (Account updated, Opportunity created) becomes an immutable record. The ETL never reads "current state" from Salesforce — it processes events. Debugging sync failures becomes trivial: replay the event stream from any point.
 
 **Common Mistake:** Event sourcing every domain object by default. It adds complexity (snapshots for performance, schema evolution of old events, eventual consistency of read models). Reserve it for domains where audit history and replay are genuinely valuable, such as financial records or compliance-critical sync operations.
 
@@ -305,7 +305,7 @@ CQRS separates write operations (**commands**) from read operations (**queries**
                      ┌─────────────┐
   HTTP POST ─────────► Command     │
   "Update Account"   │ Handler     │──── produces ────► Kafka topic
-                     └─────────────┘                   aesf.account.events
+                     └─────────────┘                   platform.account.events
                                                               │
                                               ┌───────────────┤
                                               ▼               ▼
@@ -318,7 +318,7 @@ CQRS separates write operations (**commands**) from read operations (**queries**
   "Get Account"                            (fast, denormalized, optimized for reads)
 ```
 
-The write side (command) normalizes for consistency. The read side materializes purpose-built projections. In AESF terms: the Apex trigger produces a `AccountChanged` command, middleware validates and publishes the event, and two separate consumers build their own read models — one for Epic BDE sync state, one for BigQuery analytics. Neither consumer blocks the other or requires schema agreement beyond the event contract.
+The write side (command) normalizes for consistency. The read side materializes purpose-built projections. In integration platform terms: the Apex trigger produces a `AccountChanged` command, middleware validates and publishes the event, and two separate consumers build their own read models — one for EHR BDE sync state, one for BigQuery analytics. Neither consumer blocks the other or requires schema agreement beyond the event contract.
 
 **Common Mistake:** Implementing CQRS without event sourcing and ending up with two databases that drift out of sync. CQRS without ES requires explicit synchronization logic. With ES, the event log is the single source of truth and read models are always rebuildable.
 
@@ -330,16 +330,16 @@ A **Dead Letter Queue (DLQ)** is a destination for messages that cannot be proce
 
 ```
 Normal Flow:
-  aesf.account.events ──► Consumer ──► Epic API call ──► success ──► commit offset
+  platform.account.events ──► Consumer ──► EHR system API call ──► success ──► commit offset
 
 Retry + DLQ Flow:
-  aesf.account.events ──► Consumer ──► Epic API call ──► 500 error
+  platform.account.events ──► Consumer ──► EHR system API call ──► 500 error
                                                │
                                     retry (max_retries=3, backoff=exponential)
                                                │
                                     still failing after 3 attempts
                                                │
-                                    ──► aesf.account.events.DLQ
+                                    ──► platform.account.events.DLQ
                                           (original msg + error metadata + retry count)
                                           │
                                     ──► alert/monitoring
@@ -351,7 +351,7 @@ Retry + DLQ Flow:
 import json
 from datetime import datetime, timezone
 
-DLQ_TOPIC = 'aesf.account.events.DLQ'
+DLQ_TOPIC = 'platform.account.events.DLQ'
 MAX_RETRIES = 3
 
 def process_with_dlq(consumer, producer, msg):
@@ -359,10 +359,10 @@ def process_with_dlq(consumer, producer, msg):
     retry_count = payload.get('_retry_count', 0)
 
     try:
-        sync_to_epic(payload)
+        sync_to_ehr(payload)
         consumer.commit(message=msg, asynchronous=False)
 
-    except EpicTransientError as e:
+    except EHRTransientError as e:
         # Retryable: re-enqueue with incremented retry count
         if retry_count < MAX_RETRIES:
             payload['_retry_count'] = retry_count + 1
@@ -377,7 +377,7 @@ def process_with_dlq(consumer, producer, msg):
             send_to_dlq(producer, msg, payload, str(e))
         consumer.commit(message=msg, asynchronous=False)
 
-    except EpicPermanentError as e:
+    except EHRPermanentError as e:
         # Non-retryable: straight to DLQ
         send_to_dlq(producer, msg, payload, str(e))
         consumer.commit(message=msg, asynchronous=False)
@@ -399,10 +399,10 @@ def send_to_dlq(producer, original_msg, payload, error: str):
     producer.flush()
 ```
 
-**AESF Comparison:** The current queue-table pattern handles this via a `status='failed'` column and `retry_count` field. Failed rows sit in the same `sync_queue` table. A DLQ in Kafka gives you separation of concerns: the main topic stays clean, failed messages have their own durable log with full metadata, and you can build a monitoring consumer on the DLQ topic without touching the happy path.
+**Integration Platform Comparison:** The current queue-table pattern handles this via a `status='failed'` column and `retry_count` field. Failed rows sit in the same `sync_queue` table. A DLQ in Kafka gives you separation of concerns: the main topic stays clean, failed messages have their own durable log with full metadata, and you can build a monitoring consumer on the DLQ topic without touching the happy path.
 
 ```sql
--- Current AESF DLQ equivalent in PostgreSQL
+-- Current integration platform DLQ equivalent in PostgreSQL
 UPDATE sync_queue
 SET status = 'dead',
     error_message = $1,
@@ -414,15 +414,15 @@ WHERE id = $2;
 SELECT * FROM sync_queue WHERE status = 'dead' ORDER BY last_attempted_at DESC;
 ```
 
-**Common Mistake:** Not monitoring the DLQ. A DLQ without alerts is a silent graveyard. Every message in a DLQ represents a failed business operation. In AESF's context, a DLQ message means an Epic sync did not happen — which leads to data drift between Salesforce and Epic BDE.
+**Common Mistake:** Not monitoring the DLQ. A DLQ without alerts is a silent graveyard. Every message in a DLQ represents a failed business operation. In the integration platform's context, a DLQ message means an EHR system sync did not happen — which leads to data drift between Salesforce and the EHR BDE backend.
 
 ---
 
-## 8. AESF Migration Analysis: PostgreSQL Queue Tables vs. Kafka
+## 8. Migration Analysis: PostgreSQL Queue Tables vs. Kafka
 
-This is the practical question: should AESF migrate from queue tables to Kafka?
+This is the practical question: should the integration platform migrate from queue tables to Kafka?
 
-**Current AESF queue-table characteristics:**
+**Current integration platform queue-table characteristics:**
 
 | Property | PostgreSQL Queue Table | Kafka |
 |----------|----------------------|-------|
@@ -465,7 +465,7 @@ Phase 3 (cutover): Remove queue table; ETL reads Kafka directly
 
 Debezium is a CDC (Change Data Capture) tool that tails the PostgreSQL WAL and produces Kafka events for every table change — effectively turning your existing queue table into a Kafka producer without changing any application code.
 
-**Common Mistake:** Migrating to Kafka because it is modern, not because current pain points require it. For AESF's current scale (thousands of Epic sync events per day, not millions), PostgreSQL queue tables are a reasonable choice. The migration overhead — Kafka cluster operations, Schema Registry, consumer group management — is real and non-trivial on a small team.
+**Common Mistake:** Migrating to Kafka because it is modern, not because current pain points require it. For the integration platform's current scale (thousands of EHR sync events per day, not millions), PostgreSQL queue tables are a reasonable choice. The migration overhead — Kafka cluster operations, Schema Registry, consumer group management — is real and non-trivial on a small team.
 
 ---
 
@@ -487,12 +487,12 @@ account_event_schema = """
 {
   "type": "record",
   "name": "AccountEvent",
-  "namespace": "com.aesf.events",
+  "namespace": "com.platform.events",
   "fields": [
     {"name": "account_id",      "type": "string"},
     {"name": "event_type",      "type": "string"},
     {"name": "name",            "type": "string"},
-    {"name": "epic_client_id",  "type": ["null", "string"], "default": null},
+    {"name": "ehr_client_id",   "type": ["null", "string"], "default": null},
     {"name": "occurred_at",     "type": "string"}
   ]
 }
@@ -502,13 +502,13 @@ avro_serializer = AvroSerializer(schema_registry_client, account_event_schema)
 
 # Producer uses schema-aware serializer
 producer.produce(
-    topic='aesf.account.events',
+    topic='platform.account.events',
     key=account_id.encode(),
     value=avro_serializer(
         {"account_id": account_id, "event_type": "AccountRenamed",
-         "name": "New Name", "epic_client_id": None,
+         "name": "New Name", "ehr_client_id": None,
          "occurred_at": "2026-10-12T09:00:00Z"},
-        SerializationContext('aesf.account.events', MessageField.VALUE)
+        SerializationContext('platform.account.events', MessageField.VALUE)
     )
 )
 ```
@@ -524,8 +524,8 @@ Schema evolution rules under Avro backward compatibility: adding a field with a 
 ```
 Event-Driven Architecture
 ├── Coupling Models
-│   ├── Request-Driven (sync HTTP)       ← AESF Apex→Middleware API calls
-│   ├── Queue-Table Async                ← AESF current ETL pattern
+│   ├── Request-Driven (sync HTTP)       ← Integration platform Apex→Middleware API calls
+│   ├── Queue-Table Async                ← Integration platform current ETL pattern
 │   └── Event-Driven (Kafka)             ← target architecture for scale
 │
 ├── Kafka Internals
@@ -546,10 +546,10 @@ Event-Driven Architecture
 │   ├── CQRS                             ← separate write model (commands) from read model
 │   └── Dead Letter Queue               ← isolate poison pills, enable monitoring
 │
-└── AESF Migration Considerations
+└── Migration Considerations
     ├── Current scale: queue tables are adequate
     ├── Fan-out need → strongest signal to adopt Kafka
-    ├── Replay/audit → event sourcing adds value for Epic sync history
+    ├── Replay/audit → event sourcing adds value for EHR sync history
     ├── Hybrid path: Debezium CDC bridges PostgreSQL → Kafka
     └── Operational cost: Kafka requires mature DevOps to justify
 ```
@@ -574,13 +574,13 @@ Event-Driven Architecture
 
 **7.** What two Kafka features must be combined to achieve exactly-once semantics in a read-process-write pipeline?
 
-**8.** Exactly-once in Kafka covers Kafka-to-Kafka operations. What additional pattern is required when the downstream operation is a REST API call to an external system like Epic?
+**8.** Exactly-once in Kafka covers Kafka-to-Kafka operations. What additional pattern is required when the downstream operation is a REST API call to an external system like the EHR system?
 
 **9.** What is event sourcing, and how does it differ from storing current state in a relational database row?
 
 **10.** What is a "poison pill" message in the context of a Kafka consumer, and how does a Dead Letter Queue address it?
 
-**11.** In the current AESF PostgreSQL queue-table pattern, what SQL clause prevents two ETL workers from claiming the same row simultaneously, and what is the Kafka equivalent?
+**11.** In the current integration platform PostgreSQL queue-table pattern, what SQL clause prevents two ETL workers from claiming the same row simultaneously, and what is the Kafka equivalent?
 
 **12.** What is CQRS, and why is it particularly powerful when combined with event sourcing?
 
@@ -588,7 +588,7 @@ Event-Driven Architecture
 
 **14.** You observe that `sync_queue` in PostgreSQL is frequently over 100,000 rows and autovacuum is running constantly. What does this indicate, and what Kafka feature directly addresses the underlying cause?
 
-**15.** What is Debezium, and how would it enable a low-risk migration from AESF's queue-table pattern to Kafka?
+**15.** What is Debezium, and how would it enable a low-risk migration from the integration platform's queue-table pattern to Kafka?
 
 **16.** A Kafka topic has 4 partitions and a consumer group has 6 consumers. How many consumers will be idle, and why?
 
@@ -596,9 +596,9 @@ Event-Driven Architecture
 
 **18.** In event sourcing, how is current state derived, and what is a "snapshot" used for?
 
-**19.** A new requirement asks that every Epic sync attempt — including retries and failures — be auditable for 2 years. Which approach (queue table or Kafka with event sourcing) better supports this, and why?
+**19.** A new requirement asks that every EHR sync attempt — including retries and failures — be auditable for 2 years. Which approach (queue table or Kafka with event sourcing) better supports this, and why?
 
-**20.** Name the three strongest signals that AESF should migrate from PostgreSQL queue tables to Kafka, and one strong reason to stay with the current approach.
+**20.** Name the three strongest signals that the integration platform should migrate from PostgreSQL queue tables to Kafka, and one strong reason to stay with the current approach.
 
 ---
 
@@ -606,27 +606,27 @@ Event-Driven Architecture
 
 ??? note "Reveal Answers"
 
-    **1.** Request-driven architecture requires the caller to know the callee's address and availability — if Service B is down, Service A fails immediately. Event-driven architecture inverts this: the producer emits an event to a broker without knowing who will consume it or when. This removes temporal and spatial coupling, enabling producers and consumers to evolve, scale, and fail independently. AESF's Apex trigger calling the middleware REST API is request-driven; a trigger publishing to a Kafka topic would be event-driven.
+    **1.** Request-driven architecture requires the caller to know the callee's address and availability — if Service B is down, Service A fails immediately. Event-driven architecture inverts this: the producer emits an event to a broker without knowing who will consume it or when. This removes temporal and spatial coupling, enabling producers and consumers to evolve, scale, and fail independently. The integration platform's Apex trigger calling the middleware REST API is request-driven; a trigger publishing to a Kafka topic would be event-driven.
 
-    **2.** Kafka uses consistent hashing of the message key modulo the number of partitions to determine which partition a record is routed to. Because this hash is deterministic, all messages with the same key (e.g., `account_id = "001ABC"`) always map to the same partition. Within a partition, records are strictly ordered by insertion time. This is why choosing the right partition key — one that co-locates related events — is critical for correctness in systems like AESF where account events must be processed in sequence.
+    **2.** Kafka uses consistent hashing of the message key modulo the number of partitions to determine which partition a record is routed to. Because this hash is deterministic, all messages with the same key (e.g., `account_id = "001ABC"`) always map to the same partition. Within a partition, records are strictly ordered by insertion time. This is why choosing the right partition key — one that co-locates related events — is critical for correctness in systems like the integration platform where account events must be processed in sequence.
 
     **3.** The ISR set is the group of partition replicas that are fully caught up with the partition leader. When `acks=all` is set on the producer, the broker only acknowledges a write after every replica in the ISR has persisted the message to disk. This means even if the leader broker fails immediately after the acknowledgment, at least one ISR follower has the data and will be elected as the new leader without data loss. Without `acks=all` (e.g., `acks=1`), acknowledgment comes from the leader alone, and a leader crash before replication completes results in lost messages.
 
-    **4.** Kafka **consumer groups** enable independent consumers of the same topic. Each consumer group maintains its own committed offsets for every partition it reads. When Group A commits offset 500 on Partition 0, Group B's position on that same partition is completely unaffected. You can have any number of consumer groups — e.g., `bde-sync-workers` and `bq-sink-workers` — reading the `aesf.account.events` topic simultaneously, each at their own pace, with zero producer-side changes.
+    **4.** Kafka **consumer groups** enable independent consumers of the same topic. Each consumer group maintains its own committed offsets for every partition it reads. When Group A commits offset 500 on Partition 0, Group B's position on that same partition is completely unaffected. You can have any number of consumer groups — e.g., `bde-sync-workers` and `bq-sink-workers` — reading the `platform.account.events` topic simultaneously, each at their own pace, with zero producer-side changes.
 
-    **5.** Committing a Kafka offset advances a pointer that says "this consumer group has processed up to offset N on this partition" — the message itself remains in the log until the topic's retention period expires. In a traditional message queue (or AESF's `sync_queue` table), consuming a message typically deletes or marks it, making it unavailable to any future reader. Kafka's design means any consumer group can reset to an earlier offset and reprocess historical messages, which is the foundation for replay, backfill, and disaster recovery.
+    **5.** Committing a Kafka offset advances a pointer that says "this consumer group has processed up to offset N on this partition" — the message itself remains in the log until the topic's retention period expires. In a traditional message queue (or the integration platform's `sync_queue` table), consuming a message typically deletes or marks it, making it unavailable to any future reader. Kafka's design means any consumer group can reset to an earlier offset and reprocess historical messages, which is the foundation for replay, backfill, and disaster recovery.
 
-    **6.** With `enable.auto.commit=True`, Kafka commits the offset on a timer (default every 5 seconds), regardless of whether your application has finished processing. If a slow or failing consumer crashes between the auto-commit and the completion of actual processing, Kafka believes those messages were handled and will not re-deliver them. The result is silent message loss — particularly dangerous for AESF sync events where a missed commit means an Epic record is never updated. Manual commit after confirmed processing eliminates this risk.
+    **6.** With `enable.auto.commit=True`, Kafka commits the offset on a timer (default every 5 seconds), regardless of whether your application has finished processing. If a slow or failing consumer crashes between the auto-commit and the completion of actual processing, Kafka believes those messages were handled and will not re-deliver them. The result is silent message loss — particularly dangerous for integration platform sync events where a missed commit means an EHR system record is never updated. Manual commit after confirmed processing eliminates this risk.
 
     **7.** Exactly-once semantics require the **idempotent producer** (`enable.idempotence=True`) combined with the **transactional API** (`transactional.id` + `begin_transaction` / `commit_transaction`). The idempotent producer deduplicates retried produces at the broker using a PID and sequence number. The transactional API atomically groups a produce and a consumer offset commit so that either both succeed or both roll back. Together, they ensure each input message produces exactly one output, even across consumer restarts and network failures.
 
-    **8.** When calling an external REST API like Epic's endpoints, exactly-once requires **idempotency keys** at the application layer. You pass a unique request ID (e.g., derived from the Kafka message's topic + partition + offset) in each API call. If the Epic server has already processed a request with that ID, it returns the previous result without executing the operation again. This is the only way to prevent duplicate Epic records when the Kafka consumer retries after an uncertain API response (e.g., a network timeout where you don't know if the server processed the request).
+    **8.** When calling an external REST API like the EHR system's endpoints, exactly-once requires **idempotency keys** at the application layer. You pass a unique request ID (e.g., derived from the Kafka message's topic + partition + offset) in each API call. If the EHR system server has already processed a request with that ID, it returns the previous result without executing the operation again. This is the only way to prevent duplicate EHR records when the Kafka consumer retries after an uncertain API response (e.g., a network timeout where you don't know if the server processed the request).
 
     **9.** Event sourcing stores the complete history of changes as an immutable sequence of events rather than overwriting a single mutable row. Current state is derived by replaying all events through a fold function. In a relational database, an `UPDATE accounts SET name='Acme Inc'` permanently loses the old name unless you maintain an audit table. With event sourcing, the `AccountRenamed` event is permanently recorded, the previous name is always recoverable, and you can reconstruct the state of any record at any point in time by replaying up to a specific event sequence number.
 
     **10.** A poison pill is a message that consistently causes consumer processing to fail — perhaps due to malformed data, an unexpected schema, or a bug triggered by a specific value. Without a DLQ, the consumer retries indefinitely, blocking all subsequent messages in that partition forever (since Kafka guarantees order within a partition). A Dead Letter Queue routes the problematic message to a separate topic after N failed retries, allowing the consumer to skip it and continue processing. The DLQ message retains full metadata (original topic, partition, offset, error) so engineers can diagnose and optionally reprocess it later.
 
-    **11.** AESF's queue table uses `SELECT ... FOR UPDATE SKIP LOCKED` — this acquires a row-level lock on matching rows and skips rows already locked by other transactions, allowing multiple ETL workers to each claim distinct batches without double-processing. In Kafka, this problem does not exist in the same form: Kafka's consumer group protocol assigns each partition to exactly one consumer in the group, so two consumers in the same group never read from the same partition simultaneously. The coordination is handled by the Kafka broker (via the group coordinator), not by application-level locking.
+    **11.** The integration platform's queue table uses `SELECT ... FOR UPDATE SKIP LOCKED` — this acquires a row-level lock on matching rows and skips rows already locked by other transactions, allowing multiple ETL workers to each claim distinct batches without double-processing. In Kafka, this problem does not exist in the same form: Kafka's consumer group protocol assigns each partition to exactly one consumer in the group, so two consumers in the same group never read from the same partition simultaneously. The coordination is handled by the Kafka broker (via the group coordinator), not by application-level locking.
 
     **12.** CQRS (Command Query Responsibility Segregation) separates the write model (commands that change state) from the read model (queries that return state). Combined with event sourcing, the write model produces events rather than directly updating a database, and multiple independent read models (projections) subscribe to those events to build purpose-optimized views. This is powerful because each read model can be denormalized for its specific query patterns, new read models can be added without changing the write path, and any read model can be rebuilt from scratch by replaying the event log — making the system auditable, debuggable, and evolvable.
 
@@ -634,14 +634,14 @@ Event-Driven Architecture
 
     **14.** Over 100,000 rows with constant autovacuum indicates high write amplification from frequent status column UPDATEs (`pending` → `processing` → `done`). PostgreSQL's MVCC engine creates dead row versions on every UPDATE; autovacuum must reclaim these continuously. Under heavy load, autovacuum cannot keep up, the table bloats, and query performance degrades. Kafka's append-only log design has no equivalent: consumers do not modify the log at all; they only advance a pointer (the offset). There are no dead rows, no vacuum cycles, and throughput scales with disk write bandwidth rather than lock contention.
 
-    **15.** Debezium is an open-source CDC (Change Data Capture) platform that tails the PostgreSQL Write-Ahead Log (WAL) and emits a Kafka event for every INSERT, UPDATE, or DELETE on a watched table. For AESF migration, this means the existing Apex trigger → middleware → queue table INSERT code requires zero changes. Debezium would watch `sync_queue` and produce every new row as a Kafka event automatically. New consumers (BQ sink, audit service) read from Kafka while the existing ETL continues reading PostgreSQL — a true strangler-fig migration that can be reversed at any point before the final cutover.
+    **15.** Debezium is an open-source CDC (Change Data Capture) platform that tails the PostgreSQL Write-Ahead Log (WAL) and emits a Kafka event for every INSERT, UPDATE, or DELETE on a watched table. For the integration platform migration, this means the existing Apex trigger → middleware → queue table INSERT code requires zero changes. Debezium would watch `sync_queue` and produce every new row as a Kafka event automatically. New consumers (BQ sink, audit service) read from Kafka while the existing ETL continues reading PostgreSQL — a true strangler-fig migration that can be reversed at any point before the final cutover.
 
     **16.** With 4 partitions and 6 consumers in the same group, exactly 2 consumers will be idle. Kafka's partition assignment protocol guarantees each partition is assigned to at most one consumer in a group. With 4 partitions, only 4 consumers can be active; the remaining 2 sit in standby. They serve as automatic failover — if one active consumer dies, a rebalance immediately assigns its partition to a standby consumer. Adding more consumers than partitions provides resilience but not additional parallelism; to increase parallelism you must increase the number of partitions.
 
-    **17.** Kafka's `retention.ms` is a time-based or size-based policy applied by the broker automatically to all messages across all consumers — messages older than the retention window are deleted from disk regardless of whether anyone has read them. This is a background infrastructure operation. AESF's `DELETE FROM sync_queue WHERE status='done'` is an application-driven operation that runs explicitly, only deletes rows the application marked as processed, and requires a WHERE clause index scan. Kafka's retention is operationally simpler (no application code needed) but means consumers that fall behind by more than the retention window will miss messages permanently.
+    **17.** Kafka's `retention.ms` is a time-based or size-based policy applied by the broker automatically to all messages across all consumers — messages older than the retention window are deleted from disk regardless of whether anyone has read them. This is a background infrastructure operation. The integration platform's `DELETE FROM sync_queue WHERE status='done'` is an application-driven operation that runs explicitly, only deletes rows the application marked as processed, and requires a WHERE clause index scan. Kafka's retention is operationally simpler (no application code needed) but means consumers that fall behind by more than the retention window will miss messages permanently.
 
     **18.** In event sourcing, current state is derived by taking an empty initial state and applying every event in sequence through a pure function (`state = fold(events, initial_state)`). For domains with long event histories (millions of events per entity), replaying from the beginning on every read is prohibitively slow. A **snapshot** is a periodic checkpoint that captures the fully-reduced state at a specific event sequence number. On a read, the system loads the most recent snapshot and only replays events that occurred after the snapshot's sequence number, dramatically reducing replay time while maintaining correctness.
 
-    **19.** Kafka with event sourcing is significantly better suited for a 2-year audit requirement. By setting `retention.ms=-1` (infinite) or `retention.bytes` to a large value on the topic, every Epic sync attempt — including retries with full metadata — is permanently stored in order, queryable by replaying the partition. The queue-table approach would require a separate `sync_audit` table with explicit INSERT logic for every retry, careful schema management, and growth management strategies for a 2-year accumulation. More importantly, with event sourcing you can replay any time window to reconstruct exactly what sync attempts were made for any account, which is exactly what a compliance audit requires.
+    **19.** Kafka with event sourcing is significantly better suited for a 2-year audit requirement. By setting `retention.ms=-1` (infinite) or `retention.bytes` to a large value on the topic, every EHR sync attempt — including retries with full metadata — is permanently stored in order, queryable by replaying the partition. The queue-table approach would require a separate `sync_audit` table with explicit INSERT logic for every retry, careful schema management, and growth management strategies for a 2-year accumulation. More importantly, with event sourcing you can replay any time window to reconstruct exactly what sync attempts were made for any account, which is exactly what a compliance audit requires.
 
-    **20.** The three strongest signals to migrate to Kafka are: (1) **Fan-out** — a second independent consumer (e.g., a new analytics service) needs to read the same sync events without modifying the queue-table schema or ETL code; (2) **Scale** — the `sync_queue` table shows autovacuum pressure, growing bloat, or poll latency exceeding SLA thresholds under normal load; (3) **Replay/audit** — a requirement to reconstruct the complete history of all sync operations or to replay events from a specific point in time. The strongest reason to stay is **operational cost**: Kafka requires a dedicated cluster (or managed service like Confluent Cloud / GCP Pub/Sub), Schema Registry, consumer group monitoring, and a team experienced in distributed broker operations — all of which represent substantial ongoing overhead for a system that currently works correctly at AESF's scale.
+    **20.** The three strongest signals to migrate to Kafka are: (1) **Fan-out** — a second independent consumer (e.g., a new analytics service) needs to read the same sync events without modifying the queue-table schema or ETL code; (2) **Scale** — the `sync_queue` table shows autovacuum pressure, growing bloat, or poll latency exceeding SLA thresholds under normal load; (3) **Replay/audit** — a requirement to reconstruct the complete history of all sync operations or to replay events from a specific point in time. The strongest reason to stay is **operational cost**: Kafka requires a dedicated cluster (or managed service like Confluent Cloud / GCP Pub/Sub), Schema Registry, consumer group monitoring, and a team experienced in distributed broker operations — all of which represent substantial ongoing overhead for a system that currently works correctly at the integration platform's scale.

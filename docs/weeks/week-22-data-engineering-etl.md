@@ -10,7 +10,7 @@
 
 Data engineering is the discipline of designing, building, and operating the pipelines that move raw data from operational systems into analytical or downstream systems. At its core, every pipeline answers the same question: how do we reliably get data from A to B, with the right shape, at the right time, without losing anything or duplicating it? The answer requires thinking about extraction strategy (full vs. incremental), transformation placement (ETL vs. ELT), change detection (watermarks, CDC), and fault tolerance (idempotency, dead-letter queues).
 
-Your two production pipelines — `etl-appliedcrm-bde` and `etl-appliedcrm-bq` — are real-world examples of both paradigms. The BDE pipeline is closer to classic ETL: Pentaho PDI jobs extract from Salesforce, transform records, and load them into the Epic BDE backend via the `aesf-py-middleware` REST API. The BQ pipeline is ELT-leaning: Salesforce data lands in BigQuery, and heavy transformations happen there in SQL. Both share the same operational challenges — schema drift, partial failures, idempotency, and orchestration.
+Your two production pipelines — `etl-bde-pipeline` and `etl-bq-pipeline` — are real-world examples of both paradigms. The BDE pipeline is closer to classic ETL: Pentaho PDI jobs extract from Salesforce, transform records, and load them into the EHR system backend via the `crm-middleware` REST API. The BQ pipeline is ELT-leaning: Salesforce data lands in BigQuery, and heavy transformations happen there in SQL. Both share the same operational challenges — schema drift, partial failures, idempotency, and orchestration.
 
 Understanding patterns like watermarking, change data capture (CDC), and schema evolution moves you from "it works most of the time" to "it is provably correct and restartable." That shift is what distinguishes senior ETL work from staff-level data engineering. Staff engineers think about the failure modes before writing a single line of transform code, and they design pipelines that degrade gracefully rather than silently corrupting state.
 
@@ -20,21 +20,21 @@ This guide covers the complete vocabulary and pattern set for data engineering, 
 
 ## 1. ETL vs. ELT — Where Transformation Lives
 
-**ETL (Extract → Transform → Load)** runs transformations in the pipeline layer before data reaches the destination. PDI `.ktr` files in your BDE pipeline are a textbook example: field mappings, lookups, type coercions, and business-rule filters all happen inside Pentaho before the `aesf-py-middleware` API receives a payload.
+**ETL (Extract → Transform → Load)** runs transformations in the pipeline layer before data reaches the destination. PDI `.ktr` files in your BDE pipeline are a textbook example: field mappings, lookups, type coercions, and business-rule filters all happen inside Pentaho before the `crm-middleware` API receives a payload.
 
 **ELT (Extract → Load → Transform)** loads raw data into the destination first and uses the destination's compute for transformation. Your BQ pipeline does this: Python upserts raw Salesforce rows into staging tables, then BigQuery SQL functions perform the joins, deduplication, and aggregations that produce the analytics-ready tables.
 
 ```
 ETL (BDE pipeline)
 ─────────────────────────────────────────────────────────
-Salesforce SOQL → PDI .ktr (field map, type coerce) → POST /api/v2/ → Epic BDE
+Salesforce SOQL → PDI .ktr (field map, type coerce) → POST /api/v2/ → EHR system BDE
 
 ELT (BQ pipeline)
 ─────────────────────────────────────────────────────────
 Salesforce SOQL → Python upsert → BQ staging table → BQ SQL transform → BQ final table
 ```
 
-The ELT model wins when the destination engine (BigQuery, Snowflake, Redshift) is orders of magnitude faster at set-based transforms than your pipeline layer. The ETL model wins when the destination API has strict input contracts (like the Epic SDK endpoints) and rejects mal-formed payloads — you must validate and transform before delivery.
+The ELT model wins when the destination engine (BigQuery, Snowflake, Redshift) is orders of magnitude faster at set-based transforms than your pipeline layer. The ETL model wins when the destination API has strict input contracts (like the EHR SDK endpoints) and rejects mal-formed payloads — you must validate and transform before delivery.
 
 **Common mistake:** Mixing the models ad hoc — doing partial transformation in PDI and finishing in BigQuery SQL with no clear contract between layers. If a field is renamed in the PDI step but not updated in the downstream SQL, you get silent `NULL`s in final tables. Document the transformation boundary explicitly and enforce it in code review.
 
@@ -47,7 +47,7 @@ A **full load** truncates the destination and reloads everything from the source
 An **incremental load** transfers only records that changed since the last successful run. The pipeline maintains a **high-water mark** — the maximum `LastModifiedDate` (or equivalent) seen in the previous run — and filters the source query to `WHERE LastModifiedDate > :last_run`.
 
 ```python
-# Python incremental loader pattern used in etl-appliedcrm-bq
+# Python incremental loader pattern used in etl-bq-pipeline
 import datetime
 from google.cloud import bigquery
 
@@ -92,7 +92,7 @@ A pipeline is **idempotent** if running it multiple times with the same inputs p
 The three building blocks of idempotency are:
 
 1. **Upsert semantics at the destination.** Use `MERGE` in BigQuery or `INSERT ... ON CONFLICT DO UPDATE` in PostgreSQL instead of `INSERT`. A rerun of the same records updates existing rows rather than creating duplicates.
-2. **Idempotent API calls.** The `aesf-py-middleware` endpoints are called with the Salesforce `Id` as the natural key. A `POST /clients` that already exists should behave the same as `PUT /clients/{id}` — the middleware achieves this via its queue table's upsert pattern.
+2. **Idempotent API calls.** The `crm-middleware` endpoints are called with the Salesforce `Id` as the natural key. A `POST /clients` that already exists should behave the same as `PUT /clients/{id}` — the middleware achieves this via its queue table's upsert pattern.
 3. **Checkpointing.** Track which logical batch (e.g., `offset` or `page`) was last successfully committed so a restart skips already-processed batches.
 
 ```python
@@ -139,7 +139,7 @@ For your BQ pipeline, a watermarking table in BigQuery tracks the high-water mar
 
 ```sql
 -- BQ watermark table schema
-CREATE TABLE IF NOT EXISTS `aedl-ssa-1668620072.etl_control.watermarks` (
+CREATE TABLE IF NOT EXISTS `gcp-project-staging.etl_control.watermarks` (
     object_name     STRING NOT NULL,
     last_run_ts     TIMESTAMP NOT NULL,
     last_success_ts TIMESTAMP,
@@ -148,11 +148,11 @@ CREATE TABLE IF NOT EXISTS `aedl-ssa-1668620072.etl_control.watermarks` (
 
 -- Read watermark before extraction
 SELECT last_success_ts
-FROM `aedl-ssa-1668620072.etl_control.watermarks`
+FROM `gcp-project-staging.etl_control.watermarks`
 WHERE object_name = 'Account';
 
 -- Advance watermark after successful load
-UPDATE `aedl-ssa-1668620072.etl_control.watermarks`
+UPDATE `gcp-project-staging.etl_control.watermarks`
 SET last_success_ts = CURRENT_TIMESTAMP(),
     updated_at = CURRENT_TIMESTAMP()
 WHERE object_name = 'Account';
@@ -164,7 +164,7 @@ WHERE object_name = 'Account';
 
 ## 5. Schema Evolution Handling
 
-Production pipelines break when source schemas change. A Salesforce admin adds a custom field, renames a picklist value, or changes a field type — and suddenly your PDI `.ktr` mapping throws a NullPointerException or your BigQuery `INSERT` fails with a type mismatch.
+Production pipelines break when source schemas change. a Salesforce admin adds a custom field, renames a picklist value, or changes a field type — and suddenly your PDI `.ktr` mapping throws a NullPointerException or your BigQuery `INSERT` fails with a type mismatch.
 
 Schema evolution strategies range from brittle to robust:
 
@@ -214,7 +214,7 @@ Pentaho Data Integration (PDI) uses two file types:
 Your BDE pipeline structure maps cleanly onto this:
 
 ```
-etl-appliedcrm-bde/Jobs/
+etl-bde-pipeline/Jobs/
 ├── sync.kjb          ← Master job: runs incremental sync transformations
 ├── migration.kjb     ← One-time or periodic full-load job
 ├── reconcile.kjb     ← Diff + correct: detects orphans and corrects drift
@@ -242,7 +242,7 @@ Key PDI steps relevant to your pipelines:
 
 | Step | Use |
 |---|---|
-| **REST Client** | HTTP calls to `aesf-py-middleware` API |
+| **REST Client** | HTTP calls to `crm-middleware` API |
 | **Insert/Update** | Idempotent writes to PostgreSQL middleware queue tables |
 | **Modified Java Script Value** | Inline JS transforms (avoid for complex logic; prefer Python step or dedicated `.ktr`) |
 | **Filter Rows** | Branch pipeline based on row conditions |
@@ -308,7 +308,7 @@ def load_with_dlq(
     return {"success": success_count, "dlq": dlq_count}
 ```
 
-For the BDE pipeline, the `aesf-py-middleware` queue tables (`sync_queue`, `error_queue`) serve this role. Records that fail to sync to Epic BDE are moved to an error state in the queue table with the error message, and the `reconcile.kjb` job periodically retries them.
+For the BDE pipeline, the `crm-middleware` queue tables (`sync_queue`, `error_queue`) serve this role. Records that fail to sync to the EHR system BDE are moved to an error state in the queue table with the error message, and the `reconcile.kjb` job periodically retries them.
 
 **DLQ replay** is as important as DLQ write. A dead-letter queue that fills up and is never drained is just a slow data loss. Build a replay mechanism — a script or Pentaho job that reads from the DLQ, re-attempts the load, and removes successfully replayed records.
 
@@ -367,7 +367,7 @@ def sf_to_bq_pipeline(object_name: str = "Account") -> None:
 
 Applying all the above patterns to your two production pipelines:
 
-**`etl-appliedcrm-bde` (Salesforce → Epic BDE via middleware)**
+**`etl-bde-pipeline` (Salesforce → EHR system BDE via middleware)**
 
 ```
 Design analysis
@@ -382,7 +382,7 @@ Orchestration:  Kubernetes CronJob — no dependency DAG  ⚠
 Exit codes:     Verify kitchen.sh exit propagation  ⚠
 ```
 
-**`etl-appliedcrm-bq` (Salesforce → BigQuery)**
+**`etl-bq-pipeline` (Salesforce → BigQuery)**
 
 ```
 Design analysis
@@ -443,7 +443,7 @@ Data Engineering & ETL Patterns
 
 **1.** What is the core difference between ETL and ELT, and which pattern does each of your production pipelines follow?
 
-**2.** Why is `LastModifiedDate` polling insufficient to detect deleted records in Salesforce, and what job in `etl-appliedcrm-bde` compensates for this?
+**2.** Why is `LastModifiedDate` polling insufficient to detect deleted records in Salesforce, and what job in `etl-bde-pipeline` compensates for this?
 
 **3.** Define idempotency in the context of a data pipeline. What SQL construct achieves idempotency in BigQuery?
 
@@ -463,7 +463,7 @@ Data Engineering & ETL Patterns
 
 **11.** What is CDC (Change Data Capture), and how does Salesforce's Streaming API approximate it?
 
-**12.** In the BDE pipeline, the `sync.kjb` job processes 10,000 Account records and crashes after 7,000. On the next run, how does idempotency prevent duplicate records in Epic BDE?
+**12.** In the BDE pipeline, the `sync.kjb` job processes 10,000 Account records and crashes after 7,000. On the next run, how does idempotency prevent duplicate records in the EHR system BDE?
 
 **13.** What is backpressure in the context of PDI step execution, and how does PDI handle it?
 
@@ -487,9 +487,9 @@ Data Engineering & ETL Patterns
 
 ??? note "Reveal Answers"
 
-    **1.** ETL transforms data in the pipeline layer before it reaches the destination, while ELT loads raw data into the destination and transforms it there using the destination's compute engine. The `etl-appliedcrm-bde` pipeline follows ETL: PDI `.ktr` files transform Salesforce records into the shape expected by the Epic middleware API before any API call is made. The `etl-appliedcrm-bq` pipeline follows ELT: Python upserts raw Salesforce data into BigQuery staging tables, and BigQuery SQL functions perform the joins, deduplication, and aggregations to produce analytics-ready tables. The choice reflects the destination's constraints — Epic has a strict API contract requiring pre-validated payloads, while BigQuery's massive parallel SQL engine makes in-destination transformation faster and cheaper.
+    **1.** ETL transforms data in the pipeline layer before it reaches the destination, while ELT loads raw data into the destination and transforms it there using the destination's compute engine. The `etl-bde-pipeline` pipeline follows ETL: PDI `.ktr` files transform Salesforce records into the shape expected by the EHR system middleware API before any API call is made. The `etl-bq-pipeline` pipeline follows ELT: Python upserts raw Salesforce data into BigQuery staging tables, and BigQuery SQL functions perform the joins, deduplication, and aggregations to produce analytics-ready tables. The choice reflects the destination's constraints — the EHR system has a strict API contract requiring pre-validated payloads, while BigQuery's massive parallel SQL engine makes in-destination transformation faster and cheaper.
 
-    **2.** `LastModifiedDate` only changes when a record is updated — a deleted record disappears from SOQL results entirely and never appears in a `WHERE LastModifiedDate > :watermark` query. This means an incremental load based solely on `LastModifiedDate` will leave orphan rows in the destination indefinitely, creating data drift between Salesforce and Epic. The `reconcile.kjb` job in `etl-appliedcrm-bde` compensates by performing a full comparison: it fetches all IDs from the source, compares them against the destination, and issues delete or correction operations for records present in the destination but absent from the source. This job is typically run on a slower schedule (daily or weekly) since it is more expensive than the incremental sync.
+    **2.** `LastModifiedDate` only changes when a record is updated — a deleted record disappears from SOQL results entirely and never appears in a `WHERE LastModifiedDate > :watermark` query. This means an incremental load based solely on `LastModifiedDate` will leave orphan rows in the destination indefinitely, creating data drift between Salesforce and the EHR system. The `reconcile.kjb` job in `etl-bde-pipeline` compensates by performing a full comparison: it fetches all IDs from the source, compares them against the destination, and issues delete or correction operations for records present in the destination but absent from the source. This job is typically run on a slower schedule (daily or weekly) since it is more expensive than the incremental sync.
 
     **3.** An idempotent pipeline produces the same final destination state regardless of how many times it is run with the same input data. In BigQuery, the `MERGE` statement (sometimes called an upsert) achieves this: it matches incoming rows against the destination table on a key column, updates existing rows if the key matches, and inserts new rows if the key does not exist. Running the same `MERGE` twice with identical source data results in the same destination state as running it once — no duplicates are created and no data is lost. This is the foundation of making pipelines safe to retry after partial failures.
 
@@ -509,13 +509,13 @@ Data Engineering & ETL Patterns
 
     **11.** Change Data Capture (CDC) is a pattern that captures every row-level change — INSERT, UPDATE, DELETE — from a source system, typically by reading the database transaction log, and produces an ordered stream of change events. Salesforce does not expose its transaction log directly, but its Streaming API with CDC subscriptions approximates it: you subscribe to change events for specific objects, and Salesforce pushes real-time events for creates, updates, deletes, and undeletes with the changed field values. Unlike timestamp polling, CDC events capture delete operations and provide field-level change details (which fields changed in an update), enabling more precise incremental loads and audit trails.
 
-    **12.** Idempotency prevents duplicates because the PDI `.ktr` files use `Insert/Update` steps that match on the Salesforce `Id` field. When the next run starts from the last committed watermark and re-processes the 7,000 successfully loaded records, the `Insert/Update` step finds matching `Id` values in the middleware queue table and issues `UPDATE` instead of `INSERT` — the records are refreshed in place but no new rows are created. The 3,000 unprocessed records are then newly inserted. The final state in Epic BDE reflects all 10,000 records correctly, regardless of the mid-run crash. This only holds if the watermark was not advanced past the crash point — if it was, those 7,000 records would be skipped on the next run.
+    **12.** Idempotency prevents duplicates because the PDI `.ktr` files use `Insert/Update` steps that match on the Salesforce `Id` field. When the next run starts from the last committed watermark and re-processes the 7,000 successfully loaded records, the `Insert/Update` step finds matching `Id` values in the middleware queue table and issues `UPDATE` instead of `INSERT` — the records are refreshed in place but no new rows are created. The 3,000 unprocessed records are then newly inserted. The final state in the EHR system BDE reflects all 10,000 records correctly, regardless of the mid-run crash. This only holds if the watermark was not advanced past the crash point — if it was, those 7,000 records would be skipped on the next run.
 
     **13.** Backpressure in PDI occurs when an upstream step produces rows faster than a downstream step can consume them. PDI connects steps via bounded in-memory row buffers (default 50,000 rows). When a buffer is full, the upstream step blocks (pauses) rather than allocating unbounded memory or dropping rows. This means a slow HTTP output step (posting to the middleware API) will naturally throttle the extraction step — the pipeline self-regulates its throughput to the slowest step without out-of-memory errors. You can observe this in PDI's step metrics, where blocked steps show paused row counts. Tuning the buffer size or parallelizing slow steps (increasing step copies) are the levers to improve throughput.
 
     **14.** `INSERT ... ON CONFLICT DO NOTHING` silently discards incoming rows when a key conflict exists — meaning updates to existing records in Salesforce are never reflected in the destination. This is correct behavior only if the destination is purely append-only and you never expect the source record to change. For Salesforce objects where records are regularly updated (Accounts, Contacts, Opportunities), you need `INSERT ... ON CONFLICT DO UPDATE SET ...` (upsert), which overwrites the existing row with the new values. Using `DO NOTHING` in an ETL destination effectively means your destination drifts from the source over time as records are updated in Salesforce but the destination retains the original values.
 
-    **15.** The reconcile pattern performs a full comparison between source and destination to detect and correct drift that incremental loads miss — primarily deleted records and records that may have been corrupted or missed due to pipeline failures. `reconcile.kjb` should be run on a schedule that balances freshness against cost: daily is appropriate for most production Salesforce→Epic sync use cases, as delete-driven drift accumulating over 24 hours is generally acceptable. Hourly reconcile runs are usually wasteful and may hit Salesforce API governor limits. Weekly is too infrequent for production data if any downstream process depends on delete accuracy. The reconcile job should also run on-demand after any incident or manual data correction.
+    **15.** The reconcile pattern performs a full comparison between source and destination to detect and correct drift that incremental loads miss — primarily deleted records and records that may have been corrupted or missed due to pipeline failures. `reconcile.kjb` should be run on a schedule that balances freshness against cost: daily is appropriate for most production Salesforce→EHR sync use cases, as delete-driven drift accumulating over 24 hours is generally acceptable. Hourly reconcile runs are usually wasteful and may hit Salesforce API governor limits. Weekly is too infrequent for production data if any downstream process depends on delete accuracy. The reconcile job should also run on-demand after any incident or manual data correction.
 
     **16.** A soft delete in Salesforce moves a record to the recycle bin — the record is gone from SOQL queries but recoverable for 15 days. Incremental ETL based on `LastModifiedDate` will not see soft-deleted records at all, leaving orphan rows in the destination. A hard delete (after the recycle bin is emptied) is permanent and also invisible to `LastModifiedDate` polling. Both types are detectable via Salesforce's `getDeleted()` REST API, which returns IDs of records deleted within a specified time window (up to 30 days). Your reconcile job can use `getDeleted()` to obtain the IDs of deleted records and issue corresponding deletes or tombstone updates in the destination, handling both soft and hard deletes correctly.
 

@@ -12,7 +12,7 @@ OAuth 2.0 and OpenID Connect (OIDC) are the foundational protocols behind nearly
 
 For a senior/staff engineer, protocol-level understanding matters because you'll inevitably hit edge cases that the SDK hides from you: a client that can't do PKCE, a resource server that needs to validate tokens without calling Auth0, a Salesforce connected app that uses a non-standard flow. When something breaks in production, you need to be able to read a raw HTTP exchange and diagnose it.
 
-Your AESF stack makes this immediately relevant. The middleware (`aesf-py-middleware`) exposes REST APIs that the ETL, Salesforce, and various internal tools consume. These callers need to authenticate. The middleware also calls Epic's BDE backend, which requires its own credentials. Understanding Client Credentials flow, token caching, and introspection lets you implement that authentication layer correctly — and audit the existing implementation for vulnerabilities.
+Your CRM-EHR Integration Platform stack makes this immediately relevant. The middleware (`crm-middleware`) exposes REST APIs that the ETL, Salesforce, and various internal tools consume. These callers need to authenticate. The middleware also calls the EHR system's BDE backend, which requires its own credentials. Understanding Client Credentials flow, token caching, and introspection lets you implement that authentication layer correctly — and audit the existing implementation for vulnerabilities.
 
 By the end of this week you'll be able to: implement every major OAuth 2.0 grant type from scratch in Python, distinguish ID tokens from access tokens with precision, explain PKCE's role and why Implicit flow was deprecated, validate JWTs locally in FastAPI, compare provider trade-offs with specifics, and identify common token storage mistakes in web and server contexts.
 
@@ -39,7 +39,7 @@ The core abstraction is the **authorization grant**: a credential representing t
 │  Server           →  (Auth0, Okta, Cognito)             │
 │                                                         │
 │  Resource Server  →  the API being protected            │
-│                      (aesf-py-middleware)               │
+│                      (crm-middleware)                   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -126,7 +126,7 @@ print(f"challenge={challenge[:20]}...")
 Used when there's no human involved. The client authenticates directly with the Authorization Server using its own credentials.
 
 ```
-Client (aesf-py-middleware) wants to call Epic BDE API:
+Client (crm-middleware) wants to call EHR BDE API:
 
   POST /oauth/token
   Content-Type: application/x-www-form-urlencoded
@@ -134,7 +134,7 @@ Client (aesf-py-middleware) wants to call Epic BDE API:
   grant_type=client_credentials
   &client_id=MIDDLEWARE_CLIENT_ID
   &client_secret=MIDDLEWARE_CLIENT_SECRET
-  &audience=https://api.epic-bde.internal
+  &audience=https://api.ehr-bde.internal
 
   Response:
   {
@@ -144,7 +144,7 @@ Client (aesf-py-middleware) wants to call Epic BDE API:
   }
 ```
 
-This is the flow for **your** AESF middleware calling downstream services. The key engineering challenge is **token caching**: you must not request a new token on every API call (that's one extra round-trip + rate limit risk). You should cache the token and refresh it only when it's near expiry.
+This is the flow for **your** integration platform middleware calling downstream services. The key engineering challenge is **token caching**: you must not request a new token on every API call (that's one extra round-trip + rate limit risk). You should cache the token and refresh it only when it's near expiry.
 
 ```python
 import time
@@ -209,7 +209,7 @@ Device:   polls POST /token with device_code every `interval` seconds
 Auth:     returns "authorization_pending" until user grants access, then returns tokens
 ```
 
-Relevant for AESF if you ever build a CLI tool for internal admin operations.
+Relevant for the integration platform if you ever build a CLI tool for internal admin operations.
 
 ### 2.4 Refresh Token Grant
 
@@ -339,7 +339,7 @@ You can add **custom claims** to tokens in Auth0 via Actions. In Auth0, custom c
 ```javascript
 // Auth0 Action (Node.js runtime)
 exports.onExecutePostLogin = async (event, api) => {
-  const namespace = 'https://api.aesf.internal/';
+  const namespace = 'https://api.crm-platform.internal/';
   api.accessToken.setCustomClaim(`${namespace}roles`, event.user.app_metadata.roles);
   api.accessToken.setCustomClaim(`${namespace}org_id`, event.user.app_metadata.org_id);
 };
@@ -360,7 +360,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
-    roles = payload.get("https://api.aesf.internal/roles", [])
+    roles = payload.get("https://api.crm-platform.internal/roles", [])
     return {"sub": payload["sub"], "roles": roles}
 ```
 
@@ -396,7 +396,7 @@ Response:
 | **Offline support** | Works; just need JWKS cached | Requires network to Auth Server |
 | **Use case** | Most APIs; tokens are short-lived | When revocation is critical (security events) |
 
-For AESF middleware, local JWT validation is usually correct — tokens expire in 1 hour, and the security window for a revoked token is acceptable. Use introspection only if you need immediate revocation (e.g., an admin-triggered session termination feature).
+For the integration platform middleware, local JWT validation is usually correct — tokens expire in 1 hour, and the security window for a revoked token is acceptable. Use introspection only if you need immediate revocation (e.g., an admin-triggered session termination feature).
 
 ```python
 import httpx
@@ -490,7 +490,7 @@ The modern recommended pattern for SPAs: store the **access token in memory** (a
 
 ### Server / API Context (Your Middleware)
 
-For the `aesf-py-middleware` calling downstream APIs:
+For the `crm-middleware` calling downstream APIs:
 - Store `client_id` in environment variables or Kubernetes Secrets
 - Store `client_secret` in **Vault** (already in your stack) — never in code or plain env vars
 - Keep the access token in memory (module-level cache) with expiry tracking — never write it to disk or logs
@@ -524,7 +524,7 @@ def log_token_event(event: str, token: str) -> None:
 | **SAML/SCIM** | Enterprise tier | Excellent — born in enterprise | Limited | Excellent |
 | **Multi-tenancy** | Organizations feature | Built-in | User Pools per tenant | Realms |
 | **Salesforce integration** | Connected App docs | Connected App docs | Manual | Manual |
-| **AESF fit** | **Current choice** — Auth0 | Good alternative | Viable if AWS-only | Good if you need self-hosted |
+| **Platform fit** | **Current choice** — Auth0 | Good alternative | Viable if AWS-only | Good if you need self-hosted |
 
 **Keycloak** is the right choice if you have compliance requirements that prohibit SaaS token issuance (e.g., tokens can never leave your data center). It's Java-based and runs on Kubernetes — fully compatible with your GCP/K8s stack.
 
@@ -684,7 +684,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **1.** OAuth 2.0 is described as an *authorization* framework, not an *authentication* protocol. What specific thing does it authorize, and what question does it *not* answer?
 
-**2.** What are the four roles defined in OAuth 2.0 RFC 6749? Give an example of each from the AESF stack.
+**2.** What are the four roles defined in OAuth 2.0 RFC 6749? Give an example of each from the integration platform stack.
 
 **3.** In Authorization Code + PKCE, what is the `code_verifier`, what is the `code_challenge`, and why does PKCE exist?
 
@@ -692,9 +692,9 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **5.** Why was the Implicit grant deprecated in OAuth 2.1? What should you use instead?
 
-**6.** When would you use the Client Credentials grant in your AESF middleware? Describe a concrete example.
+**6.** When would you use the Client Credentials grant in your integration platform middleware? Describe a concrete example.
 
-**7.** What is the difference between an ID Token and an access token? Which one should you send in the `Authorization` header when calling `aesf-py-middleware`?
+**7.** What is the difference between an ID Token and an access token? Which one should you send in the `Authorization` header when calling `crm-middleware`?
 
 **8.** What HTTP endpoint does OIDC add to enable discovery of an Authorization Server's capabilities?
 
@@ -720,7 +720,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **19.** What does the `aud` claim in a JWT represent, and what happens in PyJWT if you call `jwt.decode()` with the wrong audience value?
 
-**20.** You're designing the auth layer for a new internal tool: a Python CLI that engineers run to trigger data migrations on `aesf-py-middleware`. The CLI has no browser. Which OAuth 2.0 flow would you use, and why?
+**20.** You're designing the auth layer for a new internal tool: a Python CLI that engineers run to trigger data migrations on `crm-middleware`. The CLI has no browser. Which OAuth 2.0 flow would you use, and why?
 
 ---
 
@@ -730,7 +730,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **1.** OAuth 2.0 authorizes a *client application* to access a *resource on behalf of a resource owner* (user). It answers "does this client have permission to access this resource?" It does *not* answer "who is this user?" — that's OIDC's job. You can complete an OAuth 2.0 flow and still not know the identity of the authorizing user.
 
-    **2.** Resource Owner: the human user or machine granting access (e.g., an AESF admin user authorizing Salesforce access). Client: the application requesting access (e.g., `aesf-py-middleware`, a Salesforce connected app). Authorization Server: issues tokens and authenticates the resource owner (e.g., Auth0 tenant). Resource Server: the protected API (e.g., `aesf-py-middleware`'s `/api/v2/` endpoints, or Epic BDE API).
+    **2.** Resource Owner: the human user or machine granting access (e.g., an integration platform admin user authorizing Salesforce access). Client: the application requesting access (e.g., `crm-middleware`, a Salesforce connected app). Authorization Server: issues tokens and authenticates the resource owner (e.g., Auth0 tenant). Resource Server: the protected API (e.g., `crm-middleware`'s `/api/v2/` endpoints, or the EHR system BDE API).
 
     **3.** The `code_verifier` is a cryptographically random string generated by the client before the authorization request. The `code_challenge` is `BASE64URL(SHA256(code_verifier))` and is sent to the authorization server. PKCE exists because public clients (SPAs, mobile apps) can't keep a `client_secret` confidential — if an attacker intercepts the authorization code, they can't exchange it without knowing the original `code_verifier`, which never left the client.
 
@@ -738,9 +738,9 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **5.** Implicit flow was deprecated because it returned tokens in the URL fragment, which appeared in browser history, server access logs, and `Referer` headers — all uncontrolled surfaces. There was also no mechanism to bind the token to the client (no `code_verifier`). The replacement is Authorization Code + PKCE, which keeps tokens out of the URL entirely and adds cryptographic client binding.
 
-    **6.** Client Credentials is appropriate for any service-to-service call with no human in the loop. Concrete AESF examples: (a) `aesf-py-middleware` authenticating to Epic BDE API — the middleware is a "machine" requesting access to Epic resources; (b) the ETL pipeline authenticating to the middleware's admin endpoints. In both cases, you present `client_id` + `client_secret` directly to the Auth Server and receive an access token, with no user redirect involved.
+    **6.** Client Credentials is appropriate for any service-to-service call with no human in the loop. Concrete integration platform examples: (a) `crm-middleware` authenticating to the EHR system BDE API — the middleware is a "machine" requesting access to EHR system resources; (b) the ETL pipeline authenticating to the middleware's admin endpoints. In both cases, you present `client_id` + `client_secret` directly to the Auth Server and receive an access token, with no user redirect involved.
 
-    **7.** An ID Token is a JWT issued by the Authorization Server to the *client* proving user identity — it's for the application to learn who logged in. An access token is a credential issued to the client to present to the *Resource Server* (your API) to prove authorization. You should send the **access token** in the `Authorization: Bearer` header when calling `aesf-py-middleware`. Sending an ID token to an API is wrong because the API isn't the intended audience of that token — it may have different validation requirements and it leaks user PII unnecessarily.
+    **7.** An ID Token is a JWT issued by the Authorization Server to the *client* proving user identity — it's for the application to learn who logged in. An access token is a credential issued to the client to present to the *Resource Server* (your API) to prove authorization. You should send the **access token** in the `Authorization: Bearer` header when calling `crm-middleware`. Sending an ID token to an API is wrong because the API isn't the intended audience of that token — it may have different validation requirements and it leaks user PII unnecessarily.
 
     **8.** OIDC providers expose `/.well-known/openid-configuration` (the Discovery Document). This JSON endpoint contains the `authorization_endpoint`, `token_endpoint`, `jwks_uri`, `userinfo_endpoint`, `introspection_endpoint`, and all supported scopes, claims, and algorithms. You should read this at startup rather than hardcoding individual URLs so your code survives provider endpoint changes.
 
@@ -758,12 +758,12 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **15.** **Scopes** are requested by the client during authorization — they're coarse-grained permissions indicating what access is needed (`read:policies`, `openid`, `offline_access`). The Authorization Server may grant all or a subset. **Claims** are the actual key-value pairs *inside* the resulting token: `sub`, `email`, `roles`, `org_id`. Scopes determine *which claims* appear in the token and *what the token allows the client to do* on the Resource Server.
 
-    **16.** OIDC and the Auth0 documentation require custom claims on access tokens to use a namespace (a URL you control, like `https://api.aesf.internal/`). Without a namespace, a claim like `"org_id"` could conflict with a future standard claim or another vendor's claim. Auth0 actually silently drops non-namespaced custom claims from access tokens — so the claim will simply not appear in the token, and any code reading `payload.get("org_id")` will get `None`. Always namespace custom claims.
+    **16.** OIDC and the Auth0 documentation require custom claims on access tokens to use a namespace (a URL you control, like `https://api.crm-platform.internal/`). Without a namespace, a claim like `"org_id"` could conflict with a future standard claim or another vendor's claim. Auth0 actually silently drops non-namespaced custom claims from access tokens — so the claim will simply not appear in the token, and any code reading `payload.get("org_id")` will get `None`. Always namespace custom claims.
 
     **17.** **Compliance/data residency:** Keycloak is self-hosted — tokens are issued and stored entirely within your infrastructure, satisfying regulations that prohibit sending authentication traffic to external SaaS providers. Auth0 tokens are issued from Okta's cloud infrastructure. **Operational overhead:** Auth0 requires zero infrastructure management; Keycloak requires you to run, scale, backup, and upgrade a Java application (typically on Kubernetes). For teams with strict on-premises requirements, Keycloak's operational burden is the trade-off they accept for compliance.
 
     **18.** The JWKS endpoint returns the *current* set of signing keys. Authorization Servers rotate signing keys periodically (key rotation) — old tokens signed with the previous key are still valid until they expire, but new tokens use the new key. If a `kid` in an incoming token isn't in your cached JWKS, it means your cache is stale (the key was rotated after you last fetched). The correct recovery is: clear the JWKS cache, re-fetch from the `jwks_uri`, and retry validation once. If the `kid` still doesn't exist after the retry, the token is genuinely invalid.
 
-    **19.** The `aud` (audience) claim specifies the intended recipient(s) of the token — typically the API's identifier (e.g., `"https://api.aesf.internal"`). When you call `jwt.decode()` in PyJWT with an `audience` parameter, it validates that the token's `aud` claim matches. If it doesn't match, PyJWT raises `jwt.InvalidAudienceError` — a subclass of `jwt.InvalidTokenError`. This is a critical validation: without it, a token issued for a different API (but signed by the same Auth Server) could be accepted by your API.
+    **19.** The `aud` (audience) claim specifies the intended recipient(s) of the token — typically the API's identifier (e.g., `"https://api.crm-platform.internal"`). When you call `jwt.decode()` in PyJWT with an `audience` parameter, it validates that the token's `aud` claim matches. If it doesn't match, PyJWT raises `jwt.InvalidAudienceError` — a subclass of `jwt.InvalidTokenError`. This is a critical validation: without it, a token issued for a different API (but signed by the same Auth Server) could be accepted by your API.
 
     **20.** Use the **Device Authorization Grant** (RFC 8628). The CLI has no embedded browser, so it can't redirect the user to a browser-hosted login page. With Device Authorization, the CLI displays a URL and a user code, the engineer opens that URL in their own browser and authenticates with Auth0, and the CLI polls the token endpoint until the user completes login. This is preferable to Client Credentials because it authenticates the *individual engineer* (audit trail per person) rather than issuing a shared service credential — important for an admin tool triggering data migrations.

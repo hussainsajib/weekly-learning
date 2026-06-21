@@ -10,7 +10,7 @@
 
 For the first six weeks of this plan you have studied how to talk to an LLM — how to authenticate, prompt, retrieve context, and call the Claude API. This week the framing shifts: instead of you driving the conversation, the model drives itself. An *agent* is an LLM embedded in a loop that can take actions, observe results, and decide what to do next. That sounds simple, but the implications are profound. The model is no longer a stateless function that returns text; it is a participant in a stateful, multi-step process that can read databases, call APIs, write files, and orchestrate other models.
 
-This matters directly to your AESF work. The middleware you maintain is essentially a deterministic agent built from human-authored if/else logic: receive a Salesforce trigger event, decide which Epic endpoints to hit, handle errors, retry. An AI agent could, in principle, take a natural-language task ("sync all Accounts created in the last hour that don't have a matching Epic client") and produce a correct Epic sync plan, execute it step by step, and report on anomalies — without you writing the orchestration code. Whether you build that or not, you need to understand the machinery so you can evaluate where agents genuinely help versus where they introduce failure modes that deterministic code avoids.
+This matters directly to your work on the integration platform. The middleware you maintain is essentially a deterministic agent built from human-authored if/else logic: receive a Salesforce trigger event, decide which EHR system endpoints to hit, handle errors, retry. An AI agent could, in principle, take a natural-language task ("sync all Accounts created in the last hour that don't have a matching EHR client") and produce a correct EHR sync plan, execute it step by step, and report on anomalies — without you writing the orchestration code. Whether you build that or not, you need to understand the machinery so you can evaluate where agents genuinely help versus where they introduce failure modes that deterministic code avoids.
 
 This week covers the four major pillars: (1) agentic reasoning patterns like ReAct and plan-and-execute, (2) the tool/function-calling mechanism that lets models take actions, (3) the Model Context Protocol (MCP), which standardizes how tools are exposed to agents, and (4) orchestration choices — LangChain, raw Anthropic SDK, and custom loops. You will end the week with a concrete mental model for when to use each pattern and hands-on Python code grounded in your actual stack.
 
@@ -72,27 +72,27 @@ This is the skeleton of every agent, regardless of framework. LangChain, LangGra
 
 ReAct is the most widely used agentic pattern. The model interleaves *thought* (chain-of-thought reasoning about what to do next) with *action* (tool calls). The original paper (Yao et al., 2022) showed this outperforms pure chain-of-thought on multi-step tasks because the model can ground its reasoning in real observations rather than hallucinating intermediate facts.
 
-**ReAct trace example for AESF:**
+**ReAct trace example for the integration platform:**
 
 ```
 Task: "Find all Salesforce Accounts that were updated in the last 24 hours
-       but do not have a corresponding Epic client. Return a summary."
+       but do not have a corresponding EHR client. Return a summary."
 
 Thought: I need to query Salesforce for recently updated Accounts. I'll use
          the query_salesforce tool with a SOQL query.
-Action: query_salesforce(soql="SELECT Id, Name, AESF__Epic_Client_Id__c
+Action: query_salesforce(soql="SELECT Id, Name, APP__EHR_Client_Id__c
         FROM Account WHERE LastModifiedDate = LAST_N_DAYS:1")
-Observation: [{id: "001...", name: "Acme Corp", epic_client_id: None}, ...]
+Observation: [{id: "001...", name: "Acme Corp", ehr_client_id: None}, ...]
 
-Thought: I have 14 accounts. I need to filter those where epic_client_id is
-         null. That's 3 accounts. I should verify against Epic directly.
-Action: query_epic_clients(client_ids=["001...", "002...", "003..."])
+Thought: I have 14 accounts. I need to filter those where ehr_client_id is
+         null. That's 3 accounts. I should verify against the EHR system directly.
+Action: query_ehr_clients(client_ids=["001...", "002...", "003..."])
 Observation: No clients found for those IDs.
 
 Thought: Confirmed — 3 accounts need sync. I'll format the summary.
 Action: (none — end_turn)
-Answer: "3 accounts require Epic sync: Acme Corp, Beta LLC, Gamma Inc.
-         None have a corresponding Epic client record."
+Answer: "3 accounts require EHR sync: Acme Corp, Beta LLC, Gamma Inc.
+         None have a corresponding EHR client record."
 ```
 
 With the Anthropic SDK, thoughts appear as `text` blocks before `tool_use` blocks in the assistant message content array. You do not need to do anything special to get ReAct-style reasoning — Claude does this naturally when given tools and a multi-step task. What you do need to do is pass the full message history including tool results so the model can observe and continue.
@@ -117,7 +117,7 @@ Phase 2 (Execute): Each step is executed, often by a separate "executor" model
 | User needs to approve before execution | Awkward | Natural: show plan, get approval |
 | Debugging failures | Hard: trace is long | Easier: which step failed? |
 
-For AESF, a plan-and-execute architecture makes sense for a "reconcile all Accounts in org" job: the planning step generates a list of batches; the execution step processes each batch independently, which can even run in parallel with `asyncio.gather`.
+For the integration platform, a plan-and-execute architecture makes sense for a "reconcile all Accounts in org" job: the planning step generates a list of batches; the execution step processes each batch independently, which can even run in parallel with `asyncio.gather`.
 
 ### Reflection and Self-Critique
 
@@ -136,7 +136,7 @@ for attempt in range(max_retries):
     # Otherwise loop with critique injected into next attempt
 ```
 
-Reflection is expensive (doubles or triples your LLM calls) but dramatically reduces hallucination on tasks where correctness is verifiable. In AESF terms: after an agent generates a sync plan, a reflection step could verify that every referenced field name actually exists in your Salesforce schema before any Epic API calls are made.
+Reflection is expensive (doubles or triples your LLM calls) but dramatically reduces hallucination on tasks where correctness is verifiable. In integration platform terms: after an agent generates a sync plan, a reflection step could verify that every referenced field name actually exists in your Salesforce schema before any EHR API calls are made.
 
 **Common mistake:** Running reflection in an unbounded loop. Always set a `max_retries` guard (typically 2-3). An agent stuck in a reflection loop is one of the most expensive bugs you can ship.
 
@@ -156,12 +156,12 @@ import json
 
 client = anthropic.Anthropic()
 
-# Define a tool that queries the AESF middleware
+# Define a tool that queries the crm-middleware
 tools = [
     {
         "name": "query_middleware_accounts",
         "description": (
-            "Query the AESF middleware API for Salesforce Account records. "
+            "Query the crm-middleware API for Salesforce Account records. "
             "Returns a list of accounts matching the given filters. "
             "Use this when you need to look up account data."
         ),
@@ -172,9 +172,9 @@ tools = [
                     "type": "string",
                     "description": "ISO 8601 datetime. Only return accounts updated after this time.",
                 },
-                "has_epic_client": {
+                "has_ehr_client": {
                     "type": "boolean",
-                    "description": "If false, return only accounts without an Epic client mapping.",
+                    "description": "If false, return only accounts without an EHR client mapping.",
                 },
                 "limit": {
                     "type": "integer",
@@ -186,9 +186,9 @@ tools = [
         },
     },
     {
-        "name": "trigger_epic_sync",
+        "name": "trigger_ehr_sync",
         "description": (
-            "Trigger an Epic sync for a specific Salesforce Account ID. "
+            "Trigger an EHR sync for a specific Salesforce Account ID. "
             "This calls the middleware /sync endpoint which queues the sync job."
         ),
         "input_schema": {
@@ -228,7 +228,7 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
             data = resp.json()
             return json.dumps(data, indent=2)
 
-        elif tool_name == "trigger_epic_sync":
+        elif tool_name == "trigger_ehr_sync":
             resp = await http.post(
                 f"/api/v2/accounts/{tool_input['account_id']}/sync",
                 json={"force": tool_input.get("force", False)},
@@ -291,7 +291,7 @@ async def run_agent(task: str) -> str:
 # Usage
 result = asyncio.run(run_agent(
     "Find all Salesforce Accounts updated in the last 24 hours "
-    "that don't have an Epic client. Trigger sync for each one."
+    "that don't have an EHR client. Trigger sync for each one."
 ))
 print(result)
 ```
@@ -306,7 +306,7 @@ print(result)
 
 ### The Problem MCP Solves
 
-Without MCP, every agent framework invents its own tool format. LangChain tools look different from Anthropic SDK tools, which look different from OpenAI function calling. If you build a tool — say, a tool that queries your AESF middleware — you have to rewrite it for each framework. This is the connector problem: N frameworks × M tools = N×M integrations.
+Without MCP, every agent framework invents its own tool format. LangChain tools look different from Anthropic SDK tools, which look different from OpenAI function calling. If you build a tool — say, a tool that queries your crm-middleware — you have to rewrite it for each framework. This is the connector problem: N frameworks × M tools = N×M integrations.
 
 MCP (Model Context Protocol) is an open protocol created by Anthropic in late 2024 that standardizes the interface between *hosts* (applications like Claude Code, Claude Desktop, or your custom agent) and *servers* (processes that expose tools, resources, and prompts).
 
@@ -332,18 +332,18 @@ MCP (Model Context Protocol) is an open protocol created by Anthropic in late 20
 
 **Three capability types:**
 
-| Capability | What it is | AESF Example |
+| Capability | What it is | Integration Platform Example |
 |-----------|------------|-------------|
-| **Tools** | Functions the model can call | `sync_account`, `query_epic_clients` |
-| **Resources** | Read-only data the model can read | AESF config, middleware OpenAPI spec |
+| **Tools** | Functions the model can call | `sync_account`, `query_ehr_clients` |
+| **Resources** | Read-only data the model can read | middleware config, crm-middleware OpenAPI spec |
 | **Prompts** | Reusable prompt templates | "Reconcile Accounts prompt" |
 
-### Writing an MCP Server for AESF Middleware
+### Writing an MCP Server for the crm-middleware
 
 The `mcp` Python package (from Anthropic) makes writing servers straightforward:
 
 ```python
-# aesf_mcp_server.py
+# crm_middleware_mcp_server.py
 import asyncio
 import json
 import httpx
@@ -352,7 +352,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # Initialize the MCP server
-app = Server("aesf-middleware")
+app = Server("crm-middleware")
 MIDDLEWARE_BASE = "http://localhost:8000"
 
 
@@ -363,9 +363,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="query_accounts",
             description=(
-                "Query AESF middleware for Salesforce Account records. "
+                "Query crm-middleware for Salesforce Account records. "
                 "Supports filtering by sync status, last modified date, "
-                "and Epic client mapping status."
+                "and EHR client mapping status."
             ),
             inputSchema={
                 "type": "object",
@@ -385,7 +385,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_sync_queue",
             description=(
-                "Return the current Epic sync queue — jobs waiting to be "
+                "Return the current EHR sync queue — jobs waiting to be "
                 "processed, currently running, and recently failed."
             ),
             inputSchema={
@@ -401,7 +401,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="trigger_account_sync",
             description=(
-                "Trigger an immediate Epic sync for a Salesforce Account. "
+                "Trigger an immediate EHR sync for a Salesforce Account. "
                 "Use this only when the user explicitly wants to start a sync."
             ),
             inputSchema={
@@ -480,9 +480,9 @@ Add to your project's `.claude/settings.json` or `~/.claude/settings.json`:
 ```json
 {
   "mcpServers": {
-    "aesf-middleware": {
+    "crm-middleware": {
       "command": "python",
-      "args": ["C:/Works/aesf-py-middleware/aesf_mcp_server.py"],
+      "args": ["C:/Works/crm-middleware/crm_middleware_mcp_server.py"],
       "env": {
         "MIDDLEWARE_BASE_URL": "http://localhost:8000"
       }
@@ -491,7 +491,7 @@ Add to your project's `.claude/settings.json` or `~/.claude/settings.json`:
 }
 ```
 
-After restarting Claude Code, you will see `aesf-middleware` in the MCP server list and can use its tools directly in conversation — the same tools your custom agents call, but now also available to Claude Code itself.
+After restarting Claude Code, you will see `crm-middleware` in the MCP server list and can use its tools directly in conversation — the same tools your custom agents call, but now also available to Claude Code itself.
 
 **Common mistake:** Returning errors as exceptions from `call_tool`. When an MCP tool throws an uncaught exception, the host often shows a generic error with no details. Always catch exceptions inside `call_tool` and return them as `TextContent` with a JSON error payload. This gives the model actionable information it can reason about.
 
@@ -507,14 +507,14 @@ Single-agent systems hit limits when:
 3. **Specialization** — different subtasks benefit from different system prompts, tool sets, or even different models.
 4. **Quality checks** — a second agent reviewing the first agent's output catches errors the first agent missed.
 
-**A practical AESF multi-agent example:**
+**A practical integration platform multi-agent example:**
 
 ```
 Orchestrator Agent
 ├── Planner (Claude Sonnet 4.5 — cheap, fast planning)
 │   └── Produces: list of Account batches to reconcile
 ├── Batch Workers (Claude Haiku 3.5 × N — fast, cheap execution)
-│   └── Each worker: query accounts, check Epic, flag mismatches
+│   └── Each worker: query accounts, check EHR system, flag mismatches
 └── Reviewer Agent (Claude Opus 4.5 — expensive, thorough)
     └── Validates batch worker outputs, produces final report
 ```
@@ -539,14 +539,14 @@ async def run_batch_worker(task: BatchTask) -> dict:
         model="claude-haiku-3-5",  # fast and cheap for batch work
         max_tokens=1024,
         system=(
-            "You are an AESF sync auditor. You check whether Salesforce accounts "
-            "have corresponding Epic client records. Be concise and factual."
+            "You are an integration platform sync auditor. You check whether Salesforce accounts "
+            "have corresponding EHR client records. Be concise and factual."
         ),
         tools=tools,  # query_middleware_accounts, etc.
         messages=[{
             "role": "user",
             "content": (
-                f"Check these account IDs for Epic sync status: {task.account_ids}. "
+                f"Check these account IDs for EHR sync status: {task.account_ids}. "
                 "Return a JSON object with keys: synced, missing, errors."
             ),
         }],
@@ -643,7 +643,7 @@ The orchestration question is where engineers waste the most time arguing. Here 
 Build your own thin abstraction over the raw SDK. This is the approach that scales best for production systems.
 
 ```python
-# aesf_agent/core.py — a minimal, production-grade agent runner
+# platform_agent/core.py — a minimal, production-grade agent runner
 from __future__ import annotations
 
 import asyncio
@@ -667,9 +667,9 @@ class AgentConfig:
 ToolHandler = Callable[[str, dict[str, Any]], Awaitable[str]]
 
 
-class AESFAgent:
+class PlatformAgent:
     """
-    Minimal agent runner for AESF operations.
+    Minimal agent runner for integration platform operations.
     Wraps the Anthropic SDK with production concerns:
     iteration limits, structured logging, error handling.
     """
@@ -747,7 +747,7 @@ This ~80-line class is the core of a production agent. It handles the loop, the 
 
 ## 7. Tool Design Principles
 
-Good tools make the difference between an agent that works and one that hallucinates its way to wrong answers. Here are the principles, with AESF-grounded examples.
+Good tools make the difference between an agent that works and one that hallucinates its way to wrong answers. Here are the principles, with integration platform-grounded examples.
 
 ### Principle 1: One Tool, One Purpose
 
@@ -759,19 +759,19 @@ A tool named `manage_salesforce` that can create, read, update, and delete is a 
 # BAD: Tool that overwrites without confirmation
 {
     "name": "sync_account",
-    "description": "Sync a Salesforce account to Epic.",
+    "description": "Sync a Salesforce account to the EHR system.",
     ...
 }
 
 # GOOD: Separate read-only and write tools
 {
     "name": "preview_account_sync",
-    "description": "Show what changes would be made if this account were synced to Epic. Does NOT make any changes.",
+    "description": "Show what changes would be made if this account were synced to the EHR system. Does NOT make any changes.",
     ...
 },
 {
     "name": "execute_account_sync",
-    "description": "Execute an Epic sync for this account. THIS MAKES REAL API CALLS to Epic. Only call this after previewing and confirming with the user.",
+    "description": "Execute an EHR sync for this account. THIS MAKES REAL API CALLS to the EHR system. Only call this after previewing and confirming with the user.",
     ...
 }
 ```
@@ -791,7 +791,7 @@ return json.dumps({
         {"id": "001...", "name": "Acme Corp", "sync_status": "synced"},
         {"id": "002...", "name": "Beta LLC", "sync_status": "synced"},
         {"id": "003...", "name": "Gamma Inc", "sync_status": "error",
-         "error": "Epic client ID mismatch"},
+         "error": "EHR client ID mismatch"},
     ]
 })
 ```
@@ -850,9 +850,9 @@ System prompts for agents are different from system prompts for chatbots. They n
 4. **Describe the tools** — even though tools have their own descriptions, the system prompt can explain the relationship between tools.
 
 ```python
-AESF_AGENT_SYSTEM_PROMPT = """
-You are an AESF Operations Agent — an AI assistant with access to the AESF middleware API.
-You help engineers investigate and resolve sync issues between Salesforce and Epic EHR.
+PLATFORM_AGENT_SYSTEM_PROMPT = """
+You are an Integration Platform Operations Agent — an AI assistant with access to the crm-middleware API.
+You help engineers investigate and resolve sync issues between Salesforce and the EHR system.
 
 CAPABILITIES:
 - Query Salesforce accounts, contacts, and opportunities via the middleware
@@ -943,7 +943,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **8.** What are the three capability types in MCP?
 
-**9.** Describe the difference between ReAct and plan-and-execute. When would you choose plan-and-execute for an AESF reconciliation job?
+**9.** Describe the difference between ReAct and plan-and-execute. When would you choose plan-and-execute for a reconciliation job on the integration platform?
 
 **10.** What is the "reflection" pattern in agents, and what is its main cost?
 
@@ -965,7 +965,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
 **19.** Your agent loop receives `stop_reason = "max_tokens"`. What does this mean and what should your code do?
 
-**20.** You are adding an AESF sync tool to Claude Code via MCP. List the three things you must define: the config entry location, the required fields in that entry, and how Claude Code picks up the change.
+**20.** You are adding an integration platform sync tool to Claude Code via MCP. List the three things you must define: the config entry location, the required fields in that entry, and how Claude Code picks up the change.
 
 ---
 
@@ -989,7 +989,7 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **8.** The three MCP capability types are: **Tools** (callable functions that can take actions and return results), **Resources** (read-only data sources the model can read, like documents or API schemas), and **Prompts** (reusable prompt templates that can be parameterized). Most MCP servers expose at least tools; resources and prompts are optional but powerful for giving the model ambient context.
 
-    **9.** ReAct decides the next step only after observing the result of the previous step — it is reactive and sequential. Plan-and-execute first generates a complete plan (a list of steps), then executes them, potentially in parallel. For an AESF reconciliation job covering hundreds of accounts, plan-and-execute is better because: the planner can divide accounts into independent batches, each batch can be executed concurrently with `asyncio.gather`, and if one batch fails, the others are unaffected. ReAct would process accounts sequentially and the failure of one step would interrupt all subsequent ones.
+    **9.** ReAct decides the next step only after observing the result of the previous step — it is reactive and sequential. Plan-and-execute first generates a complete plan (a list of steps), then executes them, potentially in parallel. For a reconciliation job covering hundreds of accounts on the integration platform, plan-and-execute is better because: the planner can divide accounts into independent batches, each batch can be executed concurrently with `asyncio.gather`, and if one batch fails, the others are unaffected. ReAct would process accounts sequentially and the failure of one step would interrupt all subsequent ones.
 
     **10.** The reflection pattern adds a self-critique step after each execution: a second LLM call evaluates whether the output is correct and complete before the agent proceeds or returns the result. Its main cost is that it doubles or triples the number of LLM API calls (and therefore cost and latency) for every task. It is most valuable when correctness is verifiable and errors are expensive — for example, verifying that generated field names exist in your schema before making API calls.
 
@@ -997,11 +997,11 @@ Test your understanding. Try to answer without looking back, then check the answ
 
     **12.** The most robust approach is to separate the read-only preview tool from the write execution tool at the tool level — not just in the system prompt. Name the write tool `execute_account_sync` with a description that explicitly says "THIS MAKES REAL CHANGES" and instructs the model to confirm with the user first. Also add a guard in the system prompt. The system prompt can be overridden by adversarial inputs; having two separate tools (one safe, one explicit) creates a structural barrier that is much harder to accidentally or maliciously bypass.
 
-    **13.** The two MCP transport types are **stdio** (the host spawns the server as a subprocess and communicates via stdin/stdout) and **SSE** (Server-Sent Events, where the server is a remote HTTP service). For local development tools — like an AESF middleware client running on your dev machine — `stdio` is appropriate because it requires no network configuration, runs with local credentials, and is automatically managed by the host process lifecycle.
+    **13.** The two MCP transport types are **stdio** (the host spawns the server as a subprocess and communicates via stdin/stdout) and **SSE** (Server-Sent Events, where the server is a remote HTTP service). For local development tools — like a crm-middleware client running on your dev machine — `stdio` is appropriate because it requires no network configuration, runs with local credentials, and is automatically managed by the host process lifecycle.
 
     **14.** Three signs a task should not be solved with an agent: (1) The task can be solved with a single well-prompted LLM call — adding a loop adds latency, cost, and failure modes for no benefit. (2) The steps are fully predetermined and the same every time — this is just a workflow; write it in Python with deterministic logic. (3) The user needs a guarantee of consistency or atomicity that a non-deterministic LLM loop cannot provide — for example, a financial transaction that must be exactly right, not "probably right."
 
-    **15.** Plan-and-execute with parallel batch workers. The planner agent divides 200 accounts into batches of ~20, then `asyncio.gather` dispatches all worker agents concurrently. Each worker independently checks its batch against Epic and returns a result. A reviewer agent synthesizes the results. This is far faster than a single ReAct agent processing accounts one at a time, and cheaper because batch workers can use smaller, faster models (Haiku vs. Opus).
+    **15.** Plan-and-execute with parallel batch workers. The planner agent divides 200 accounts into batches of ~20, then `asyncio.gather` dispatches all worker agents concurrently. Each worker independently checks its batch against the EHR system and returns a result. A reviewer agent synthesizes the results. This is far faster than a single ReAct agent processing accounts one at a time, and cheaper because batch workers can use smaller, faster models (Haiku vs. Opus).
 
     **16.** Without a `max_iterations` limit, an agent in a bad state — for example, one receiving error responses from a tool and retrying indefinitely — will loop forever. Each iteration costs tokens. A production agent without a guard can run up a large API bill before anyone notices. Beyond cost, an unbounded agent can hold a database connection or file handle open indefinitely, causing resource exhaustion. Always set `max_iterations` (typically 10-20) and treat hitting it as a hard error that triggers an alert.
 

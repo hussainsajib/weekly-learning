@@ -8,13 +8,13 @@
 
 ## Overview
 
-Python's concurrency model is often misunderstood because the language offers three distinct mechanisms — threading, multiprocessing, and asyncio — each targeting a different class of problem. Threading and multiprocessing have been in the standard library since the early 2000s, while asyncio arrived in Python 3.4 and has matured significantly through 3.13. Understanding which tool to reach for, and why, is a critical skill for any senior engineer working on I/O-bound services like the AESF FastAPI middleware.
+Python's concurrency model is often misunderstood because the language offers three distinct mechanisms — threading, multiprocessing, and asyncio — each targeting a different class of problem. Threading and multiprocessing have been in the standard library since the early 2000s, while asyncio arrived in Python 3.4 and has matured significantly through 3.13. Understanding which tool to reach for, and why, is a critical skill for any senior engineer working on I/O-bound services like the CRM-EHR Integration Platform FastAPI middleware.
 
-At the heart of asyncio lies the event loop: a single-threaded scheduler that multiplexes I/O operations without blocking the calling thread. When you write `await some_coroutine()`, you are not blocking — you are yielding control back to the event loop, which can then service other waiting tasks. This cooperative multitasking model is extremely efficient for services like AESF middleware that spend most of their time waiting on external systems: the Epic EHR API, PostgreSQL, and Salesforce. A single event loop thread can handle hundreds of concurrent HTTP connections with far less overhead than an equivalent thread pool.
+At the heart of asyncio lies the event loop: a single-threaded scheduler that multiplexes I/O operations without blocking the calling thread. When you write `await some_coroutine()`, you are not blocking — you are yielding control back to the event loop, which can then service other waiting tasks. This cooperative multitasking model is extremely efficient for services like crm-middleware that spend most of their time waiting on external systems: the EHR system API, PostgreSQL, and Salesforce. A single event loop thread can handle hundreds of concurrent HTTP connections with far less overhead than an equivalent thread pool.
 
-The danger in this model is that it is cooperative, not preemptive. If any coroutine performs a blocking operation — a synchronous database query, a CPU-heavy computation, even a blocking `time.sleep()` — the event loop freezes entirely. Every other in-flight request queues behind that one blocking call. This is exactly the failure mode seen in AESF middleware when synchronous SQLAlchemy sessions leak into async request handlers. Detecting and eliminating these blocking calls is one of the highest-leverage reliability improvements you can make to the service.
+The danger in this model is that it is cooperative, not preemptive. If any coroutine performs a blocking operation — a synchronous database query, a CPU-heavy computation, even a blocking `time.sleep()` — the event loop freezes entirely. Every other in-flight request queues behind that one blocking call. This is exactly the failure mode seen in crm-middleware when synchronous SQLAlchemy sessions leak into async request handlers. Detecting and eliminating these blocking calls is one of the highest-leverage reliability improvements you can make to the service.
 
-This week builds from the ground up: event loop internals, the coroutine/task/awaitable hierarchy, the relationship between asyncio and threads/processes, and practical FastAPI patterns for writing genuinely non-blocking endpoints. Every section includes a concrete AESF-relevant example because the gap between "understanding asyncio" and "correctly applying it in production" is where most bugs live.
+This week builds from the ground up: event loop internals, the coroutine/task/awaitable hierarchy, the relationship between asyncio and threads/processes, and practical FastAPI patterns for writing genuinely non-blocking endpoints. Every section includes a concrete integration-platform-relevant example because the gap between "understanding asyncio" and "correctly applying it in production" is where most bugs live.
 
 ---
 
@@ -58,8 +58,8 @@ A coroutine object is **lazy**: calling an `async def` function returns a corout
 import asyncio
 import httpx
 
-async def fetch_epic_client(client_id: str, http: httpx.AsyncClient) -> dict:
-    """Fetch a single client from Epic EHR API."""
+async def fetch_ehr_client(client_id: str, http: httpx.AsyncClient) -> dict:
+    """Fetch a single client from the EHR system API."""
     response = await http.get(
         f"/clients/{client_id}",
         timeout=10.0,
@@ -68,11 +68,11 @@ async def fetch_epic_client(client_id: str, http: httpx.AsyncClient) -> dict:
     return response.json()
 
 async def fetch_many_clients(client_ids: list[str]) -> list[dict]:
-    """Fetch multiple Epic clients concurrently using Tasks."""
-    async with httpx.AsyncClient(base_url="https://de21web/api/v1") as http:
+    """Fetch multiple EHR clients concurrently using Tasks."""
+    async with httpx.AsyncClient(base_url="https://ehr-server-prod/api/v1") as http:
         # create_task schedules all coroutines immediately — they run concurrently
         tasks = [
-            asyncio.create_task(fetch_epic_client(cid, http), name=f"epic-{cid}")
+            asyncio.create_task(fetch_ehr_client(cid, http), name=f"ehr-{cid}")
             for cid in client_ids
         ]
         # gather collects results in order, propagates first exception by default
@@ -85,10 +85,10 @@ async def fetch_many_clients(client_ids: list[str]) -> list[dict]:
 ```python
 async def fetch_many_clients_structured(client_ids: list[str]) -> list[dict]:
     results: list[dict] = []
-    async with httpx.AsyncClient(base_url="https://de21web/api/v1") as http:
+    async with httpx.AsyncClient(base_url="https://ehr-server-prod/api/v1") as http:
         async with asyncio.TaskGroup() as tg:
             tasks = [
-                tg.create_task(fetch_epic_client(cid, http))
+                tg.create_task(fetch_ehr_client(cid, http))
                 for cid in client_ids
             ]
         # TaskGroup exits only when all tasks are done or one raised
@@ -96,7 +96,7 @@ async def fetch_many_clients_structured(client_ids: list[str]) -> list[dict]:
     return results
 ```
 
-**Common mistake:** Awaiting a coroutine sequentially when concurrent execution is needed. `result = await coro_a(); result2 = await coro_b()` runs A then B in serial. Use `create_task` or `gather` to run them concurrently. In AESF, fetching Epic client data and policy data for the same account in serial doubles latency unnecessarily.
+**Common mistake:** Awaiting a coroutine sequentially when concurrent execution is needed. `result = await coro_a(); result2 = await coro_b()` runs A then B in serial. Use `create_task` or `gather` to run them concurrently. In the integration platform, fetching EHR client data and policy data for the same account in serial doubles latency unnecessarily.
 
 ---
 
@@ -118,16 +118,16 @@ import asyncio
 from concurrent.futures import ProcessPoolExecutor
 import json
 
-def parse_large_epic_payload(raw: bytes) -> dict:
+def parse_large_ehr_payload(raw: bytes) -> dict:
     """CPU-bound: deserialize and validate a large JSON payload. Runs in process pool."""
     data = json.loads(raw)
     # ... heavy validation logic ...
     return data
 
-async def handle_epic_webhook(raw_body: bytes) -> dict:
+async def handle_ehr_webhook(raw_body: bytes) -> dict:
     loop = asyncio.get_running_loop()
     with ProcessPoolExecutor(max_workers=2) as pool:
-        result = await loop.run_in_executor(pool, parse_large_epic_payload, raw_body)
+        result = await loop.run_in_executor(pool, parse_large_ehr_payload, raw_body)
     return result
 ```
 
@@ -149,7 +149,7 @@ _thread_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="sync-db")
 
 def sync_query(query: str, params: tuple) -> list[dict]:
     """Blocking DB call — must not run on the event loop thread."""
-    conn = psycopg2.connect("postgresql://localhost/aesf")
+    conn = psycopg2.connect("postgresql://localhost/appdb")
     cur = conn.cursor()
     cur.execute(query, params)
     return cur.fetchall()
@@ -165,7 +165,7 @@ async def async_wrapped_query(query: str, params: tuple) -> list[dict]:
     )
 ```
 
-Note: In AESF middleware you use SQLAlchemy async (`asyncpg` driver), so this pattern applies only when integrating legacy sync dependencies — for example, the Pentaho ETL monitoring sidecar or any sync Salesforce SDK calls. The key insight is that `run_in_executor` is the bridge between the synchronous and asynchronous worlds.
+Note: In crm-middleware you use SQLAlchemy async (`asyncpg` driver), so this pattern applies only when integrating legacy sync dependencies — for example, the Pentaho ETL monitoring sidecar or any sync Salesforce SDK calls. The key insight is that `run_in_executor` is the bridge between the synchronous and asynchronous worlds.
 
 **Common mistake:** Creating a new `ThreadPoolExecutor` on every request. Thread pool creation is expensive. Define the pool at module level (or as a dependency) and reuse it. FastAPI's `lifespan` context is the right place to create and shut down shared pools.
 
@@ -183,7 +183,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
 engine = create_async_engine(
-    "postgresql+asyncpg://user:pass@localhost/aesf",
+    "postgresql+asyncpg://user:pass@localhost/appdb",
     pool_size=20,
     max_overflow=10,
 )
@@ -257,7 +257,7 @@ async def get_client(
 @app.post("/legacy/sync-client")
 def sync_client_legacy(client_id: str) -> dict:
     # blocking code is fine here — FastAPI dispatched us off the event loop
-    return legacy_sync_epic_call(client_id)
+    return legacy_sync_ehr_call(client_id)
 
 # WRONG: async endpoint that blocks the event loop
 @app.get("/clients/{client_id}/bad")
@@ -272,18 +272,18 @@ For endpoints that must call both async and sync code, use `asyncio.to_thread()`
 ```python
 import asyncio
 
-@app.post("/sync-to-epic/{account_id}")
-async def sync_account_to_epic(account_id: str) -> dict:
+@app.post("/sync-to-ehr/{account_id}")
+async def sync_account_to_ehr(account_id: str) -> dict:
     # Fetch from DB asynchronously
     async with get_db_session() as db:
         account = await get_account(db, account_id)
 
-    # Call a legacy sync Epic SDK function in a thread
-    epic_response = await asyncio.to_thread(
-        legacy_epic_client.put_client,
-        account.to_epic_payload(),
+    # Call a legacy sync EHR SDK function in a thread
+    ehr_response = await asyncio.to_thread(
+        legacy_ehr_client.put_client,
+        account.to_ehr_payload(),
     )
-    return {"status": "synced", "epic_id": epic_response["id"]}
+    return {"status": "synced", "ehr_id": ehr_response["id"]}
 ```
 
 **Common mistake:** Marking an endpoint `async def` under the assumption it is "faster." If the body contains any blocking calls (sync ORM, `requests` library, `time.sleep`), the async decoration makes things *worse* — it blocks the loop rather than running in the thread pool that `def` would use.
@@ -292,7 +292,7 @@ async def sync_account_to_epic(account_id: str) -> dict:
 
 ## 7. Detecting Sync Code Blocking the Async Loop
 
-Blocking detection is an operational necessity for AESF middleware. A single misfired synchronous DB call during peak load can stall the entire service. There are four approaches, from lightest to most comprehensive.
+Blocking detection is an operational necessity for crm-middleware. A single misfired synchronous DB call during peak load can stall the entire service. There are four approaches, from lightest to most comprehensive.
 
 **Approach 1: `asyncio` debug mode**
 
@@ -411,24 +411,24 @@ async def upsert_sync_queue_batch(
 
 ---
 
-## 9. Async httpx — Concurrent Epic API Calls
+## 9. Async httpx — Concurrent EHR API Calls
 
-`httpx.AsyncClient` is the production-grade async HTTP client for AESF middleware. It supports connection pooling, retries via `httpx-retries` or a custom transport, and proper timeout configuration.
+`httpx.AsyncClient` is the production-grade async HTTP client for crm-middleware. It supports connection pooling, retries via `httpx-retries` or a custom transport, and proper timeout configuration.
 
 ```python
 import asyncio
 import httpx
 from typing import Any
 
-EPIC_BASE_URL = "https://de21web/api/v1"
-EPIC_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+EHR_BASE_URL = "https://ehr-server-prod/api/v1"
+EHR_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 
-async def make_epic_client() -> httpx.AsyncClient:
+async def make_ehr_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        base_url=EPIC_BASE_URL,
-        timeout=EPIC_TIMEOUT,
+        base_url=EHR_BASE_URL,
+        timeout=EHR_TIMEOUT,
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-        headers={"Authorization": f"Bearer {get_epic_token()}"},
+        headers={"Authorization": f"Bearer {get_ehr_token()}"},
     )
 
 async def sync_account_and_contacts(
@@ -455,13 +455,13 @@ async def sync_account_and_contacts(
     return {"account": account, "contacts": contacts}
 ```
 
-Rate limiting with a semaphore — Epic EHR enforces per-client rate limits. Use `asyncio.Semaphore` to cap concurrency:
+Rate limiting with a semaphore — the EHR system enforces per-client rate limits. Use `asyncio.Semaphore` to cap concurrency:
 
 ```python
-_epic_semaphore = asyncio.Semaphore(10)  # max 10 concurrent Epic requests
+_ehr_semaphore = asyncio.Semaphore(10)  # max 10 concurrent EHR requests
 
-async def rate_limited_epic_get(http: httpx.AsyncClient, path: str) -> dict:
-    async with _epic_semaphore:
+async def rate_limited_ehr_get(http: httpx.AsyncClient, path: str) -> dict:
+    async with _ehr_semaphore:
         response = await http.get(path)
         response.raise_for_status()
         return response.json()
@@ -480,7 +480,7 @@ import asyncio
 
 async def process_sync_batch(batch: list[str]) -> list[dict]:
     """
-    Process a batch of Epic sync operations.
+    Process a batch of EHR sync operations.
     If any single operation fails, all siblings are cancelled
     and the exception propagates immediately.
     """
@@ -494,7 +494,7 @@ async def process_sync_batch(batch: list[str]) -> list[dict]:
     except* httpx.HTTPStatusError as eg:
         # ExceptionGroup handling (Python 3.11+)
         for exc in eg.exceptions:
-            print(f"Epic API error: {exc.response.status_code}")
+            print(f"EHR API error: {exc.response.status_code}")
         raise
     return [t.result() for t in tasks]
 ```
@@ -548,8 +548,8 @@ Python Concurrency Model
 └── multiprocessing (CPU-bound, GIL-bypassing)
     └── ProcessPoolExecutor  (preferred)
 
-AESF Middleware Concurrency Patterns
-├── Epic API calls  →  httpx.AsyncClient + TaskGroup + Semaphore
+CRM-EHR Integration Platform Middleware Concurrency Patterns
+├── EHR API calls   →  httpx.AsyncClient + TaskGroup + Semaphore
 ├── DB reads        →  SQLAlchemy async + selectinload (no lazy load)
 ├── DB writes       →  batch upsert, avoid per-row refresh()
 ├── Legacy sync     →  asyncio.to_thread() or run_in_executor()
@@ -568,7 +568,7 @@ AESF Middleware Concurrency Patterns
 
 **3.** In Python 3.13, when should you use `asyncio.get_running_loop()` vs. `asyncio.get_event_loop()`?
 
-**4.** You have 50 account IDs and need to fetch each from the Epic API. Write the high-level structure of a concurrent fetch using `TaskGroup` and a `Semaphore`.
+**4.** You have 50 account IDs and need to fetch each from the EHR system API. Write the high-level structure of a concurrent fetch using `TaskGroup` and a `Semaphore`.
 
 **5.** What is `asyncio.gather(return_exceptions=True)` useful for, and what is the risk of `return_exceptions=False`?
 
@@ -584,13 +584,13 @@ AESF Middleware Concurrency Patterns
 
 **11.** What is the GIL, and why does it mean that `ThreadPoolExecutor` provides no speedup for CPU-bound Python code?
 
-**12.** Describe two production techniques for detecting event-loop blocking in an AESF FastAPI service.
+**12.** Describe two production techniques for detecting event-loop blocking in a FastAPI middleware service.
 
 **13.** What is `asyncio.to_thread()` and how does it differ from `loop.run_in_executor(None, fn)`?
 
 **14.** In the context of `httpx.AsyncClient`, why is it wrong to create the client at module-level without a lifespan hook?
 
-**15.** What is a `Semaphore` in asyncio, and give a concrete reason to use one when calling the Epic EHR API?
+**15.** What is a `Semaphore` in asyncio, and give a concrete reason to use one when calling the EHR system API?
 
 **16.** Explain `asyncio.shield()`: what it protects and what it does NOT protect.
 
@@ -614,11 +614,11 @@ AESF Middleware Concurrency Patterns
 
     **3.** `asyncio.get_running_loop()` is the correct call inside a coroutine or any code that knows it is running within an async context. It raises `RuntimeError` if no loop is running, making errors explicit. `asyncio.get_event_loop()` was the older, more permissive API that would create a new loop if none existed. In Python 3.10+ this creation behaviour is deprecated, and in 3.12+ it raises a warning in many cases. As a rule: use `get_running_loop()` inside coroutines, and `asyncio.run()` at the program entry point.
 
-    **4.** Wrap all task creation in an `async with asyncio.TaskGroup() as tg:` block. Before creating tasks, declare `sem = asyncio.Semaphore(10)`. Each task coroutine should begin with `async with sem:` before calling `http.get(...)`. This ensures at most 10 concurrent requests fly to Epic at any moment, while still issuing all 50 requests concurrently in batches constrained by the semaphore. TaskGroup ensures all 50 tasks complete (or one exception cancels the rest) before the block exits.
+    **4.** Wrap all task creation in an `async with asyncio.TaskGroup() as tg:` block. Before creating tasks, declare `sem = asyncio.Semaphore(10)`. Each task coroutine should begin with `async with sem:` before calling `http.get(...)`. This ensures at most 10 concurrent requests fly to the EHR system at any moment, while still issuing all 50 requests concurrently in batches constrained by the semaphore. TaskGroup ensures all 50 tasks complete (or one exception cancels the rest) before the block exits.
 
     **5.** `return_exceptions=True` causes `gather()` to collect exceptions as regular return values rather than propagating them, so all tasks run to completion regardless of individual failures. This is useful when you want partial results — for example, syncing 100 accounts and reporting which ones failed rather than aborting on the first failure. The risk of `return_exceptions=False` (the default) is that the first exception immediately propagates to the caller, but the other tasks continue running in the background with no handle to cancel them, potentially causing resource leaks or duplicate operations.
 
-    **6.** FastAPI (via `anyio`) detects plain `def` endpoints and runs them in a default thread pool so they do not block the event loop thread. This is useful for legacy code or third-party libraries that are inherently synchronous and cannot be easily converted — for example, a sync Salesforce SDK call or a legacy Epic client library. It is preferable to mark such endpoints as plain `def` rather than wrapping them in `async def` with ad hoc `run_in_executor` calls, because FastAPI's automatic dispatch is cleaner and less error-prone.
+    **6.** FastAPI (via `anyio`) detects plain `def` endpoints and runs them in a default thread pool so they do not block the event loop thread. This is useful for legacy code or third-party libraries that are inherently synchronous and cannot be easily converted — for example, a sync Salesforce SDK call or a legacy EHR client library. It is preferable to mark such endpoints as plain `def` rather than wrapping them in `async def` with ad hoc `run_in_executor` calls, because FastAPI's automatic dispatch is cleaner and less error-prone.
 
     **7.** `MissingGreenlet` is raised by SQLAlchemy async when ORM code tries to perform lazy-loading (implicitly issuing a SQL query to load a relationship) from outside a greenlet context — i.e., from pure asyncio code. SQLAlchemy async uses greenlets internally to bridge the sync ORM layer to async I/O. The fix is to eagerly load all relationships you intend to access using `selectinload()` or `joinedload()` in the original query, so no additional SQL is needed after the query returns.
 
@@ -636,13 +636,13 @@ AESF Middleware Concurrency Patterns
 
     **14.** An `httpx.AsyncClient` creates its internal connection pool and binds it to the event loop that was running when the client was created. In a testing environment where each test calls `asyncio.run()`, each run creates a new event loop, making any previously created client stale — connections in its pool reference the old loop. In production, if the ASGI lifespan has not started the loop yet, the module-level client is also misconfigured. The correct pattern is to create the client inside a FastAPI `lifespan` async context manager, where the event loop is already running and the client lifetime is tied to the application lifetime.
 
-    **15.** `asyncio.Semaphore(n)` is a counter-based lock: `async with sem:` decrements the counter (blocking if it reaches zero) and increments it on exit. It limits the number of concurrent coroutines that hold the semaphore at any time. For Epic EHR API calls, the Epic server enforces rate limits (e.g., 10 requests/second per client). Without a semaphore, 100 concurrent tasks could all make Epic API calls simultaneously, triggering HTTP 429 rate-limit errors. A `Semaphore(10)` ensures at most 10 calls are in-flight at once, naturally spreading load and avoiding rate limit breaches.
+    **15.** `asyncio.Semaphore(n)` is a counter-based lock: `async with sem:` decrements the counter (blocking if it reaches zero) and increments it on exit. It limits the number of concurrent coroutines that hold the semaphore at any time. For EHR system API calls, the EHR server enforces rate limits (e.g., 10 requests/second per client). Without a semaphore, 100 concurrent tasks could all make EHR API calls simultaneously, triggering HTTP 429 rate-limit errors. A `Semaphore(10)` ensures at most 10 calls are in-flight at once, naturally spreading load and avoiding rate limit breaches.
 
     **16.** `asyncio.shield(coro_or_future)` wraps the inner awaitable so that if the outer Task is cancelled, the cancellation is NOT forwarded to the inner awaitable — the inner continues running. However, `shield` does NOT protect the outer Task from cancellation: after the inner completes, `CancelledError` is still raised in the outer task at the `await asyncio.shield(...)` point. A common misuse is assuming `shield` makes an operation "uncancellable" — it only decouples the inner awaitable's cancellation from the outer task's, which is useful for cleanup operations (e.g., "cancel the request, but let the DB commit finish").
 
-    **17.** Arguments passed to a `ProcessPoolExecutor` worker function must be picklable, because they are serialized and sent to the child process via `multiprocessing`'s IPC mechanism. This means: built-in types (int, str, list, dict), most dataclasses and plain objects, and numpy arrays all work. Things that do NOT pickle include lambda functions, closures that capture non-picklable state, database connections, file handles, asyncio event loops, and `httpx` clients. For AESF use cases, pass raw data (dicts, bytes, strings) to process pool workers, not ORM objects or network clients.
+    **17.** Arguments passed to a `ProcessPoolExecutor` worker function must be picklable, because they are serialized and sent to the child process via `multiprocessing`'s IPC mechanism. This means: built-in types (int, str, list, dict), most dataclasses and plain objects, and numpy arrays all work. Things that do NOT pickle include lambda functions, closures that capture non-picklable state, database connections, file handles, asyncio event loops, and `httpx` clients. For integration platform use cases, pass raw data (dicts, bytes, strings) to process pool workers, not ORM objects or network clients.
 
-    **18.** `selectinload` issues a separate `SELECT ... WHERE id IN (...)` query to load the related collection after the parent query completes. It is efficient when loading many parents with many children because it avoids a cartesian product. `joinedload` adds a `JOIN` to the parent query and loads everything in one round-trip, which is more efficient when you have a small number of parents and you know each will have few children. For AESF, prefer `selectinload` for loading policies on an Account (potentially hundreds of policies) and `joinedload` for loading a single related object (e.g., an Account's primary branch).
+    **18.** `selectinload` issues a separate `SELECT ... WHERE id IN (...)` query to load the related collection after the parent query completes. It is efficient when loading many parents with many children because it avoids a cartesian product. `joinedload` adds a `JOIN` to the parent query and loads everything in one round-trip, which is more efficient when you have a small number of parents and you know each will have few children. For the integration platform, prefer `selectinload` for loading policies on an Account (potentially hundreds of policies) and `joinedload` for loading a single related object (e.g., an Account's primary branch).
 
     **19.** When any child task inside a `TaskGroup` raises an unhandled exception, the TaskGroup immediately cancels all remaining sibling tasks by calling `task.cancel()` on each. It then waits for all siblings to finish (either naturally or by handling their `CancelledError`). After all tasks are settled, the TaskGroup collects all exceptions (from the original failure and any tasks that also raised during cancellation) into an `ExceptionGroup` and raises it. The caller handles it with `except*` syntax. This guarantees no task is silently abandoned and no exception is silently swallowed.
 
@@ -657,7 +657,7 @@ AESF Middleware Concurrency Patterns
     async def lifespan(app: FastAPI):
         # Startup
         app.state.http_client = httpx.AsyncClient(
-            base_url="https://de21web/api/v1",
+            base_url="https://ehr-server-prod/api/v1",
             timeout=httpx.Timeout(30.0),
         )
         app.state.thread_pool = ThreadPoolExecutor(max_workers=10)

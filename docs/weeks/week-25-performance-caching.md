@@ -10,11 +10,11 @@
 
 Performance engineering is the discipline of making systems measurably faster, more resource-efficient, and more predictable under load — not merely *fast enough* by intuition. For a senior-to-staff engineer, the distinction is critical: you are expected to reason about performance from first principles, instrument real code, and propose architectural decisions (e.g., which cache pattern to apply, how to bound queue growth) rather than just applying folk wisdom. This week consolidates two tightly related areas — profiling and caching — because the correct sequence in practice is always: measure first, cache or optimize second.
 
-Latency and throughput are often confused or conflated. Latency is the elapsed time for a single operation (one API call, one database round-trip). Throughput is the number of operations completed per unit of time. They interact but are not inverses: you can have high throughput with high per-request latency (large batches), or low latency with low throughput (serial single-item processing). In the AESF middleware, the Epic API calls for policy type and structure combination lookups add latency to every inbound Salesforce webhook, while the sync queue throughput determines how quickly the backlog drains. Fixing latency in the hot path (via caching) and fixing throughput in the queue (via concurrency tuning and batching) are separate levers.
+Latency and throughput are often confused or conflated. Latency is the elapsed time for a single operation (one API call, one database round-trip). Throughput is the number of operations completed per unit of time. They interact but are not inverses: you can have high throughput with high per-request latency (large batches), or low latency with low throughput (serial single-item processing). In the integration platform middleware, the EHR system API calls for policy type and structure combination lookups add latency to every inbound Salesforce webhook, while the sync queue throughput determines how quickly the backlog drains. Fixing latency in the hot path (via caching) and fixing throughput in the queue (via concurrency tuning and batching) are separate levers.
 
 Python profiling has a layered ecosystem. `cProfile` is the standard-library deterministic profiler — low overhead, call-count accurate, good for identifying hot functions in unit or integration tests. `line_profiler` narrows to line-level granularity inside a specific function, which is essential once `cProfile` identifies a suspect. `py-spy` is a sampling profiler that attaches to a running process without modification, making it the right tool for production diagnosis or for profiling a long-running Gunicorn/Uvicorn worker. Each tool has a distinct role, and knowing when to reach for each is a staff-level skill.
 
-Caching patterns (cache-aside, write-through, write-behind) differ in who owns consistency and when writes propagate. Redis data structures go far beyond simple key/value: sorted sets, streams, and Lua scripts underpin many production patterns. Cache stampede — the thundering-herd event where a popular key expires and hundreds of concurrent requests slam the origin simultaneously — is especially dangerous during reconnect windows, exactly the scenario AESF faces when the Epic server becomes unavailable and then comes back online with a backlog of waiters.
+Caching patterns (cache-aside, write-through, write-behind) differ in who owns consistency and when writes propagate. Redis data structures go far beyond simple key/value: sorted sets, streams, and Lua scripts underpin many production patterns. Cache stampede — the thundering-herd event where a popular key expires and hundreds of concurrent requests slam the origin simultaneously — is especially dangerous during reconnect windows, exactly the scenario the integration platform faces when the EHR server becomes unavailable and then comes back online with a backlog of waiters.
 
 ---
 
@@ -24,15 +24,15 @@ A useful mental model: imagine a highway. **Latency** is the time one car takes 
 
 For API services, the key latency decomposition is:
 
-| Component | Typical share in AESF middleware | Optimization lever |
+| Component | Typical share in crm-middleware | Optimization lever |
 |---|---|---|
 | Network RTT (client → service) | 1–5 ms (GKE internal) | Topology, keep-alive |
 | Application logic (Python) | 2–20 ms | Profiling, async |
 | Database query (PostgreSQL) | 5–50 ms | Indexes, query rewrite |
-| Upstream API call (Epic) | 80–400 ms | **Caching** |
+| Upstream API call (EHR system) | 80–400 ms | **Caching** |
 | Serialization / validation | 1–10 ms | Pydantic v2, orjson |
 
-Epic API calls dominate. This is why caching policy type lookups and structure combinations is the highest-ROI optimization available.
+EHR system API calls dominate. This is why caching policy type lookups and structure combinations is the highest-ROI optimization available.
 
 **Little's Law** formalizes the throughput/latency/concurrency relationship:
 
@@ -40,9 +40,9 @@ Epic API calls dominate. This is why caching policy type lookups and structure c
 L = λ × W
 ```
 
-Where `L` is the average number of requests in the system, `λ` is the arrival rate (throughput), and `W` is the average time in system (latency). If the Epic reconnect event causes `W` to spike from 200 ms to 8 s, and arrival rate `λ` stays constant, the queue depth `L` grows 40×. This is why cache-warming on reconnect is an architectural concern, not just a performance nicety.
+Where `L` is the average number of requests in the system, `λ` is the arrival rate (throughput), and `W` is the average time in system (latency). If the EHR reconnect event causes `W` to spike from 200 ms to 8 s, and arrival rate `λ` stays constant, the queue depth `L` grows 40×. This is why cache-warming on reconnect is an architectural concern, not just a performance nicety.
 
-> **Common mistake:** Optimizing average latency while ignoring p99. A cache hit rate of 95% looks great, but the 5% misses that go to Epic at 400 ms will dominate your p99 and SLO breach events. Always measure tail latency.
+> **Common mistake:** Optimizing average latency while ignoring p99. A cache hit rate of 95% looks great, but the 5% misses that go to the EHR system at 400 ms will dominate your p99 and SLO breach events. Always measure tail latency.
 
 ---
 
@@ -85,7 +85,7 @@ Read the output columns carefully:
 | `cumtime` | Total time including callees — use this to find the expensive path |
 | `percall` | cumtime / ncalls |
 
-In AESF sync profiling, you will typically find that `httpx.Client.send` or `requests.Session.send` accounts for 70%+ of cumtime. That confirms the Epic API call is the bottleneck and caching is the right solution. If instead you see SQLAlchemy `execute` at the top, the bottleneck is the PostgreSQL queue table, which calls for index tuning or batch upserts.
+In integration platform sync profiling, you will typically find that `httpx.Client.send` or `requests.Session.send` accounts for 70%+ of cumtime. That confirms the EHR system API call is the bottleneck and caching is the right solution. If instead you see SQLAlchemy `execute` at the top, the bottleneck is the PostgreSQL queue table, which calls for index tuning or batch upserts.
 
 ```python
 # Save profile data for later inspection with snakeviz
@@ -104,9 +104,9 @@ Once `cProfile` identifies a hot function, `line_profiler` reveals *which lines*
 ```python
 # Decorate the suspect function
 from line_profiler import LineProfiler
-from app.services.epic_client import EpicClient
+from app.services.ehr_client import EhrClient
 
-def get_policy_types(client: EpicClient, account_id: str):
+def get_policy_types(client: EhrClient, account_id: str):
     # cProfile showed this function at 120ms average — diagnose it
     response = client.get(f"/clients/{account_id}/policies")      # line A
     policy_types = [p["policyType"] for p in response.json()]      # line B
@@ -142,17 +142,17 @@ py-spy top --pid 12345
 py-spy record -o sync_worker_flamegraph.svg --pid 12345 --duration 30
 
 # On GKE: exec into the pod first
-kubectl exec -it middleware-pod-xyz -n aesf -- bash
+kubectl exec -it middleware-pod-xyz -n crm-middleware -- bash
 # Then run py-spy inside the container (requires --cap-add SYS_PTRACE or privileged mode)
 py-spy top --pid $(pgrep -f uvicorn)
 ```
 
-The flame graph SVG shows call stacks as horizontal bars. Wide bars are where time is spent. In an AESF middleware worker, a healthy flame graph under cache-hit conditions will show a wide bar for Redis `GET` (~0.5 ms) and a narrow bar for Epic HTTP calls. During a cache miss storm (post-reconnect), the Epic HTTP bars will dominate.
+The flame graph SVG shows call stacks as horizontal bars. Wide bars are where time is spent. In a crm-middleware worker, a healthy flame graph under cache-hit conditions will show a wide bar for Redis `GET` (~0.5 ms) and a narrow bar for EHR system HTTP calls. During a cache miss storm (post-reconnect), the EHR system HTTP bars will dominate.
 
 For GKE deployments, add `SYS_PTRACE` capability to the pod security context:
 
 ```yaml
-# deployment-manifests/kubernetes/middleware/deployment.yaml (excerpt)
+# infra-manifests/kubernetes/middleware/deployment.yaml (excerpt)
 securityContext:
   capabilities:
     add:
@@ -174,27 +174,27 @@ The application checks the cache first. On a miss, it fetches from the origin, w
 ```python
 import redis.asyncio as aioredis
 import json
-from app.clients.epic_client import EpicClient
+from app.clients.ehr_client import EhrClient
 
 redis_client = aioredis.from_url("redis://memorystore:6379", decode_responses=True)
-epic_client = EpicClient()
+ehr_client = EhrClient()
 
-POLICY_TYPES_KEY = "aesf:ref:policy_types"
+POLICY_TYPES_KEY = "app:ref:policy_types"
 POLICY_TYPES_TTL = 3600  # 1 hour — reference data changes rarely
 
 async def get_policy_types() -> list[dict]:
-    """Cache-aside: check Redis, fall back to Epic API."""
+    """Cache-aside: check Redis, fall back to EHR system API."""
     cached = await redis_client.get(POLICY_TYPES_KEY)
     if cached:
         return json.loads(cached)
 
-    # Cache miss — fetch from Epic
-    data = await epic_client.get_policy_types()
+    # Cache miss — fetch from EHR system
+    data = await ehr_client.get_policy_types()
     await redis_client.setex(POLICY_TYPES_KEY, POLICY_TYPES_TTL, json.dumps(data))
     return data
 ```
 
-**Best for:** Read-heavy reference data that rarely changes (AESF policy types, structure combinations, activity codes). Tolerates stale reads within the TTL window.
+**Best for:** Read-heavy reference data that rarely changes (integration platform policy types, structure combinations, activity codes). Tolerates stale reads within the TTL window.
 
 ### Write-Through
 
@@ -207,7 +207,7 @@ async def update_structure_combination(combo_id: str, payload: dict) -> dict:
     updated = await db.update_structure_combination(combo_id, payload)
 
     # Immediately update cache
-    cache_key = f"aesf:ref:structure_combo:{combo_id}"
+    cache_key = f"app:ref:structure_combo:{combo_id}"
     await redis_client.setex(cache_key, 3600, json.dumps(updated))
     return updated
 ```
@@ -223,10 +223,10 @@ import asyncio
 
 async def enqueue_sync_status_update(item_id: str, status: str):
     """Write-behind: ack immediately, flush to DB asynchronously."""
-    cache_key = f"aesf:sync:status:{item_id}"
+    cache_key = f"app:sync:status:{item_id}"
     await redis_client.setex(cache_key, 300, status)
     # Push to a Redis list that a background worker drains to PostgreSQL
-    await redis_client.lpush("aesf:sync:status_flush_queue", f"{item_id}:{status}")
+    await redis_client.lpush("app:sync:status_flush_queue", f"{item_id}:{status}")
 ```
 
 **Best for:** High-frequency status updates or metrics where losing a few seconds of data is acceptable (e.g., sync item processing state that can be reconstructed from the queue if needed).
@@ -241,7 +241,7 @@ async def enqueue_sync_status_update(item_id: str, status: str):
 
 ---
 
-## 6. Redis Data Structures and AESF Use Cases
+## 6. Redis Data Structures and Integration Platform Use Cases
 
 Redis is not a key/value store — it is a data structure server. Choosing the right structure eliminates application-side complexity and reduces round-trips.
 
@@ -249,7 +249,7 @@ Redis is not a key/value store — it is a data structure server. Choosing the r
 Simple cache values. Use for serialized JSON blobs (policy type lists, structure combinations).
 
 ```python
-await redis_client.setex("aesf:ref:policy_types", 3600, json.dumps(data))
+await redis_client.setex("app:ref:policy_types", 3600, json.dumps(data))
 ```
 
 ### Hashes
@@ -257,12 +257,12 @@ Field-level access without deserializing the entire blob. Use for per-account co
 
 ```python
 # Store sync state fields individually — update one field without touching others
-await redis_client.hset("aesf:sync:state:ACC-001", mapping={
+await redis_client.hset("app:sync:state:ACC-001", mapping={
     "last_synced_at": "2026-11-23T10:00:00Z",
     "status": "completed",
     "retry_count": "0",
 })
-status = await redis_client.hget("aesf:sync:state:ACC-001", "status")
+status = await redis_client.hget("app:sync:state:ACC-001", "status")
 ```
 
 ### Sorted Sets
@@ -274,11 +274,11 @@ import time
 # Priority sync queue: lower score = higher priority; use timestamp as score
 async def enqueue_sync_item(account_id: str, priority: int = 0):
     score = time.time() - (priority * 1000)  # higher priority = lower score
-    await redis_client.zadd("aesf:sync:queue", {account_id: score})
+    await redis_client.zadd("app:sync:queue", {account_id: score})
 
 async def dequeue_sync_item() -> str | None:
     # Atomically pop the lowest-score (highest-priority) item
-    result = await redis_client.zpopmin("aesf:sync:queue", count=1)
+    result = await redis_client.zpopmin("app:sync:queue", count=1)
     return result[0][0] if result else None
 ```
 
@@ -290,11 +290,11 @@ Membership testing. Use for deduplication: "which accounts are already in the sy
 
 ```python
 async def is_already_queued(account_id: str) -> bool:
-    return await redis_client.sismember("aesf:sync:queued_accounts", account_id)
+    return await redis_client.sismember("app:sync:queued_accounts", account_id)
 ```
 
 ### Pub/Sub and Streams
-Redis Streams (`XADD`/`XREAD`) provide durable, consumer-group-aware event delivery. Relevant if AESF moves toward an event-driven sync architecture (each Epic change event published to a stream, multiple worker groups consuming).
+Redis Streams (`XADD`/`XREAD`) provide durable, consumer-group-aware event delivery. Relevant if the integration platform moves toward an event-driven sync architecture (each EHR change event published to a stream, multiple worker groups consuming).
 
 > **Common mistake:** Storing large Salesforce account blobs (10–50 KB) in Redis Strings and caching thousands of them. Redis is an in-memory store — every cached object costs RAM. Cache only reference data and hot lookup keys, not full account records.
 
@@ -324,7 +324,7 @@ def local_cached(cache: TTLCache):
 
 @local_cached(_policy_types_cache)
 async def get_policy_types_local() -> list[dict]:
-    return await epic_client.get_policy_types()
+    return await ehr_client.get_policy_types()
 ```
 
 | Dimension | Local cache | Distributed (Redis) |
@@ -335,7 +335,7 @@ async def get_policy_types_local() -> list[dict]:
 | Cache invalidation | Per-pod; must invalidate all | Single invalidation |
 | Memory limit | JVM/process heap | Dedicated Redis instance |
 
-**AESF decision rule:** Use local cache only for immutable or near-immutable config (e.g., Epic server URL, feature flags fetched at startup). Use Redis for any data shared across middleware pods, especially sync state and reference data, where a cache invalidation from one pod must be visible to all others.
+**Integration platform decision rule:** Use local cache only for immutable or near-immutable config (e.g., EHR server URL, feature flags fetched at startup). Use Redis for any data shared across middleware pods, especially sync state and reference data, where a cache invalidation from one pod must be visible to all others.
 
 > **Common mistake:** Using a local TTLCache for session tokens or sync state in a multi-replica GKE deployment. Pod A's cache becomes stale while Pod B updates the state in PostgreSQL, leading to phantom "already synced" decisions.
 
@@ -345,7 +345,7 @@ async def get_policy_types_local() -> list[dict]:
 
 Cache stampede (thundering herd) occurs when a popular cached key expires simultaneously for many concurrent requests. All of them find a cache miss and fire requests to the origin at the same instant, overloading it.
 
-**AESF risk scenario:** The Epic server goes down for 5 minutes during a maintenance window. All policy type and structure combination cache entries (TTL = 1 hour) happen to expire while Epic is down — or were never populated because the outage started before the first request. When Epic comes back online, every waiting middleware pod fires a GET to Epic concurrently for the same reference data. Epic's rate limiter throttles them; some requests time out; the sync backlog explodes.
+**Integration platform risk scenario:** The EHR server goes down for 5 minutes during a maintenance window. All policy type and structure combination cache entries (TTL = 1 hour) happen to expire while the EHR system is down — or were never populated because the outage started before the first request. When the EHR system comes back online, every waiting middleware pod fires a GET to the EHR system concurrently for the same reference data. The EHR system's rate limiter throttles them; some requests time out; the sync backlog explodes.
 
 ### Prevention Strategy 1: Probabilistic Early Expiration (PER / XFetch)
 
@@ -403,37 +403,37 @@ async def get_policy_types_with_lock() -> list[dict]:
         return json.loads(cached)
 
     # Acquire a distributed lock — only one pod recomputes
-    lock = redis_client.lock("aesf:lock:policy_types_refresh", timeout=10)
+    lock = redis_client.lock("app:lock:policy_types_refresh", timeout=10)
     async with lock:
         # Double-check after acquiring lock (another pod may have populated it)
         cached = await redis_client.get(POLICY_TYPES_KEY)
         if cached:
             return json.loads(cached)
 
-        data = await epic_client.get_policy_types()
+        data = await ehr_client.get_policy_types()
         await redis_client.setex(POLICY_TYPES_KEY, POLICY_TYPES_TTL, json.dumps(data))
         return data
 ```
 
 ### Prevention Strategy 3: Cache Warming on Reconnect
 
-Proactively warm the cache when Epic becomes available again, before the backlog of requests hits.
+Proactively warm the cache when the EHR system becomes available again, before the backlog of requests hits.
 
 ```python
-from app.events import epic_reconnected_event
+from app.events import ehr_reconnected_event
 
-async def on_epic_reconnect():
-    """Warm reference data cache immediately after Epic reconnect."""
+async def on_ehr_reconnect():
+    """Warm reference data cache immediately after EHR system reconnect."""
     keys_to_warm = [
-        ("aesf:ref:policy_types", epic_client.get_policy_types),
-        ("aesf:ref:activity_codes", epic_client.get_activity_codes),
-        ("aesf:ref:structure_combinations", epic_client.get_structure_combinations),
+        ("app:ref:policy_types", ehr_client.get_policy_types),
+        ("app:ref:activity_codes", ehr_client.get_activity_codes),
+        ("app:ref:structure_combinations", ehr_client.get_structure_combinations),
     ]
     for cache_key, fetch_fn in keys_to_warm:
         data = await fetch_fn()
         await redis_client.setex(cache_key, POLICY_TYPES_TTL, json.dumps(data))
 
-epic_reconnected_event.subscribe(on_epic_reconnect)
+ehr_reconnected_event.subscribe(on_ehr_reconnect)
 ```
 
 > **Common mistake:** Setting all reference data keys to the same TTL. They will all expire at roughly the same time (especially if the service restarts and populates them all in a burst). Add jitter: `ttl = base_ttl + random.randint(0, 300)`.
@@ -445,13 +445,13 @@ epic_reconnected_event.subscribe(on_epic_reconnect)
 Locust is a Python-native load testing framework. Tests are written as Python classes, making them composable, version-controlled, and easy to integrate into CI.
 
 ```python
-# locustfile.py — load test AESF middleware endpoints
+# locustfile.py — load test crm-middleware endpoints
 from locust import HttpUser, task, between, events
 import random
 
 ACCOUNT_IDS = [f"ACC-{i:04d}" for i in range(1, 201)]
 
-class AESFMiddlewareUser(HttpUser):
+class CRMMiddlewareUser(HttpUser):
     """Simulates Salesforce webhook traffic hitting middleware."""
     wait_time = between(0.1, 0.5)  # think time between requests
 
@@ -499,7 +499,7 @@ class AESFMiddlewareUser(HttpUser):
 
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
-    print("Load test started — AESF middleware")
+    print("Load test started — crm-middleware")
 
 @events.test_stop.add_listener
 def on_test_stop(environment, **kwargs):
@@ -511,7 +511,7 @@ Run the load test:
 ```bash
 # Headless mode — 50 concurrent users, ramp up over 10 seconds, run for 60 seconds
 locust -f locustfile.py \
-  --host=https://middleware-staging.aesf.internal \
+  --host=https://middleware-staging.internal \
   --headless \
   --users 50 \
   --spawn-rate 5 \
@@ -519,26 +519,26 @@ locust -f locustfile.py \
   --html load_test_report.html
 
 # Interactive web UI (useful for exploratory testing)
-locust -f locustfile.py --host=https://middleware-staging.aesf.internal
+locust -f locustfile.py --host=https://middleware-staging.internal
 # Open http://localhost:8089
 ```
 
-**Interpreting results for AESF:**
+**Interpreting results for the integration platform:**
 
 | Metric | Target | Red flag |
 |---|---|---|
 | `GET /reference/policy-types` p50 | < 5 ms (cache hit) | > 50 ms = cache miss rate too high |
 | `GET /reference/policy-types` p99 | < 20 ms | > 200 ms = stampede occurring |
 | `POST /accounts/:id/sync` p50 | < 50 ms | > 500 ms = queue table contention |
-| Error rate | < 0.1% | > 1% = circuit breaker or Epic throttle |
+| Error rate | < 0.1% | > 1% = circuit breaker or EHR system throttle |
 
-> **Common mistake:** Running locust against production endpoints without rate limiting the test itself. In AESF, the sync POST creates real queue items. Always use a dedicated load-test environment or add a `X-Load-Test: true` header that the middleware uses to skip actual Epic calls.
+> **Common mistake:** Running locust against production endpoints without rate limiting the test itself. In the integration platform, the sync POST creates real queue items. Always use a dedicated load-test environment or add a `X-Load-Test: true` header that the middleware uses to skip actual EHR system calls.
 
 ---
 
-## 10. Putting It Together: AESF Performance Playbook
+## 10. Putting It Together: Integration Platform Performance Playbook
 
-A practical checklist for diagnosing and fixing a slow AESF middleware deployment:
+A practical checklist for diagnosing and fixing a slow crm-middleware deployment:
 
 **Step 1 — Measure tail latency first**
 ```bash
@@ -555,12 +555,12 @@ python -c "import pstats; p=pstats.Stats('baseline.prof'); p.sort_stats('cumtime
 
 **Step 3 — Attach py-spy to a production pod if cProfile is inconclusive**
 ```bash
-kubectl exec -it $(kubectl get pod -l app=aesf-middleware -o name | head -1) -- \
+kubectl exec -it $(kubectl get pod -l app=crm-middleware -o name | head -1) -- \
   py-spy record -o /tmp/flamegraph.svg --pid $(pgrep -f uvicorn) --duration 30
 kubectl cp <pod>:/tmp/flamegraph.svg ./flamegraph.svg
 ```
 
-**Step 4 — Cache Epic reference data in Redis with jitter**
+**Step 4 — Cache EHR system reference data in Redis with jitter**
 ```python
 TTL_BASE = 3600
 TTL_JITTER = random.randint(0, 300)
@@ -570,8 +570,8 @@ await redis_client.setex(key, TTL_BASE + TTL_JITTER, json.dumps(data))
 **Step 5 — Add distributed lock on cache population**
 Use the mutex pattern from Section 8 for any key that multiple pods might populate simultaneously.
 
-**Step 6 — Warm cache on Epic reconnect**
-Implement the `on_epic_reconnect` hook from Section 8. Register it with your circuit breaker's `on_close` callback.
+**Step 6 — Warm cache on EHR system reconnect**
+Implement the `on_ehr_reconnect` hook from Section 8. Register it with your circuit breaker's `on_close` callback.
 
 **Step 7 — Validate with locust at target concurrency**
 Re-run the load test and confirm p99 for reference endpoints is < 20 ms and error rate is < 0.1%.
@@ -625,9 +625,9 @@ Performance Engineering & Caching
 
 ### Questions
 
-**1.** What is the difference between latency and throughput? Give an example from AESF where optimizing one does not automatically improve the other.
+**1.** What is the difference between latency and throughput? Give an example from the integration platform where optimizing one does not automatically improve the other.
 
-**2.** What does Little's Law (`L = λ × W`) predict happens to the AESF sync queue depth if Epic API latency increases from 200 ms to 2 s while arrival rate stays constant?
+**2.** What does Little's Law (`L = λ × W`) predict happens to the integration platform sync queue depth if EHR system API latency increases from 200 ms to 2 s while arrival rate stays constant?
 
 **3.** You run `cProfile` on `process_sync_batch` and see that `requests.Session.send` has `cumtime = 18.4s` out of `20.1s` total. What does this tell you, and what is your next action?
 
@@ -637,17 +637,17 @@ Performance Engineering & Caching
 
 **6.** What is a sampling profiler, and why is `py-spy` safer to use in production than `cProfile`?
 
-**7.** Explain the cache-aside pattern. In which scenario does it perform worst, and what is the AESF-specific example of this worst case?
+**7.** Explain the cache-aside pattern. In which scenario does it perform worst, and what is the integration platform-specific example of this worst case?
 
 **8.** What is the main trade-off of write-through caching compared to cache-aside?
 
-**9.** Describe a scenario where write-behind caching could cause data loss in AESF. What Redis configuration mitigates this risk?
+**9.** Describe a scenario where write-behind caching could cause data loss in the integration platform. What Redis configuration mitigates this risk?
 
-**10.** You have 5 GKE pods running AESF middleware. A sync state update is written by Pod A. Why would a local (in-process) cache on Pod B be a problem?
+**10.** You have 5 GKE pods running the integration platform middleware. A sync state update is written by Pod A. Why would a local (in-process) cache on Pod B be a problem?
 
 **11.** What Redis data structure would you use to implement a priority-ordered sync queue where higher-priority accounts are dequeued first? Name the relevant commands.
 
-**12.** What is cache stampede and why is it a specific risk during Epic reconnect events in AESF?
+**12.** What is cache stampede and why is it a specific risk during EHR system reconnect events in the integration platform?
 
 **13.** Explain the XFetch (Probabilistic Early Revalidation) algorithm. How does the `beta` parameter affect stampede risk?
 
@@ -655,11 +655,11 @@ Performance Engineering & Caching
 
 **15.** Why should you add TTL jitter when populating multiple reference data keys in Redis? What problem does it prevent?
 
-**16.** In a locust test, the `POST /accounts/:id/sync` endpoint shows p99 = 800 ms under 50 users. What are the two most likely causes in the AESF context, and how would you distinguish between them?
+**16.** In a locust test, the `POST /accounts/:id/sync` endpoint shows p99 = 800 ms under 50 users. What are the two most likely causes in the integration platform context, and how would you distinguish between them?
 
 **17.** What is the `wait_time = between(0.1, 0.5)` parameter in Locust and what real-world behavior does it model?
 
-**18.** Why is it dangerous to run a locust load test against AESF staging using the `POST /accounts/:id/sync` endpoint without precautions?
+**18.** Why is it dangerous to run a locust load test against integration platform staging using the `POST /accounts/:id/sync` endpoint without precautions?
 
 **19.** You notice that `GET /reference/policy-types` has p50 = 3 ms but p99 = 450 ms under load. What is the most likely explanation, and which stampede-prevention technique addresses it?
 
@@ -671,11 +671,11 @@ Performance Engineering & Caching
 
 ??? note "Reveal Answers"
 
-    **1.** Latency is the elapsed time for a single operation; throughput is the number of operations completed per second. In AESF, caching Epic API responses reduces the latency of a single reference lookup from ~300 ms to ~1 ms. However, if the sync worker is single-threaded and processes items serially, throughput (items/sec) is bounded by concurrency — reducing per-item latency helps, but adding async concurrency is the throughput lever. These are orthogonal improvements.
+    **1.** Latency is the elapsed time for a single operation; throughput is the number of operations completed per second. In the integration platform, caching EHR system API responses reduces the latency of a single reference lookup from ~300 ms to ~1 ms. However, if the sync worker is single-threaded and processes items serially, throughput (items/sec) is bounded by concurrency — reducing per-item latency helps, but adding async concurrency is the throughput lever. These are orthogonal improvements.
 
-    **2.** Little's Law states `L = λ × W`. If `W` (average time in system, proportional to Epic latency) grows 10×, queue depth `L` grows 10× at the same arrival rate `λ`. If the queue has a fixed capacity or a downstream consumer with bounded concurrency, items begin to back up and eventually time out. This is why cache-warming on reconnect is critical: it prevents the 10× latency spike from translating into a 10× queue spike.
+    **2.** Little's Law states `L = λ × W`. If `W` (average time in system, proportional to EHR system latency) grows 10×, queue depth `L` grows 10× at the same arrival rate `λ`. If the queue has a fixed capacity or a downstream consumer with bounded concurrency, items begin to back up and eventually time out. This is why cache-warming on reconnect is critical: it prevents the 10× latency spike from translating into a 10× queue spike.
 
-    **3.** This tells you that 91.5% of all processing time is spent in HTTP I/O calling the Epic API, not in Python computation. The bottleneck is not algorithm efficiency — it is network round-trips. The correct next action is to implement caching (cache-aside with Redis) for any Epic API call that returns stable reference data, so that repeated calls within the TTL window are served from Redis at ~1 ms instead of 300+ ms.
+    **3.** This tells you that 91.5% of all processing time is spent in HTTP I/O calling the EHR system API, not in Python computation. The bottleneck is not algorithm efficiency — it is network round-trips. The correct next action is to implement caching (cache-aside with Redis) for any EHR system API call that returns stable reference data, so that repeated calls within the TTL window are served from Redis at ~1 ms instead of 300+ ms.
 
     **4.** `tottime` is the time spent executing only that function's own code, excluding time spent in any function it calls. `cumtime` is the total time including all callees. To find the most expensive call chain (the path where time is really being spent), sort by `cumtime` — a function may have negligible `tottime` itself but a very high `cumtime` because it calls expensive sub-functions. `tottime` is useful only when you want to confirm that a specific function's own logic (not its callees) is expensive.
 
@@ -683,17 +683,17 @@ Performance Engineering & Caching
 
     **6.** A sampling profiler periodically interrupts the process and records the current call stack, rather than instrumenting every function call. `py-spy` is written in Rust and reads the CPython stack via `/proc/<pid>/mem` without injecting any code into the process. This means overhead is proportional only to sampling frequency (default 100 Hz), not to call rate, making it safe to run against a live production Uvicorn worker. `cProfile`'s overhead grows with function call frequency, which can distort results and slow the service under production load.
 
-    **7.** Cache-aside: the application checks the cache before calling the origin; on a miss it fetches from origin and populates the cache; subsequent reads hit the cache. It performs worst when the cache hit rate is low — specifically, when a large number of distinct keys are requested before any have been warmed, causing every request to be a cache miss and hit the origin. In AESF, the worst case is immediately after service startup or after a Redis flush, when all policy type and structure combination keys are cold and every concurrent Salesforce webhook fires an Epic API call simultaneously.
+    **7.** Cache-aside: the application checks the cache before calling the origin; on a miss it fetches from origin and populates the cache; subsequent reads hit the cache. It performs worst when the cache hit rate is low — specifically, when a large number of distinct keys are requested before any have been warmed, causing every request to be a cache miss and hit the origin. In the integration platform, the worst case is immediately after service startup or after a Redis flush, when all policy type and structure combination keys are cold and every concurrent Salesforce webhook fires an EHR system API call simultaneously.
 
-    **8.** Write-through guarantees that the cache always reflects the latest write (strong consistency), unlike cache-aside which may serve stale data until the TTL expires. The trade-off is write latency: every mutation must complete two writes (origin DB and cache) before acknowledging the client. This doubles write latency compared to cache-aside, which only writes to the origin on the write path. For AESF reference data that is updated infrequently, cache-aside with a short TTL is usually the better balance.
+    **8.** Write-through guarantees that the cache always reflects the latest write (strong consistency), unlike cache-aside which may serve stale data until the TTL expires. The trade-off is write latency: every mutation must complete two writes (origin DB and cache) before acknowledging the client. This doubles write latency compared to cache-aside, which only writes to the origin on the write path. For integration platform reference data that is updated infrequently, cache-aside with a short TTL is usually the better balance.
 
-    **9.** In write-behind, updates are acknowledged to the client after writing only to Redis; the flush to PostgreSQL happens asynchronously. If the Redis instance crashes or the GKE pod running the flush worker is evicted before the flush completes, those writes are lost permanently. In AESF, if sync status updates are written behind and Redis loses data, the sync queue state in PostgreSQL becomes stale, leading to duplicate or missed syncs. The mitigation is to enable Redis AOF (Append-Only File) persistence with `appendfsync always` or to use GCP Memorystore with a replica, so writes survive instance restarts.
+    **9.** In write-behind, updates are acknowledged to the client after writing only to Redis; the flush to PostgreSQL happens asynchronously. If the Redis instance crashes or the GKE pod running the flush worker is evicted before the flush completes, those writes are lost permanently. In the integration platform, if sync status updates are written behind and Redis loses data, the sync queue state in PostgreSQL becomes stale, leading to duplicate or missed syncs. The mitigation is to enable Redis AOF (Append-Only File) persistence with `appendfsync always` or to use GCP Memorystore with a replica, so writes survive instance restarts.
 
     **10.** Pod B's local cache holds its own in-memory copy of the sync state that was valid when Pod B last fetched it. When Pod A writes a state update to PostgreSQL (and possibly Redis), Pod B's local cache is unaware of this change and will continue returning its stale copy for any request routed to it. In a GKE deployment with round-robin load balancing, this means ~80% of subsequent requests (those routed to Pods B–E) will observe stale state. Distributed Redis eliminates this: all pods read from and write to the same store, so an update from any pod is immediately visible to all others within the same Redis read.
 
-    **11.** A Redis Sorted Set (`ZSET`) is the correct structure. Each member is an account ID; the score is a numeric value representing priority (lower score = higher priority, so use a timestamp or a negative priority value). Key commands: `ZADD aesf:sync:queue <score> <account_id>` to enqueue, `ZPOPMIN aesf:sync:queue 1` to atomically dequeue the highest-priority (lowest-score) item, and `ZCARD aesf:sync:queue` to check queue depth. The atomic `ZPOPMIN` is important — it prevents two workers from dequeuing the same item.
+    **11.** A Redis Sorted Set (`ZSET`) is the correct structure. Each member is an account ID; the score is a numeric value representing priority (lower score = higher priority, so use a timestamp or a negative priority value). Key commands: `ZADD app:sync:queue <score> <account_id>` to enqueue, `ZPOPMIN app:sync:queue 1` to atomically dequeue the highest-priority (lowest-score) item, and `ZCARD app:sync:queue` to check queue depth. The atomic `ZPOPMIN` is important — it prevents two workers from dequeuing the same item.
 
-    **12.** Cache stampede occurs when a popular cached key expires and many concurrent requests all detect a miss at the same instant, then simultaneously race to recompute the value from the origin. During an Epic reconnect, all middleware pods have been unable to populate their caches while Epic was down. The moment Epic becomes available, every queued request fires an Epic API call for the same reference data keys at the same time, potentially overwhelming Epic's rate limiter and causing cascading failures. This is amplified in AESF by the backlog: hundreds of sync items may have accumulated during the outage, all requiring policy type lookups.
+    **12.** Cache stampede occurs when a popular cached key expires and many concurrent requests all detect a miss at the same instant, then simultaneously race to recompute the value from the origin. During an EHR system reconnect, all middleware pods have been unable to populate their caches while the EHR system was down. The moment the EHR system becomes available, every queued request fires an EHR system API call for the same reference data keys at the same time, potentially overwhelming the EHR system's rate limiter and causing cascading failures. This is amplified in the integration platform by the backlog: hundreds of sync items may have accumulated during the outage, all requiring policy type lookups.
 
     **13.** XFetch works by computing, before the key expires, a probabilistic re-fetch decision based on remaining TTL and the time it took to compute the value. The formula `−delta × beta × log(random())` produces a threshold: if the threshold exceeds the remaining TTL, the current request re-fetches early and refreshes the cache before expiry. A higher `beta` (e.g., 2.0) makes early revalidation more likely, reducing stampede risk at the cost of more frequent origin fetches. A lower `beta` (e.g., 0.5) delays revalidation closer to actual expiry, saving origin calls but increasing stampede risk.
 
@@ -701,12 +701,12 @@ Performance Engineering & Caching
 
     **15.** When a service restarts, it populates all reference data keys simultaneously. If all keys have the same TTL (e.g., 3600 s), they will all expire at the same time 1 hour later, creating a synchronized expiry event where all keys become cold simultaneously. This is a self-inflicted stampede. Adding jitter (e.g., `TTL = 3600 + random(0, 300)`) staggers expiration times across a 5-minute window, ensuring that at any given time only a small fraction of keys expire together, spreading the recomputation load smoothly.
 
-    **16.** The two most likely causes are (a) PostgreSQL queue table contention — the sync queue table is being written to and read from by many workers simultaneously, causing lock waits — or (b) the sync POST triggers a synchronous Epic API call in the request path (i.e., the handler is not fully asynchronous and awaits an Epic response before returning). To distinguish them: attach py-spy during the load test and look at the flame graph. If the wide bar is `asyncpg` or `sqlalchemy.execute`, the bottleneck is PostgreSQL. If the wide bar is `httpx.send` or `requests.Session.send`, the bottleneck is a synchronous Epic call in the request handler.
+    **16.** The two most likely causes are (a) PostgreSQL queue table contention — the sync queue table is being written to and read from by many workers simultaneously, causing lock waits — or (b) the sync POST triggers a synchronous EHR system API call in the request path (i.e., the handler is not fully asynchronous and awaits an EHR response before returning). To distinguish them: attach py-spy during the load test and look at the flame graph. If the wide bar is `asyncpg` or `sqlalchemy.execute`, the bottleneck is PostgreSQL. If the wide bar is `httpx.send` or `requests.Session.send`, the bottleneck is a synchronous EHR system call in the request handler.
 
     **17.** `wait_time = between(0.1, 0.5)` configures each simulated user to pause for a random duration between 100 ms and 500 ms between consecutive requests. This models real-world user think time — the delay between a Salesforce user completing one action and triggering the next. Without think time, locust users would fire requests as fast as the server responds, producing unrealistically high concurrency. The `between` distribution also randomizes arrival patterns, preventing the artificial synchronized bursts that a fixed wait time would create.
 
-    **18.** The `POST /accounts/:id/sync` endpoint creates real sync queue items in the PostgreSQL queue table. A locust test with 50 users and `task` weight 2 could generate thousands of queue items in minutes. These items will be picked up by the real ETL worker and sent to the Epic API, potentially creating duplicate records, firing Epic webhooks, or consuming Epic rate limit quota. The staging environment may also share a PostgreSQL database with the real QA Salesforce org. Always either add a load-test header that causes the handler to enqueue to a separate test queue or to no-op entirely, or coordinate with the team to ensure the ETL worker is paused during load tests.
+    **18.** The `POST /accounts/:id/sync` endpoint creates real sync queue items in the PostgreSQL queue table. A locust test with 50 users and `task` weight 2 could generate thousands of queue items in minutes. These items will be picked up by the real ETL worker and sent to the EHR system API, potentially creating duplicate records, firing EHR webhooks, or consuming EHR system rate limit quota. The staging environment may also share a PostgreSQL database with the real QA Salesforce org. Always either add a load-test header that causes the handler to enqueue to a separate test queue or to no-op entirely, or coordinate with the team to ensure the ETL worker is paused during load tests.
 
-    **19.** The p50 of 3 ms indicates that most requests are served from the Redis cache (cache hits). The p99 of 450 ms indicates that approximately 1% of requests are cache misses that fall through to the Epic API (~400 ms). This is a classic cache stampede signature at the tail: the 1% misses are likely requests that arrive at the moment a key expires, and if they are concurrent, they all hit Epic simultaneously. Probabilistic Early Revalidation (XFetch) addresses this most directly by re-fetching the key before expiry, preventing the synchronized miss event. A distributed lock is a secondary option but adds lock-wait latency to misses.
+    **19.** The p50 of 3 ms indicates that most requests are served from the Redis cache (cache hits). The p99 of 450 ms indicates that approximately 1% of requests are cache misses that fall through to the EHR system API (~400 ms). This is a classic cache stampede signature at the tail: the 1% misses are likely requests that arrive at the moment a key expires, and if they are concurrent, they all hit the EHR system simultaneously. Probabilistic Early Revalidation (XFetch) addresses this most directly by re-fetching the key before expiry, preventing the synchronized miss event. A distributed lock is a secondary option but adds lock-wait latency to misses.
 
-    **20.** Caching 50,000 accounts at 40 KB each would consume 2 GB of Redis memory — a significant and likely unwarranted cost on GCP Memorystore. More importantly, account data changes frequently (Salesforce updates, Epic sync results), so cached copies would go stale quickly, requiring aggressive TTLs or complex invalidation logic. The alternative is to cache only the data that is truly read-heavy and rarely changes: reference data (policy types, structure combinations, activity codes, ~50–200 KB total), and per-account hot state (sync status, last-synced timestamp) using Hashes (~100–500 bytes per account). Full account objects should be served directly from PostgreSQL with appropriate indexes, not from Redis.
+    **20.** Caching 50,000 accounts at 40 KB each would consume 2 GB of Redis memory — a significant and likely unwarranted cost on GCP Memorystore. More importantly, account data changes frequently (Salesforce updates, EHR sync results), so cached copies would go stale quickly, requiring aggressive TTLs or complex invalidation logic. The alternative is to cache only the data that is truly read-heavy and rarely changes: reference data (policy types, structure combinations, activity codes, ~50–200 KB total), and per-account hot state (sync status, last-synced timestamp) using Hashes (~100–500 bytes per account). Full account objects should be served directly from PostgreSQL with appropriate indexes, not from Redis.

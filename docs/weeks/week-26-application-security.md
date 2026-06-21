@@ -8,13 +8,13 @@
 
 ## Overview
 
-Application security is not a feature you bolt on at the end — it is a design constraint that shapes every layer of your system. For engineers working on integration platforms that carry sensitive data, the stakes are especially high. The AESF middleware sits at the exact intersection of Salesforce (CRM with policy/patient data), Epic EHR (a regulated healthcare backend), and GCP/GKE infrastructure. Every inbound request from Salesforce and every outbound call to Epic passes through code you write. A single injection flaw, misconfigured secret, or unvalidated redirect can expose protected health information, policy records, or internal network topology.
+Application security is not a feature you bolt on at the end — it is a design constraint that shapes every layer of your system. For engineers working on integration platforms that carry sensitive data, the stakes are especially high. The crm-middleware sits at the exact intersection of Salesforce (CRM with policy/patient data), the EHR system (a regulated healthcare backend), and GCP/GKE infrastructure. Every inbound request from Salesforce and every outbound call to the EHR system passes through code you write. A single injection flaw, misconfigured secret, or unvalidated redirect can expose protected health information, policy records, or internal network topology.
 
-This week maps the OWASP Top 10 (2021 edition) to concrete patterns you will recognize in FastAPI and SQLAlchemy code. The goal is not to memorize CVE numbers but to internalize *why* each class of vulnerability exists and what the minimal effective mitigation looks like. You will see how Vault secret rotation changes the threat model for long-lived credentials, how parameterized queries eliminate SQL injection at the driver level, and how SSRF turns your own middleware into a pivot point against Epic's internal network.
+This week maps the OWASP Top 10 (2021 edition) to concrete patterns you will recognize in FastAPI and SQLAlchemy code. The goal is not to memorize CVE numbers but to internalize *why* each class of vulnerability exists and what the minimal effective mitigation looks like. You will see how Vault secret rotation changes the threat model for long-lived credentials, how parameterized queries eliminate SQL injection at the driver level, and how SSRF turns your own middleware into a pivot point against the EHR system's internal network.
 
-Secure design goes beyond fixing known attack classes. Threat modeling — systematically asking "what can go wrong, who can make it go wrong, and what is the impact" — gives you a structured way to find gaps before an attacker does. Applied to the Salesforce→middleware→Epic data flow, threat modeling surfaces risks like Apex trigger replay attacks, unauthenticated admin panel exposure, and overly broad Vault policies. You will work through a lightweight STRIDE model applied to AESF at the end of the sectional content.
+Secure design goes beyond fixing known attack classes. Threat modeling — systematically asking "what can go wrong, who can make it go wrong, and what is the impact" — gives you a structured way to find gaps before an attacker does. Applied to the Salesforce→middleware→EHR data flow, threat modeling surfaces risks like Apex trigger replay attacks, unauthenticated admin panel exposure, and overly broad Vault policies. You will work through a lightweight STRIDE model applied to the integration platform at the end of the sectional content.
 
-Finally, security must live in CI/CD. Dependency scanning, SAST linting, and secret-leak detection are cheapest when they run on every pull request. This week gives you the tooling vocabulary and the configuration snippets to wire these checks into a GitHub Actions pipeline — the same pipeline pattern used for AESF middleware deployments.
+Finally, security must live in CI/CD. Dependency scanning, SAST linting, and secret-leak detection are cheapest when they run on every pull request. This week gives you the tooling vocabulary and the configuration snippets to wire these checks into a GitHub Actions pipeline — the same pipeline pattern used for crm-middleware deployments.
 
 ---
 
@@ -35,7 +35,7 @@ The OWASP Top 10 is a ranked list of the most critical web application security 
 | A09 | Security Logging & Monitoring Failures | No audit trail | Structured logs → SIEM |
 | A10 | SSRF | Unvalidated outbound URLs | Allowlist; metadata block |
 
-**AESF connection:** A03 (Injection) is mitigated by SQLAlchemy ORM. A10 (SSRF) is the highest-priority risk in the middleware because every `POST /clients` call from Salesforce triggers an outbound HTTP call to Epic using a URL that is partially derived from configuration — if that configuration can be influenced by input, you have SSRF.
+**Integration platform connection:** A03 (Injection) is mitigated by SQLAlchemy ORM. A10 (SSRF) is the highest-priority risk in the middleware because every `POST /clients` call from Salesforce triggers an outbound HTTP call to the EHR system using a URL that is partially derived from configuration — if that configuration can be influenced by input, you have SSRF.
 
 **Common mistake:** Treating OWASP Top 10 as a checklist to complete once rather than a lens to apply continuously. New endpoints, new integrations, and dependency upgrades all re-open previously mitigated risks.
 
@@ -53,18 +53,18 @@ FastAPI's dependency on Pydantic means you get input validation essentially for 
 from pydantic import BaseModel, Field, field_validator
 import re
 
-EPIC_CLIENT_ID_PATTERN = re.compile(r"^[A-Z0-9\-]{6,20}$")
+EHR_CLIENT_ID_PATTERN = re.compile(r"^[A-Z0-9\-]{6,20}$")
 
 class SyncClientRequest(BaseModel):
-    epic_client_id: str = Field(..., min_length=6, max_length=20)
+    ehr_client_id: str = Field(..., min_length=6, max_length=20)
     salesforce_account_id: str = Field(..., min_length=15, max_length=18)
     operation: Literal["create", "update", "delete"]
 
-    @field_validator("epic_client_id")
+    @field_validator("ehr_client_id")
     @classmethod
-    def validate_epic_id_format(cls, v: str) -> str:
-        if not EPIC_CLIENT_ID_PATTERN.match(v):
-            raise ValueError("epic_client_id contains invalid characters")
+    def validate_ehr_id_format(cls, v: str) -> str:
+        if not EHR_CLIENT_ID_PATTERN.match(v):
+            raise ValueError("ehr_client_id contains invalid characters")
         return v
 ```
 
@@ -80,15 +80,15 @@ from sqlalchemy.orm import Session
 
 # WRONG — string interpolation, injectable
 def get_client_bad(db: Session, client_id: str):
-    return db.execute(f"SELECT * FROM clients WHERE epic_id = '{client_id}'")
+    return db.execute(f"SELECT * FROM clients WHERE ehr_id = '{client_id}'")
 
 # CORRECT — parameterized via ORM
 def get_client_orm(db: Session, client_id: str):
-    return db.query(Client).filter(Client.epic_id == client_id).first()
+    return db.query(Client).filter(Client.ehr_id == client_id).first()
 
 # CORRECT — parameterized via raw SQL when ORM is insufficient
 def get_client_raw(db: Session, client_id: str):
-    stmt = text("SELECT * FROM clients WHERE epic_id = :cid")
+    stmt = text("SELECT * FROM clients WHERE ehr_id = :cid")
     return db.execute(stmt, {"cid": client_id}).fetchone()
 ```
 
@@ -112,12 +112,12 @@ from functools import lru_cache
 def get_vault_client() -> hvac.Client:
     client = hvac.Client(url="https://vault.internal:8200")
     # In GKE, authenticate via GCP IAM role
-    client.auth.gcp.login(role="aesf-middleware", jwt=_get_instance_jwt())
+    client.auth.gcp.login(role="crm-middleware", jwt=_get_instance_jwt())
     return client
 
 def get_db_credentials() -> dict:
     vault = get_vault_client()
-    secret = vault.secrets.database.generate_credentials(name="aesf-middleware-role")
+    secret = vault.secrets.database.generate_credentials(name="crm-middleware-role")
     return {
         "username": secret["data"]["username"],
         "password": secret["data"]["password"],
@@ -126,15 +126,15 @@ def get_db_credentials() -> dict:
 
 ### Vault policies — principle of least privilege
 
-A Vault policy should grant exactly the paths and capabilities your service needs — nothing more. The AESF middleware needs to read the Epic API key and generate database credentials. It should *not* have access to ETL secrets or infrastructure PKI paths.
+A Vault policy should grant exactly the paths and capabilities your service needs — nothing more. The crm-middleware needs to read the EHR API key and generate database credentials. It should *not* have access to ETL secrets or infrastructure PKI paths.
 
 ```hcl
-# aesf-middleware policy
-path "secret/data/aesf/epic-api-key" {
+# crm-middleware policy
+path "secret/data/crm-middleware/ehr-api-key" {
   capabilities = ["read"]
 }
 
-path "database/creds/aesf-middleware-role" {
+path "database/creds/crm-middleware-role" {
   capabilities = ["read"]
 }
 
@@ -160,7 +160,7 @@ def refresh_credentials_on_disconnect(engine: Engine):
         connection_record.info["vault_creds"] = creds
 ```
 
-**AESF connection:** The Epic API key (used for every outbound call to `de21web`) lives in Vault under `secret/data/aesf/epic-api-key`. If the middleware reads this once at startup and caches it indefinitely, a rotated key breaks all Epic callouts silently. Always read from Vault per-request (with caching at the HTTP client level with TTL matching the lease duration).
+**Integration platform connection:** The EHR API key (used for every outbound call to `ehr-server-prod`) lives in Vault under `secret/data/crm-middleware/ehr-api-key`. If the middleware reads this once at startup and caches it indefinitely, a rotated key breaks all EHR callouts silently. Always read from Vault per-request (with caching at the HTTP client level with TTL matching the lease duration).
 
 **Common mistake:** Storing Vault tokens in environment variables. The token itself is a secret. Use IAM-based authentication (GCP workload identity in GKE) so the service never has to manage a Vault token bootstrap problem.
 
@@ -172,19 +172,19 @@ SSRF occurs when an attacker can cause your server to make HTTP requests to an u
 
 - The GCP metadata endpoint (`169.254.169.254`) — returns service account tokens
 - Internal Kubernetes services (`http://vault.internal:8200`)
-- Epic's internal network topology (via crafted Epic API paths)
+- The EHR system's internal network topology (via crafted EHR API paths)
 
-### The AESF SSRF risk surface
+### The integration platform SSRF risk surface
 
-The middleware constructs Epic API URLs from configuration and request parameters:
+The middleware constructs EHR API URLs from configuration and request parameters:
 
 ```python
 # Dangerous pattern — base URL partially from request data
-def build_epic_url(endpoint: str, client_id: str) -> str:
-    return f"{settings.EPIC_BASE_URL}/{endpoint}/{client_id}"
+def build_ehr_url(endpoint: str, client_id: str) -> str:
+    return f"{settings.EHR_BASE_URL}/{endpoint}/{client_id}"
 ```
 
-If `client_id` contains `../../../internal-service`, the constructed URL escapes the intended path. If `settings.EPIC_BASE_URL` can be influenced by environment injection (a compromised ConfigMap), the entire base can be redirected.
+If `client_id` contains `../../../internal-service`, the constructed URL escapes the intended path. If `settings.EHR_BASE_URL` can be influenced by environment injection (a compromised ConfigMap), the entire base can be redirected.
 
 ### Mitigations
 
@@ -193,19 +193,19 @@ import ipaddress
 import urllib.parse
 from fastapi import HTTPException
 
-ALLOWED_EPIC_HOSTS = frozenset(["de21web.applied.com", "ve001d1web.applied.com"])
+ALLOWED_EHR_HOSTS = frozenset(["ehr-server-prod.internal", "ehr-server-dev.internal"])
 
-def validate_epic_url(url: str) -> str:
-    """Validate that a constructed Epic URL points to an allowed host."""
+def validate_ehr_url(url: str) -> str:
+    """Validate that a constructed EHR URL points to an allowed host."""
     parsed = urllib.parse.urlparse(url)
     
     # Reject non-HTTPS
     if parsed.scheme != "https":
-        raise HTTPException(status_code=400, detail="Only HTTPS Epic URLs are permitted")
+        raise HTTPException(status_code=400, detail="Only HTTPS EHR URLs are permitted")
     
-    # Enforce allowlist of Epic hostnames
-    if parsed.hostname not in ALLOWED_EPIC_HOSTS:
-        raise HTTPException(status_code=400, detail=f"Host {parsed.hostname} is not an allowed Epic endpoint")
+    # Enforce allowlist of EHR hostnames
+    if parsed.hostname not in ALLOWED_EHR_HOSTS:
+        raise HTTPException(status_code=400, detail=f"Host {parsed.hostname} is not an allowed EHR endpoint")
     
     # Block private IP ranges (defense in depth against DNS rebinding)
     try:
@@ -220,11 +220,11 @@ def validate_epic_url(url: str) -> str:
 # Enforce URL-safe path segments only
 SAFE_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9\-_]+$")
 
-def build_epic_url(endpoint: str, client_id: str) -> str:
+def build_ehr_url(endpoint: str, client_id: str) -> str:
     if not SAFE_PATH_SEGMENT.match(client_id):
         raise ValueError(f"Invalid client_id for URL construction: {client_id!r}")
-    url = f"{settings.EPIC_BASE_URL}/{endpoint}/{client_id}"
-    return validate_epic_url(url)
+    url = f"{settings.EHR_BASE_URL}/{endpoint}/{client_id}"
+    return validate_ehr_url(url)
 ```
 
 Additionally, configure the GKE network policy to block metadata server access from the middleware pod:
@@ -238,7 +238,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: aesf-middleware
+      app: crm-middleware
   policyTypes:
     - Egress
   egress:
@@ -249,7 +249,7 @@ spec:
               - 169.254.169.254/32
 ```
 
-**Common mistake:** Only validating user-supplied input and trusting configuration values blindly. A compromised ConfigMap or environment injection can set `EPIC_BASE_URL` to an internal target. Always validate the final constructed URL, not just the components.
+**Common mistake:** Only validating user-supplied input and trusting configuration values blindly. A compromised ConfigMap or environment injection can set `EHR_BASE_URL` to an internal target. Always validate the final constructed URL, not just the components.
 
 ---
 
@@ -257,12 +257,12 @@ spec:
 
 XXE exploits XML parsers that process external entity declarations. When a parser resolves `<!ENTITY xxe SYSTEM "file:///etc/passwd">`, it reads that file and injects its content into the document. XXE can lead to local file disclosure, SSRF (via `http://` entities), and denial of service (billion laughs attack).
 
-FastAPI's default request parsing is JSON, so XXE is not an immediate concern for JSON endpoints. However, if you ever parse XML — from Epic SOAP responses, Salesforce SOAP API, or uploaded documents — you must disable external entity processing.
+FastAPI's default request parsing is JSON, so XXE is not an immediate concern for JSON endpoints. However, if you ever parse XML — from EHR SOAP responses, Salesforce SOAP API, or uploaded documents — you must disable external entity processing.
 
 ```python
 from lxml import etree
 
-def parse_epic_xml_response(xml_bytes: bytes) -> etree._Element:
+def parse_ehr_xml_response(xml_bytes: bytes) -> etree._Element:
     # SAFE: disable all external entity processing
     parser = etree.XMLParser(
         resolve_entities=False,
@@ -272,7 +272,7 @@ def parse_epic_xml_response(xml_bytes: bytes) -> etree._Element:
     try:
         return etree.fromstring(xml_bytes, parser=parser)
     except etree.XMLSyntaxError as e:
-        raise ValueError(f"Malformed Epic XML response: {e}") from e
+        raise ValueError(f"Malformed EHR XML response: {e}") from e
 ```
 
 For Python's stdlib `xml.etree.ElementTree`, use `defusedxml` instead, which patches all stdlib XML parsers:
@@ -309,13 +309,13 @@ pickle.loads(payload)  # RCE
 
 ### Safe task queue payloads (Celery / Redis)
 
-AESF uses async background tasks for Epic sync operations. If Celery is configured with the default pickle serializer, anyone who can write to the Redis task queue can execute arbitrary code in the middleware worker.
+The integration platform uses async background tasks for EHR sync operations. If Celery is configured with the default pickle serializer, anyone who can write to the Redis task queue can execute arbitrary code in the middleware worker.
 
 ```python
 # celery_app.py — enforce JSON serialization
 from celery import Celery
 
-app = Celery("aesf")
+app = Celery("crm-middleware")
 app.conf.update(
     task_serializer="json",
     result_serializer="json",
@@ -364,11 +364,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build -t aesf-middleware:ci .
+        run: docker build -t crm-middleware:ci .
       - name: Trivy scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: "aesf-middleware:ci"
+          image-ref: "crm-middleware:ci"
           severity: "HIGH,CRITICAL"
           exit-code: "1"
 
@@ -392,19 +392,19 @@ jobs:
 
 Standard TLS authenticates the *server* to the client. Mutual TLS (mTLS) requires both sides to present certificates, giving you cryptographic proof of service identity in addition to encryption. In GKE, mTLS between the middleware, ETL, and internal services prevents a compromised pod from impersonating a trusted service.
 
-### The AESF mTLS aspiration
+### The integration platform mTLS aspiration
 
 Current state: services communicate over internal Kubernetes cluster networking with TLS to external endpoints. Target state: Istio service mesh or SPIFFE/SPIRE workload identity for pod-to-pod mTLS.
 
 With Istio:
 
 ```yaml
-# PeerAuthentication: require mTLS in the aesf namespace
+# PeerAuthentication: require mTLS in the crm-middleware namespace
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:
   name: default
-  namespace: aesf
+  namespace: crm-middleware
 spec:
   mtls:
     mode: STRICT
@@ -416,8 +416,8 @@ Without a service mesh, you can implement application-level mTLS in Python using
 import ssl
 import httpx
 
-def get_epic_client(cert_path: str, key_path: str, ca_path: str) -> httpx.Client:
-    """Build an httpx client with mTLS for Epic API calls."""
+def get_ehr_client(cert_path: str, key_path: str, ca_path: str) -> httpx.Client:
+    """Build an httpx client with mTLS for EHR API calls."""
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_path)
     ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -452,7 +452,7 @@ jobs:
       - uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f
         with:
           workload_identity_provider: "projects/123/locations/global/workloadIdentityPools/ci-pool/providers/github"
-          service_account: "aesf-deployer@aesf-prod.iam.gserviceaccount.com"
+          service_account: "crm-deployer@crm-prod.iam.gserviceaccount.com"
       
       # Never print secrets in logs
       - name: Deploy
@@ -482,7 +482,7 @@ Bandit flags common Python security issues: `subprocess` with `shell=True`, hard
 
 ---
 
-## 10. Threat Modeling the AESF Integration Platform
+## 10. Threat Modeling the CRM-EHR Integration Platform
 
 Threat modeling is systematic enumeration of what can go wrong. The STRIDE framework categorizes threats: **S**poofing, **T**ampering, **R**epudiation, **I**nformation disclosure, **D**enial of service, **E**levation of privilege.
 
@@ -492,12 +492,12 @@ Threat modeling is systematic enumeration of what can go wrong. The STRIDE frame
 Salesforce Apex Trigger
        │ HTTPS + JWT (Named Credential)
        ▼
-  [AESF Middleware] ──── PostgreSQL (queue tables)
+  [CRM Middleware] ──── PostgreSQL (queue tables)
        │                      │
        │ HTTPS + mTLS (aspirational)
        ▼
-   Epic EHR BDE
-       (de21web / ve001d1web)
+   EHR System BDE
+       (ehr-server-prod / ehr-server-dev)
 ```
 
 ### STRIDE analysis
@@ -506,10 +506,10 @@ Salesforce Apex Trigger
 |-----------|--------|--------|------------|
 | Apex→Middleware JWT | Token replay from Salesforce | S | Short expiry (5 min); nonce/jti check |
 | Middleware inbound API | Unauthenticated admin panel | E | IP allowlist + Vault-issued admin tokens |
-| Middleware→Epic callout | SSRF to internal network | I | URL allowlist; NetworkPolicy |
+| Middleware→EHR callout | SSRF to internal network | I | URL allowlist; NetworkPolicy |
 | PostgreSQL queue table | Direct DB write bypasses API | T | Restrict DB user to app schema only |
 | Vault token | Overly broad policy grants DB write | E | Least-privilege policy; audit log review |
-| Epic response parsing | Malicious XML/JSON in Epic response | T | Schema validation on all Epic responses |
+| EHR response parsing | Malicious XML/JSON in EHR response | T | Schema validation on all EHR responses |
 | CI/CD pipeline | Compromised workflow writes to prod | E | OIDC auth; branch protection; pin SHA |
 | Dependency | Malicious package in supply chain | T | pip-audit + trivy in CI; hash pinning |
 
@@ -563,11 +563,11 @@ Application Security
 
 **2.** Why does SQLAlchemy's ORM prevent SQL injection even when the `client_id` value contains a single-quote character?
 
-**3.** You receive an Epic XML response containing `<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">`. What attack is being attempted, and what is the exact mechanism that makes it dangerous?
+**3.** You receive an EHR XML response containing `<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">`. What attack is being attempted, and what is the exact mechanism that makes it dangerous?
 
-**4.** A colleague suggests caching the Vault-issued Epic API key in a module-level variable at application startup to reduce latency. What is the security problem with this approach?
+**4.** A colleague suggests caching the Vault-issued EHR API key in a module-level variable at application startup to reduce latency. What is the security problem with this approach?
 
-**5.** Explain how SSRF in the AESF middleware could be exploited to exfiltrate a GKE service account token, step by step.
+**5.** Explain how SSRF in the crm-middleware could be exploited to exfiltrate a GKE service account token, step by step.
 
 **6.** What is the difference between `pickle.loads()` and `json.loads()` from a security perspective? Why can one lead to RCE and the other cannot?
 
@@ -581,7 +581,7 @@ Application Security
 
 **11.** What is the "billion laughs" attack and which XML feature does it exploit?
 
-**12.** Explain the STRIDE acronym. For the AESF middleware, give one concrete example of a Tampering threat.
+**12.** Explain the STRIDE acronym. For the crm-middleware, give one concrete example of a Tampering threat.
 
 **13.** Why is `assert` a bad choice for enforcing security checks in Python?
 
@@ -589,15 +589,15 @@ Application Security
 
 **15.** A Celery worker is configured with `accept_content=["json", "pickle"]`. Explain the attack surface this creates and how to close it.
 
-**16.** In the context of Vault policies, what does the principle of least privilege mean concretely for the AESF middleware service?
+**16.** In the context of Vault policies, what does the principle of least privilege mean concretely for the crm-middleware service?
 
 **17.** What is DNS rebinding, and why does an allowlist of hostnames alone not fully prevent SSRF? What additional control addresses it?
 
 **18.** Describe two ways that a compromised CI/CD pipeline could harm a production system, and one control that mitigates both.
 
-**19.** The AESF middleware makes outbound calls to Epic using a URL constructed from `settings.EPIC_BASE_URL` and a `client_id` path segment. A Kubernetes ConfigMap is compromised and `EPIC_BASE_URL` is changed to point to an internal service. What is the vulnerability class, and what code-level control catches it?
+**19.** The crm-middleware makes outbound calls to the EHR system using a URL constructed from `settings.EHR_BASE_URL` and a `client_id` path segment. A Kubernetes ConfigMap is compromised and `EHR_BASE_URL` is changed to point to an internal service. What is the vulnerability class, and what code-level control catches it?
 
-**20.** What is a trust anchor in a threat model, and how does the Salesforce Named Credential JWT function as a trust anchor for the AESF middleware? What is one weakness in treating it as the sole trust anchor?
+**20.** What is a trust anchor in a threat model, and how does the Salesforce Named Credential JWT function as a trust anchor for the crm-middleware? What is one weakness in treating it as the sole trust anchor?
 
 ---
 
@@ -611,9 +611,9 @@ Application Security
 
     **3.** This is an XXE (XML External Entity) combined with SSRF. The `SYSTEM` keyword instructs the XML parser to fetch the URL and substitute the response text as the entity value. If the parser resolves it, it will make an HTTP GET to the GCP metadata server (`169.254.169.254`) and return the instance metadata — potentially including service account tokens and project configuration — in the parsed document or error output. The danger is that the *server* (middleware) makes the request, so it succeeds from within GKE's network even though the attacker has no direct access.
 
-    **4.** Vault issues credentials with a lease TTL — after expiry, the credential is revoked and any call using it returns a 401 or 403 from Epic. If the key is cached at startup, the application runs correctly until the first rotation event, then fails silently until redeployment. More importantly, a Vault lease represents an active secret that should be auditable and revocable. Caching at the module level bypasses audit logging for ongoing usage and prevents emergency revocation from taking effect. Read the secret per-request with a short in-memory TTL (matching the Vault lease) instead.
+    **4.** Vault issues credentials with a lease TTL — after expiry, the credential is revoked and any call using it returns a 401 or 403 from the EHR system. If the key is cached at startup, the application runs correctly until the first rotation event, then fails silently until redeployment. More importantly, a Vault lease represents an active secret that should be auditable and revocable. Caching at the module level bypasses audit logging for ongoing usage and prevents emergency revocation from taking effect. Read the secret per-request with a short in-memory TTL (matching the Vault lease) instead.
 
-    **5.** Step 1: The attacker controls a value that influences the URL constructed for an Epic API call — for example, via a crafted `client_id` that includes URL path traversal sequences. Step 2: The middleware constructs a URL that resolves to `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token` with the appropriate `Metadata-Flavor: Google` header. Step 3: The middleware's HTTP client (httpx/requests) fetches this URL from within the GKE pod network, which has direct access to the metadata server. Step 4: The JSON response containing the service account OAuth token is returned to the attacker — either in the API response body, an error message, or a log line. Step 5: The attacker uses the token to authenticate as the GKE service account with whatever GCP IAM permissions it holds.
+    **5.** Step 1: The attacker controls a value that influences the URL constructed for an EHR API call — for example, via a crafted `client_id` that includes URL path traversal sequences. Step 2: The middleware constructs a URL that resolves to `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token` with the appropriate `Metadata-Flavor: Google` header. Step 3: The middleware's HTTP client (httpx/requests) fetches this URL from within the GKE pod network, which has direct access to the metadata server. Step 4: The JSON response containing the service account OAuth token is returned to the attacker — either in the API response body, an error message, or a log line. Step 5: The attacker uses the token to authenticate as the GKE service account with whatever GCP IAM permissions it holds.
 
     **6.** `json.loads()` parses JSON text into Python primitive types (dicts, lists, strings, numbers, booleans, None). The JSON format has no mechanism to represent arbitrary objects or executable code — it is a pure data format. `pickle.loads()` reconstructs arbitrary Python objects from a binary stream. Python objects can define `__reduce__` or `__reduce_ex__` methods that specify a callable to invoke during unpickling — effectively arbitrary code execution. Since these methods run automatically during deserialization, loading a malicious pickle payload is equivalent to running the attacker's code with the process's privileges.
 
@@ -627,7 +627,7 @@ Application Security
 
     **11.** The "billion laughs" (or XML bomb) attack exploits XML entity nesting. A DTD defines a chain of entities where each one expands to multiple copies of the previous: `&a;` expands to `&b;&b;&b;&b;&b;`, `&b;` expands similarly, and so on exponentially. A document that is kilobytes in size expands to gigabytes (or more) in memory when parsed, causing the parser — and potentially the host — to exhaust available memory. The underlying XML feature is the internal entity declaration (`<!ENTITY name "value">`). `defusedxml` and `lxml` with `resolve_entities=False` prevent this by refusing to expand entity references.
 
-    **12.** STRIDE: **S**poofing (claiming a false identity), **T**ampering (modifying data or code), **R**epudiation (denying an action occurred), **I**nformation disclosure (leaking data), **D**enial of service (making a system unavailable), **E**levation of privilege (gaining unauthorized capabilities). For AESF middleware, a concrete Tampering threat is: a compromised internal service (or a developer with direct DB access) writes records directly to the PostgreSQL sync queue, bypassing all validation and business logic in the middleware API, causing invalid or malicious data to be synced into Epic.
+    **12.** STRIDE: **S**poofing (claiming a false identity), **T**ampering (modifying data or code), **R**epudiation (denying an action occurred), **I**nformation disclosure (leaking data), **D**enial of service (making a system unavailable), **E**levation of privilege (gaining unauthorized capabilities). For the crm-middleware, a concrete Tampering threat is: a compromised internal service (or a developer with direct DB access) writes records directly to the PostgreSQL sync queue, bypassing all validation and business logic in the middleware API, causing invalid or malicious data to be synced into the EHR system.
 
     **13.** In Python, `assert` statements are removed entirely when the interpreter runs in optimized mode (`python -O` or `PYTHONOPTIMIZE=1`). Many production containers and deployment toolchains enable optimization. This means `assert user.is_admin, "Admin required"` becomes a no-op and every user is treated as an admin. Use explicit `if/raise` constructs for security checks: `if not user.is_admin: raise HTTPException(status_code=403)`. This is immune to optimization flags and makes the security check visible and intentional.
 
@@ -635,12 +635,12 @@ Application Security
 
     **15.** Celery workers with `accept_content=["json", "pickle"]` will deserialize any task payload whose content type is `application/x-python-serialize` (pickle). Any process that can write to the Redis/RabbitMQ broker — including a compromised application pod, a developer with broker credentials, or an attacker who exploited a different service — can enqueue a malicious pickle payload. When a worker consumes it, the `__reduce__` method executes arbitrary code with the worker's OS privileges. To close this: set `accept_content=["json"]` and `task_serializer="json"` only. All task arguments must be JSON-serializable primitives.
 
-    **16.** Least privilege for AESF middleware means the Vault policy grants exactly the paths the service legitimately needs at runtime and nothing else. Concretely: read access to `secret/data/aesf/epic-api-key`; generate credentials from `database/creds/aesf-middleware-role`; and no other paths. It should not be able to read ETL secrets, write to any Vault path, manage policies, or access PKI endpoints. The Vault role should also restrict which Kubernetes ServiceAccounts can authenticate to it — only the `aesf-middleware` ServiceAccount in the `aesf` namespace, not cluster-admin or other service accounts.
+    **16.** Least privilege for the crm-middleware means the Vault policy grants exactly the paths the service legitimately needs at runtime and nothing else. Concretely: read access to `secret/data/crm-middleware/ehr-api-key`; generate credentials from `database/creds/crm-middleware-role`; and no other paths. It should not be able to read ETL secrets, write to any Vault path, manage policies, or access PKI endpoints. The Vault role should also restrict which Kubernetes ServiceAccounts can authenticate to it — only the `crm-middleware` ServiceAccount in the `crm-middleware` namespace, not cluster-admin or other service accounts.
 
     **17.** DNS rebinding exploits the gap between hostname resolution at validation time and at request time. An attacker controls a domain (`evil.com`) that initially resolves to a public IP (passing your allowlist hostname check). After the TTL expires, they change the DNS record to resolve to `169.254.169.254` or an internal Kubernetes service IP. Your cached allowlist check passed at validation time, but the actual HTTP request resolves to the internal target. A hostname allowlist alone does not catch this because the allowlist check is on the domain name, not the resolved IP. The additional control is to resolve the hostname at validation time, check that the resolved IP is not in private/reserved ranges, and then use the resolved IP for the actual request — or use a network-level egress policy that blocks private IPs regardless of how a connection is initiated.
 
     **18.** First: a compromised pipeline could exfiltrate all repository secrets by adding a step that prints or POSTs them to an external server, then use those credentials to access production databases, Vault, or GCP. Second: it could inject malicious code into the built container image or Helm chart before pushing to the registry, causing backdoored code to run in production on the next deployment. One control that mitigates both: use Workload Identity Federation (OIDC) instead of long-lived service account keys stored as secrets. Without a secret in the repository, there is nothing to exfiltrate for GCP auth. For artifact integrity, combine OIDC with signed container images (Cosign/sigstore) verified at deploy time.
 
-    **19.** This is SSRF via configuration injection. Even though the user-supplied `client_id` is validated, the base URL is treated as trusted configuration. When that configuration is compromised (via a writable ConfigMap), the base URL can be pointed at any internal address. The code-level control is to validate the *final constructed URL* — not just its components — against an allowlist of known-good hostnames every time before making the outbound request. The `validate_epic_url()` function that checks `parsed.hostname in ALLOWED_EPIC_HOSTS` catches this because the allowlist is hardcoded in application code, not in a ConfigMap that can be modified without a code deploy.
+    **19.** This is SSRF via configuration injection. Even though the user-supplied `client_id` is validated, the base URL is treated as trusted configuration. When that configuration is compromised (via a writable ConfigMap), the base URL can be pointed at any internal address. The code-level control is to validate the *final constructed URL* — not just its components — against an allowlist of known-good hostnames every time before making the outbound request. The `validate_ehr_url()` function that checks `parsed.hostname in ALLOWED_EHR_HOSTS` catches this because the allowlist is hardcoded in application code, not in a ConfigMap that can be modified without a code deploy.
 
     **20.** A trust anchor is a root of trust — a credential, certificate, or identity assertion that is accepted without further verification, from which all other authorization decisions flow. The Salesforce Named Credential JWT is the trust anchor for inbound middleware requests: the middleware verifies the JWT signature and treats the caller as an authenticated Salesforce org. The weakness of treating it as the *sole* trust anchor is that it proves only that the request came from *some* Salesforce code in the org — not that it followed the expected business logic path (e.g., came from the correct trigger, with correct before/after state, for a valid object type). A malicious or buggy Apex class could obtain the Named Credential and call middleware endpoints with arbitrary payloads. Layering in operation-level authorization (validating that the requested sync operation is consistent with the Salesforce object state) adds defense in depth beyond the JWT.

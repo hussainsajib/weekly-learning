@@ -10,9 +10,9 @@
 
 BigQuery is Google Cloud's fully managed, serverless data warehouse, but understanding *why* it performs the way it does requires looking beneath the abstractions. At its core, BigQuery separates storage from compute: data lives in Google's distributed file system (Colossus) in a proprietary columnar format, while queries are executed by Dremel — a massively parallel query execution engine that can fan out work across thousands of workers in seconds. This architecture means BigQuery scales to petabytes without any infrastructure tuning on your part, but it also means that naive SQL patterns that work fine in PostgreSQL or MySQL can become enormously expensive or slow.
 
-For an engineer working on the `etl-appliedcrm-bq` pipeline, this matters in concrete ways. Every Salesforce object sync you write touches BigQuery tables that either pay by bytes scanned or compete for reservation slots. The difference between a query that scans 10 MB and one that scans 10 GB is often a single missing partition filter. Choosing between streaming inserts (low-latency, higher cost) and batch loads (high-throughput, lower cost) directly determines how fresh your analytics data is and what it costs at month-end. Designing your schema as a normalized star schema versus a denormalized OBT (One Big Table) affects not just performance but whether downstream analysts can actually use the data without joining nightmares.
+For an engineer working on the `etl-bq-pipeline` pipeline, this matters in concrete ways. Every Salesforce object sync you write touches BigQuery tables that either pay by bytes scanned or compete for reservation slots. The difference between a query that scans 10 MB and one that scans 10 GB is often a single missing partition filter. Choosing between streaming inserts (low-latency, higher cost) and batch loads (high-throughput, lower cost) directly determines how fresh your analytics data is and what it costs at month-end. Designing your schema as a normalized star schema versus a denormalized OBT (One Big Table) affects not just performance but whether downstream analysts can actually use the data without joining nightmares.
 
-This week covers the internals that explain BigQuery's behavior, the SQL techniques (window functions, analytical queries) that make it powerful, and the design patterns (SCD Type 2, partitioning, clustering) that separate a working ETL from a production-grade one. You already own BQ schema design for the AESF platform — this guide is meant to sharpen the "why" behind decisions you likely already make by intuition, and to surface a few traps that bite even experienced BQ practitioners.
+This week covers the internals that explain BigQuery's behavior, the SQL techniques (window functions, analytical queries) that make it powerful, and the design patterns (SCD Type 2, partitioning, clustering) that separate a working ETL from a production-grade one. You already own BQ schema design for the integration platform — this guide is meant to sharpen the "why" behind decisions you likely already make by intuition, and to surface a few traps that bite even experienced BQ practitioners.
 
 By the end of this session you should be able to reason about slot utilization, write correct SCD Type 2 merge logic in BigQuery SQL, explain when to use streaming inserts versus batch loads in the context of Salesforce sync events, and choose a partition and cluster strategy for any Salesforce object table with confidence.
 
@@ -41,7 +41,7 @@ Shuffles between stages move data between nodes and are the primary bottleneck i
 SELECT
   account_id,
   COUNT(*) AS sync_count
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
 WHERE DATE(created_at) BETWEEN '2026-10-01' AND '2026-10-31'
 GROUP BY account_id;
 ```
@@ -62,11 +62,11 @@ Partitioning divides a table into segments based on a column value. BigQuery sup
 | Date/Timestamp | Any DATE or TIMESTAMP column | Tables with a natural time axis |
 | Integer range | Any INT64 column | IDs with known ranges |
 
-For your Salesforce object tables in `etl-appliedcrm-bq`, the natural partition column is almost always the record's `LastModifiedDate` or your ETL's `load_timestamp`. Date partitioning on `LastModifiedDate` means incremental sync queries that filter `WHERE LastModifiedDate >= @watermark` scan only the relevant day partitions instead of the full table.
+For your Salesforce object tables in `etl-bq-pipeline`, the natural partition column is almost always the record's `LastModifiedDate` or your ETL's `load_timestamp`. Date partitioning on `LastModifiedDate` means incremental sync queries that filter `WHERE LastModifiedDate >= @watermark` scan only the relevant day partitions instead of the full table.
 
 ```sql
 -- Create a partitioned table for SF Opportunity syncs
-CREATE TABLE `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+CREATE TABLE `gcp-project-staging.salesforce_sync.sf_opportunity`
 (
   opportunity_id        STRING NOT NULL,
   account_id            STRING,
@@ -93,7 +93,7 @@ Clustering sorts data within each partition by up to four columns. Queries that 
 
 ```sql
 -- Cluster by columns that analysts filter/join on most
-CREATE TABLE `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+CREATE TABLE `gcp-project-staging.salesforce_sync.sf_opportunity`
 (
   -- ... same columns ...
 )
@@ -113,7 +113,7 @@ For Salesforce objects, a good clustering strategy is: primary lookup key first 
 
 On-demand pricing charges $6.25 per TiB of data processed. The first 1 TiB per month is free. Queries get access to a shared pool of up to 2,000 concurrent slots. This model is ideal for development, ad-hoc analysis, and workloads with unpredictable query patterns.
 
-For `etl-appliedcrm-bq` on-demand projects (QA: `aedl-ssa-9999999996`, Data: `aedl-ssa-9999990033`), the cost pressure is primarily about minimizing bytes scanned — hence the importance of partition filters and column selection.
+For `etl-bq-pipeline` on-demand projects (QA: `gcp-project-qa`, Data: `gcp-project-data`), the cost pressure is primarily about minimizing bytes scanned — hence the importance of partition filters and column selection.
 
 ### Slot-Based / Capacity Billing
 
@@ -125,7 +125,7 @@ This model makes sense when: (a) monthly on-demand costs consistently exceed res
 # Python BigQuery client: check bytes processed before running expensive queries
 from google.cloud import bigquery
 
-client = bigquery.Client(project="aedl-ssa-1668620072")
+client = bigquery.Client(project="gcp-project-staging")
 
 job_config = bigquery.QueryJobConfig(
     dry_run=True,
@@ -133,7 +133,7 @@ job_config = bigquery.QueryJobConfig(
 )
 
 query = """
-SELECT * FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+SELECT * FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
 WHERE DATE(load_timestamp) >= '2026-01-01'
 """
 
@@ -172,7 +172,7 @@ SELECT
     PARTITION BY opportunity_id
     ORDER BY load_timestamp DESC
   ) AS rn
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
 WHERE DATE(load_timestamp) >= '2026-01-01';
 
 -- 2. LAG: detect field changes between syncs (for SCD Type 2)
@@ -184,7 +184,7 @@ SELECT
     ORDER BY load_timestamp
   ) AS prev_stage_name,
   load_timestamp
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`;
+FROM `gcp-project-staging.salesforce_sync.sf_opportunity`;
 
 -- 3. Running total of opportunity amounts per account per month
 SELECT
@@ -196,7 +196,7 @@ SELECT
     ORDER BY close_date
     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
   ) AS running_monthly_total
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
 WHERE stage_name = 'Closed Won';
 
 -- 4. NTILE: bucket policies by premium size for analysis
@@ -204,7 +204,7 @@ SELECT
   policy_id,
   total_premium,
   NTILE(4) OVER (ORDER BY total_premium) AS premium_quartile
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_policy`;
+FROM `gcp-project-staging.salesforce_sync.sf_policy`;
 ```
 
 ### Frame Clauses
@@ -221,7 +221,7 @@ FROM `aedl-ssa-1668620072.salesforce_sync.sf_policy`;
 
 ## 5. Slowly Changing Dimensions (SCD)
 
-A slowly changing dimension tracks how a dimension attribute changes over time. For your pipeline, this is critical for objects like `AESF__Policy__c` (policy status changes over time) and `Account` (address, assigned rep changes).
+A slowly changing dimension tracks how a dimension attribute changes over time. For your pipeline, this is critical for objects like `APP__Policy__c` (policy status changes over time) and `Account` (address, assigned rep changes).
 
 ### SCD Type 1 — Overwrite
 Just update in place. No history preserved. Simplest, but you lose the audit trail. Appropriate for fields where history genuinely does not matter (e.g., a data-quality correction).
@@ -231,8 +231,8 @@ Just update in place. No history preserved. Simplest, but you lose the audit tra
 SCD Type 2 creates a new row for each change and tracks validity periods. Every row gets `valid_from`, `valid_to`, and `is_current` columns.
 
 ```sql
--- SCD Type 2 merge for AESF__Policy__c
-MERGE `aedl-ssa-1668620072.salesforce_sync.sf_policy_dim` AS target
+-- SCD Type 2 merge for APP__Policy__c
+MERGE `gcp-project-staging.salesforce_sync.sf_policy_dim` AS target
 USING (
   -- Incoming batch from Salesforce sync
   SELECT
@@ -242,7 +242,7 @@ USING (
     expiration_date,
     total_premium,
     CURRENT_TIMESTAMP() AS load_ts
-  FROM `aedl-ssa-1668620072.salesforce_sync.sf_policy_staging`
+  FROM `gcp-project-staging.salesforce_sync.sf_policy_staging`
 ) AS source
 ON target.policy_id = source.policy_id
    AND target.is_current = TRUE
@@ -269,14 +269,14 @@ WHEN NOT MATCHED BY TARGET THEN INSERT (
 -- Insert the new version for MATCHED-but-changed rows
 -- (BigQuery MERGE cannot insert and update in the same MATCHED clause,
 --  so use a follow-up INSERT ... SELECT for the new current rows)
-INSERT INTO `aedl-ssa-1668620072.salesforce_sync.sf_policy_dim`
+INSERT INTO `gcp-project-staging.salesforce_sync.sf_policy_dim`
 SELECT
   s.policy_id, s.status, s.effective_date, s.expiration_date, s.total_premium,
   s.load_ts AS valid_from,
   TIMESTAMP('9999-12-31') AS valid_to,
   TRUE AS is_current
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_policy_staging` s
-JOIN `aedl-ssa-1668620072.salesforce_sync.sf_policy_dim` d
+FROM `gcp-project-staging.salesforce_sync.sf_policy_staging` s
+JOIN `gcp-project-staging.salesforce_sync.sf_policy_dim` d
   ON s.policy_id = d.policy_id
   AND d.valid_to != TIMESTAMP('9999-12-31')   -- row we just closed
   AND d.is_current = FALSE
@@ -311,13 +311,13 @@ Pre-join everything into a single wide, denormalized table. Analysts query one t
 **Pros:** Faster queries (no shuffle from joins), simpler for analysts, BigQuery's columnar storage means unused columns don't cost anything at query time.  
 **Cons:** Storage duplication, dimension updates require rewriting fact rows, harder to maintain.
 
-### Practical Recommendation for AESF BQ
+### Practical Recommendation for the Integration Platform BQ
 
 Use a **hybrid approach**: denormalize the most frequently joined dimensions (account name, stage name, record type label) into the fact table as redundant columns, while keeping full dimension tables for complex lookups. This gives you join-free performance on the 90% case while preserving correctness.
 
 ```sql
 -- Hybrid OBT: policy fact with denormalized account name
-CREATE TABLE `aedl-ssa-1668620072.salesforce_sync.policy_fact` AS
+CREATE TABLE `gcp-project-staging.salesforce_sync.policy_fact` AS
 SELECT
   p.policy_id,
   p.account_id,
@@ -327,8 +327,8 @@ SELECT
   p.effective_date,
   p.total_premium,
   p.load_timestamp
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_policy` p
-LEFT JOIN `aedl-ssa-1668620072.salesforce_sync.sf_account` a
+FROM `gcp-project-staging.salesforce_sync.sf_policy` p
+LEFT JOIN `gcp-project-staging.salesforce_sync.sf_account` a
   ON p.account_id = a.account_id
   AND a.is_current = TRUE;
 ```
@@ -343,7 +343,7 @@ LEFT JOIN `aedl-ssa-1668620072.salesforce_sync.sf_account` a
 
 The BigQuery Storage Write API (or legacy streaming API) allows row-by-row or micro-batch insertion with data available for queries within seconds.
 
-**Use when:** You need near-real-time data availability. For example, `AESF__Marketing_Submission__c` changes that should be visible in dashboards within minutes of the Salesforce trigger firing.
+**Use when:** You need near-real-time data availability. For example, `APP__Marketing_Submission__c` changes that should be visible in dashboards within minutes of the Salesforce trigger firing.
 
 **Cost:** ~$0.01 per 200 MB inserted (Storage Write API committed mode is cheaper than legacy streaming).
 
@@ -360,8 +360,8 @@ client = bigquery_storage_v1.BigQueryWriteClient()
 # For simpler use cases, the standard BQ client streaming insert:
 from google.cloud import bigquery
 
-bq = bigquery.Client(project="aedl-ssa-1668620072")
-table_id = "aedl-ssa-1668620072.salesforce_sync.sf_marketing_submission"
+bq = bigquery.Client(project="gcp-project-staging")
+table_id = "gcp-project-staging.salesforce_sync.sf_marketing_submission"
 
 rows = [
     {
@@ -382,7 +382,7 @@ if errors:
 
 Load jobs read from Cloud Storage (CSV, JSON, Avro, Parquet, ORC) and write directly to managed storage. No per-row cost — loads are free.
 
-**Use when:** You run scheduled ETL windows (hourly, daily). For `etl-appliedcrm-bq`'s Pentaho jobs that run on a schedule, batch load from a GCS staging bucket is almost always the right choice.
+**Use when:** You run scheduled ETL windows (hourly, daily). For `etl-bq-pipeline`'s Pentaho jobs that run on a schedule, batch load from a GCS staging bucket is almost always the right choice.
 
 ```python
 from google.cloud import bigquery, storage
@@ -427,7 +427,7 @@ def batch_load_to_bq(df: pd.DataFrame, table_id: str, project: str):
 | Volume per sync | Low (< 10K rows) | High (> 100K rows) |
 | Cost sensitivity | Higher | Lower (free) |
 | Schema flexibility | Needs stable schema | Same |
-| AESF use case | Real-time trigger events | Scheduled Pentaho ETL |
+| Integration platform use case | Real-time trigger events | Scheduled Pentaho ETL |
 
 > **Common mistake:** Using streaming inserts for bulk historical backfills. A one-time load of 50M historical Opportunity records via streaming inserts costs ~$2,500 in insert fees. The same load via Parquet files in GCS costs $0 for the load job itself (you pay only for GCS storage and BigQuery storage after load).
 
@@ -451,7 +451,7 @@ def batch_load_to_bq(df: pd.DataFrame, table_id: str, project: str):
 Configure partition expiration to automatically drop old partitions. For staging/QA projects this controls cost; for production set a longer window or no expiration.
 
 ```sql
-ALTER TABLE `aedl-ssa-9999999996.salesforce_sync.sf_opportunity`
+ALTER TABLE `gcp-project-qa.salesforce_sync.sf_opportunity`
 SET OPTIONS (
   partition_expiration_days = 365
 );
@@ -466,7 +466,7 @@ SELECT
   total_rows,
   total_logical_bytes / pow(1024, 3) AS size_gb,
   last_modified_time
-FROM `aedl-ssa-1668620072.salesforce_sync.INFORMATION_SCHEMA.PARTITIONS`
+FROM `gcp-project-staging.salesforce_sync.INFORMATION_SCHEMA.PARTITIONS`
 WHERE table_name = 'sf_opportunity'
 ORDER BY partition_id DESC
 LIMIT 30;
@@ -484,11 +484,11 @@ Always name columns explicitly. In columnar storage, `SELECT *` reads every colu
 
 ```sql
 -- Bad: reads all 80 columns
-SELECT * FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`;
+SELECT * FROM `gcp-project-staging.salesforce_sync.sf_opportunity`;
 
 -- Good: reads only 4 columns
 SELECT opportunity_id, account_id, stage_name, amount
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
 WHERE DATE(load_timestamp) = CURRENT_DATE();
 ```
 
@@ -499,7 +499,7 @@ WHERE DATE(load_timestamp) = CURRENT_DATE();
 SELECT
   stage_name,
   APPROX_COUNT_DISTINCT(account_id) AS approx_unique_accounts
-FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
 WHERE DATE(load_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
 GROUP BY stage_name;
 ```
@@ -510,13 +510,13 @@ GROUP BY stage_name;
 -- Materialize filtered subsets before joining (reduces shuffle size)
 WITH recent_opportunities AS (
   SELECT opportunity_id, account_id, amount
-  FROM `aedl-ssa-1668620072.salesforce_sync.sf_opportunity`
+  FROM `gcp-project-staging.salesforce_sync.sf_opportunity`
   WHERE DATE(load_timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
     AND stage_name = 'Closed Won'
 ),
 active_accounts AS (
   SELECT account_id, name, billing_state
-  FROM `aedl-ssa-1668620072.salesforce_sync.sf_account`
+  FROM `gcp-project-staging.salesforce_sync.sf_account`
   WHERE is_current = TRUE
     AND billing_state IN ('CA', 'NY', 'TX')
 )
@@ -568,7 +568,7 @@ BigQuery & Data Warehousing
 │   ├── Streaming → low latency, higher cost, dedup via insertId
 │   └── Batch (GCS → Load Job) → free, high throughput
 │
-└── AESF BQ ETL Application
+└── Integration Platform BQ ETL Application
     ├── Partition: load_timestamp (incremental watermark queries)
     ├── Cluster: account_id first (primary join/filter key)
     ├── SCD Type 2: sf_policy_dim for policy history
@@ -601,7 +601,7 @@ BigQuery & Data Warehousing
 
 **10.** What is the core trade-off between a star schema and a One Big Table (OBT) in BigQuery?
 
-**11.** When should you use streaming inserts instead of batch load jobs in the context of the AESF ETL pipeline?
+**11.** When should you use streaming inserts instead of batch load jobs in the context of the integration platform ETL pipeline?
 
 **12.** What is the `insertId` field in BigQuery streaming inserts, and what guarantee does it provide?
 
@@ -617,7 +617,7 @@ BigQuery & Data Warehousing
 
 **18.** What is the difference between `APPROX_COUNT_DISTINCT` and `COUNT(DISTINCT ...)` in BigQuery?
 
-**19.** Describe the recommended partition and cluster strategy for the `sf_opportunity` table in `etl-appliedcrm-bq` and justify each choice.
+**19.** Describe the recommended partition and cluster strategy for the `sf_opportunity` table in `etl-bq-pipeline` and justify each choice.
 
 **20.** A load job that appended records to `sf_policy` ran twice due to a Pentaho retry. How would you detect and remove duplicate rows?
 
@@ -647,7 +647,7 @@ BigQuery & Data Warehousing
 
     **10.** A star schema normalizes dimensions into separate tables, reducing storage redundancy and making dimension updates simple. However, every query against a star schema requires JOINs, which in BigQuery generate expensive shuffle operations between Dremel nodes. A One Big Table pre-joins everything, eliminating shuffle at query time but duplicating dimension data across every fact row. In BigQuery, because columnar storage means unused columns cost nothing at query time, the OBT's storage duplication is less harmful than in row-store databases, making a fully or partially denormalized OBT often faster and simpler for analysts — at the cost of more complex ETL to maintain consistency.
 
-    **11.** Use streaming inserts when the downstream use case requires data to be queryable within seconds to minutes of the Salesforce event — for example, if a marketing submission status change needs to appear in a live dashboard within 5 minutes of the trigger. For all other cases in the AESF ETL pipeline — scheduled Pentaho jobs running hourly or daily syncs of Opportunity, Policy, Account, or Contact data — batch load from a GCS staging file is preferable. Batch loads are free (no per-row insert cost), support higher throughput, and are more straightforward to retry and audit. Streaming inserts cost approximately $0.01 per 200 MB and have subtler deduplication semantics.
+    **11.** Use streaming inserts when the downstream use case requires data to be queryable within seconds to minutes of the Salesforce event — for example, if a marketing submission status change needs to appear in a live dashboard within 5 minutes of the trigger. For all other cases in the integration platform ETL pipeline — scheduled Pentaho jobs running hourly or daily syncs of Opportunity, Policy, Account, or Contact data — batch load from a GCS staging file is preferable. Batch loads are free (no per-row insert cost), support higher throughput, and are more straightforward to retry and audit. Streaming inserts cost approximately $0.01 per 200 MB and have subtler deduplication semantics.
 
     **12.** The `insertId` is an optional string field you provide when streaming rows to BigQuery. BigQuery uses it for best-effort deduplication: if the same `insertId` is received within a short deduplication window (typically a few minutes), BigQuery attempts to deduplicate the rows. It is *best-effort*, not guaranteed — BigQuery explicitly does not guarantee exactly-once delivery for streaming inserts. For true idempotency, use the Storage Write API in committed mode with `offset`-based exactly-once semantics, or design your downstream queries to use `ROW_NUMBER()` deduplication rather than relying on insert-time dedup.
 
@@ -655,7 +655,7 @@ BigQuery & Data Warehousing
 
     **14.** No. Partition pruning is triggered only when the query filter references the *partition column* directly. The `sf_policy` table is partitioned by `DATE(effective_date)`, so only queries filtering on `effective_date` (or an expression involving it) can prune partitions. A filter on `account_id` alone does not help BigQuery determine which date partitions to skip. The query will scan all partitions. This is exactly where *clustering* on `account_id` helps — within each partition, BigQuery can skip blocks that don't contain the target `account_id` value, providing sub-partition pruning.
 
-    **15.** `require_partition_filter = TRUE` is a table option that forces every query against the table to include a filter on the partition column. If a query omits the partition filter, BigQuery rejects it with an error before scanning any data. This is valuable for production Salesforce sync tables for two reasons: it prevents runaway cost from accidental full-table scans (e.g., an analyst who writes `SELECT * FROM sf_policy` without a date filter), and it enforces a query discipline that keeps the table usable as it grows. It is especially important in environments like `aedl-ssa-1668620072` (staging) where on-demand billing applies.
+    **15.** `require_partition_filter = TRUE` is a table option that forces every query against the table to include a filter on the partition column. If a query omits the partition filter, BigQuery rejects it with an error before scanning any data. This is valuable for production Salesforce sync tables for two reasons: it prevents runaway cost from accidental full-table scans (e.g., an analyst who writes `SELECT * FROM sf_policy` without a date filter), and it enforces a query discipline that keeps the table usable as it grows. It is especially important in environments like `gcp-project-staging` (staging) where on-demand billing applies.
 
     **16.** `NOT IN (SELECT ...)` returns NULL (meaning no rows) if the subquery returns any NULL values, because `x NOT IN (NULL, 'a', 'b')` evaluates to `UNKNOWN` for any value of `x`. This is a SQL standard behavior that causes silent data loss — rows that should be excluded based on the logic are instead simply dropped from the result set. The safe alternative is `NOT EXISTS (SELECT 1 FROM ... WHERE key = outer.key)`, which handles NULLs correctly, or a `LEFT JOIN ... WHERE inner_key IS NULL` anti-join pattern. In ETL deduplication logic, this bug can cause records to silently disappear from incremental loads.
 

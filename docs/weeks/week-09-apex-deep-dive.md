@@ -12,9 +12,9 @@ Apex is Salesforce's proprietary, strongly-typed, Java-like language that runs e
 
 For a senior engineer who writes both Apex and Python/FastAPI, the contrast is instructive. In Python you think about I/O and memory at the infrastructure level; in Apex you think about it at the platform limit level. A bulk trigger that fires on 200 records must perform the same number of SOQL queries as one that fires on 1 record — or you'll hit the 100-SOQL-per-transaction limit and crash your batch inserts in production. This forces a programming discipline — collect, query, process in bulk, DML once — that makes Apex code structurally different from equivalent Python.
 
-The AESF codebase you work in every day is a living example of these patterns and their edge cases. AccountTriggerHandler, ContactTriggerHandler, and OpportunityTriggerHandler handle bidirectional sync between Salesforce objects and Epic EHR via HTTP callouts to the FastAPI middleware. Each of these handlers must bulkify Epic API calls, manage async execution (callouts can't happen in the same synchronous DML transaction that fires the trigger), and handle partial failures without rolling back unrelated records. Understanding why those handlers are structured the way they are is the goal of this week.
+The CRM-EHR Integration Platform codebase you work in every day is a living example of these patterns and their edge cases. AccountTriggerHandler, ContactTriggerHandler, and OpportunityTriggerHandler handle bidirectional sync between Salesforce objects and the EHR system via HTTP callouts to the FastAPI middleware. Each of these handlers must bulkify EHR API calls, manage async execution (callouts can't happen in the same synchronous DML transaction that fires the trigger), and handle partial failures without rolling back unrelated records. Understanding why those handlers are structured the way they are is the goal of this week.
 
-By the end of this session you'll be able to: explain every major governor limit and why it exists, implement a one-trigger-per-object framework from scratch, choose the right async Apex mechanism (@future vs. Queueable vs. Batch vs. Scheduled), write bulkified SOQL and avoid N+1 query patterns, build proper exception handling that doesn't swallow failures silently, write meaningful unit tests with genuine coverage, and read the AESF trigger handlers with full comprehension of every architectural decision.
+By the end of this session you'll be able to: explain every major governor limit and why it exists, implement a one-trigger-per-object framework from scratch, choose the right async Apex mechanism (@future vs. Queueable vs. Batch vs. Scheduled), write bulkified SOQL and avoid N+1 query patterns, build proper exception handling that doesn't swallow failures silently, write meaningful unit tests with genuine coverage, and read the integration platform trigger handlers with full comprehension of every architectural decision.
 
 ---
 
@@ -37,7 +37,7 @@ Every Apex execution runs inside a **transaction**, and every transaction has a 
 | Queueable jobs enqueued | 50 | 1 (per execute) |
 | Batch Apex records | up to 50M | — |
 
-Notice the callout limit: 100 callouts per transaction. In AESF, a trigger on Opportunity might fire for 200 records. If you naively made one HTTP call to the middleware per record, you'd hit the callout limit at record 101 and fail the entire transaction. This is why `OpportunityTriggerHandler` collects all records first, batches them, and sends a single (or small number of) callout(s).
+Notice the callout limit: 100 callouts per transaction. In the integration platform, a trigger on Opportunity might fire for 200 records. If you naively made one HTTP call to the middleware per record, you'd hit the callout limit at record 101 and fail the entire transaction. This is why `OpportunityTriggerHandler` collects all records first, batches them, and sends a single (or small number of) callout(s).
 
 ### Checking Limits Programmatically
 
@@ -53,7 +53,7 @@ Integer remaining = Limits.getLimitCpuTime() - Limits.getCpuTime();
 System.debug('CPU ms remaining: ' + remaining);
 ```
 
-The `Limits` class exposes both current consumption (`Limits.getQueries()`) and the ceiling (`Limits.getLimitQueries()`). In production AESF code you rarely see these guards explicitly — the architecture is designed to stay well inside limits by construction — but during debugging they're invaluable.
+The `Limits` class exposes both current consumption (`Limits.getQueries()`) and the ceiling (`Limits.getLimitQueries()`). In production integration platform code you rarely see these guards explicitly — the architecture is designed to stay well inside limits by construction — but during debugging they're invaluable.
 
 **Common mistake:** Assuming limits reset between method calls within the same transaction. They do not. If MethodA uses 60 SOQL queries and then calls MethodB which uses 50 more, the transaction total is 110 — over the 100 limit. The reset only happens when the entire transaction completes (commit or rollback).
 
@@ -128,7 +128,7 @@ public class AccountTriggerHandler extends TriggerHandler {
 
     protected override void afterInsert() {
         // Callout can't run in before context; must be after
-        AccountEpicSync.syncToEpic(this.newList);
+        AccountEHRSync.syncToEHR(this.newList);
     }
 
     protected override void afterUpdate() {
@@ -142,7 +142,7 @@ public class AccountTriggerHandler extends TriggerHandler {
             }
         }
         if (!changed.isEmpty()) {
-            AccountEpicSync.syncToEpic(changed);
+            AccountEHRSync.syncToEHR(changed);
         }
     }
 }
@@ -153,7 +153,7 @@ public class AccountTriggerHandler extends TriggerHandler {
 - **Before triggers** run before the record is saved to the database. Use them for field defaulting, validation, and computed field population. `Trigger.new` is writable here — you can set fields directly without a DML statement.
 - **After triggers** run after the record is committed and has an Id. Use them for cross-object operations, callouts (via async), and anything that requires the record Id. `Trigger.new` is read-only.
 
-In AESF, all Epic sync happens in `afterInsert` and `afterUpdate` because: (a) you need the Salesforce Id to build the Epic payload, and (b) the HTTP callout to the middleware is dispatched asynchronously anyway.
+In the integration platform, all EHR sync happens in `afterInsert` and `afterUpdate` because: (a) you need the Salesforce Id to build the EHR payload, and (b) the HTTP callout to the middleware is dispatched asynchronously anyway.
 
 **Common mistake:** Performing SOQL inside a for loop over `Trigger.new`. Every iteration fires a new query against the query limit. Always query outside the loop, then use a Map for O(1) lookup inside the loop.
 
@@ -161,25 +161,25 @@ In AESF, all Epic sync happens in `afterInsert` and `afterUpdate` because: (a) y
 
 ## 3. Async Apex — Choosing the Right Mechanism
 
-Because triggers run synchronously and callouts to external systems can't happen in the same DML transaction that saves the record, AESF uses async Apex to hand off Epic sync work. There are four async mechanisms and choosing the wrong one has real consequences.
+Because triggers run synchronously and callouts to external systems can't happen in the same DML transaction that saves the record, the integration platform uses async Apex to hand off EHR sync work. There are four async mechanisms and choosing the wrong one has real consequences.
 
 ### @future — Fire-and-Forget
 
 ```apex
-public class AccountEpicSync {
+public class AccountEHRSync {
 
     @future(callout=true)
-    public static void syncToEpic(Set<Id> accountIds) {
+    public static void syncToEHR(Set<Id> accountIds) {
         // Re-query inside @future — you can't pass sObjects across async boundaries
         List<Account> accounts = [
             SELECT Id, Name, BillingStreet, BillingCity,
-                   AESF__Epic_Client_Id__c
+                   APP__EHR_Client_Id__c
             FROM   Account
             WHERE  Id IN :accountIds
         ];
         // Build payload and callout
-        String payload = buildEpicPayload(accounts);
-        EpicMiddlewareClient.post('/clients', payload);
+        String payload = buildEHRPayload(accounts);
+        EHRMiddlewareClient.post('/clients', payload);
     }
 }
 ```
@@ -205,11 +205,11 @@ public class AccountSyncQueueable implements Queueable, Database.AllowsCallouts 
 
     public void execute(QueueableContext ctx) {
         List<Account> accounts = [
-            SELECT Id, Name, BillingStreet, AESF__Epic_Client_Id__c
+            SELECT Id, Name, BillingStreet, APP__EHR_Client_Id__c
             FROM   Account
             WHERE  Id IN :this.accountIds
         ];
-        HttpResponse resp = EpicMiddlewareClient.post(
+        HttpResponse resp = EHRMiddlewareClient.post(
             '/clients',
             JSON.serialize(buildPayload(accounts))
         );
@@ -224,7 +224,7 @@ public class AccountSyncQueueable implements Queueable, Database.AllowsCallouts 
         for (Account a : accounts) {
             result.add(new Map<String, Object>{
                 'sfId'    => a.Id,
-                'epicId'  => a.AESF__Epic_Client_Id__c,
+                'ehrId'   => a.APP__EHR_Client_Id__c,
                 'name'    => a.Name,
                 'address' => a.BillingStreet
             });
@@ -246,25 +246,25 @@ Queueable advantages over @future: can implement interfaces, has a job Id you ca
 ### Batch Apex — Large Data Volumes
 
 ```apex
-public class AccountEpicBatchSync
+public class AccountEHRBatchSync
     implements Database.Batchable<SObject>, Database.AllowsCallouts {
 
     public Database.QueryLocator start(Database.BatchableContext bc) {
         return Database.getQueryLocator([
-            SELECT Id, Name, BillingStreet, AESF__Epic_Client_Id__c,
-                   AESF__Sync_Status__c
+            SELECT Id, Name, BillingStreet, APP__EHR_Client_Id__c,
+                   APP__Sync_Status__c
             FROM   Account
-            WHERE  AESF__Sync_Status__c = 'Pending'
+            WHERE  APP__Sync_Status__c = 'Pending'
         ]);
     }
 
     public void execute(Database.BatchableContext bc, List<Account> scope) {
         // scope size is 1–200 records, configurable
         // Each execute() call is its own transaction with fresh governor limits
-        EpicMiddlewareClient.post('/clients/bulk', JSON.serialize(scope));
+        EHRMiddlewareClient.post('/clients/bulk', JSON.serialize(scope));
 
         for (Account a : scope) {
-            a.AESF__Sync_Status__c = 'Synced';
+            a.APP__Sync_Status__c = 'Synced';
         }
         update scope;  // DML inside execute is fine
     }
@@ -282,7 +282,7 @@ public class AccountEpicBatchSync
 }
 
 // Launch:
-Database.executeBatch(new AccountEpicBatchSync(), 50);
+Database.executeBatch(new AccountEHRBatchSync(), 50);
 // 50 = scope size per execute() call
 ```
 
@@ -291,15 +291,15 @@ Key: each `execute()` call gets a **fresh set of governor limits**. This is why 
 ### Scheduled Apex
 
 ```apex
-public class DailyEpicReconcile implements Schedulable {
+public class DailyEHRReconcile implements Schedulable {
     public void execute(SchedulableContext sc) {
-        Database.executeBatch(new AccountEpicBatchSync(), 50);
+        Database.executeBatch(new AccountEHRBatchSync(), 50);
     }
 }
 
 // Schedule via Apex (can also use Setup > Scheduled Jobs UI):
 String cron = '0 0 2 * * ?';  // 2 AM daily
-System.schedule('Daily Epic Reconcile', cron, new DailyEpicReconcile());
+System.schedule('Daily EHR Reconcile', cron, new DailyEHRReconcile());
 ```
 
 **Common mistake:** Implementing `Database.AllowsCallouts` on a Batch class but using a scope size larger than 1 when each record requires its own HTTP callout. HTTP callout limits (100 per transaction) apply per `execute()` call. With scope=50 records and one callout per record, you'll hit the limit halfway through.
@@ -316,7 +316,7 @@ SOQL (Salesforce Object Query Language) is to Apex what SQL is to Python — the
 // Basic query with relationship traversal (parent → child)
 List<Opportunity> opps = [
     SELECT Id, Name, Amount, StageName,
-           Account.Name, Account.AESF__Epic_Client_Id__c,
+           Account.Name, Account.APP__EHR_Client_Id__c,
            (SELECT Id, Subject FROM Tasks WHERE Status = 'Open')
     FROM   Opportunity
     WHERE  StageName NOT IN ('Closed Won', 'Closed Lost')
@@ -327,7 +327,7 @@ List<Opportunity> opps = [
 
 // Map-based query — critical for bulkification
 Map<Id, Account> accountMap = new Map<Id, Account>([
-    SELECT Id, Name, AESF__Epic_Client_Id__c
+    SELECT Id, Name, APP__EHR_Client_Id__c
     FROM   Account
     WHERE  Id IN :accountIds  // :variable bind — safe, no SOQL injection
 ]);
@@ -348,12 +348,12 @@ for (AggregateResult ar : results) {
 
 ### Dynamic SOQL
 
-When field names or conditions come from configuration (as in AESF's metadata-driven sync field mapping), you need dynamic SOQL:
+When field names or conditions come from configuration (as in the integration platform's metadata-driven sync field mapping), you need dynamic SOQL:
 
 ```apex
 String objectApiName = 'Account';
 String fields = 'Id, Name, BillingStreet';
-String filter = 'AESF__Sync_Status__c = \'Pending\'';
+String filter = 'APP__Sync_Status__c = \'Pending\'';
 
 String query = 'SELECT ' + fields
              + ' FROM ' + objectApiName
@@ -412,7 +412,7 @@ for (Contact con : Trigger.new) {
 }
 
 Map<Id, Account> accountMap = new Map<Id, Account>([
-    SELECT Id, Name, AESF__Epic_Client_Id__c
+    SELECT Id, Name, APP__EHR_Client_Id__c
     FROM   Account
     WHERE  Id IN :accountIds
 ]);
@@ -430,19 +430,19 @@ for (Contact con : Trigger.new) {
 ```apex
 // BAD — DML inside loop
 for (Contact con : Trigger.new) {
-    AESF__Contact_Number__c num = new AESF__Contact_Number__c(
-        AESF__Contact__c = con.Id,
-        AESF__Type__c    = 'Primary'
+    APP__Contact_Number__c num = new APP__Contact_Number__c(
+        APP__Contact__c = con.Id,
+        APP__Type__c    = 'Primary'
     );
     insert num;  // 1 DML per record → 200 records = 200 DML statements
 }
 
 // GOOD — collect and DML once
-List<AESF__Contact_Number__c> toInsert = new List<AESF__Contact_Number__c>();
+List<APP__Contact_Number__c> toInsert = new List<APP__Contact_Number__c>();
 for (Contact con : Trigger.new) {
-    toInsert.add(new AESF__Contact_Number__c(
-        AESF__Contact__c = con.Id,
-        AESF__Type__c    = 'Primary'
+    toInsert.add(new APP__Contact_Number__c(
+        APP__Contact__c = con.Id,
+        APP__Type__c    = 'Primary'
     ));
 }
 if (!toInsert.isEmpty()) {
@@ -450,19 +450,19 @@ if (!toInsert.isEmpty()) {
 }
 ```
 
-### Bulkifying Callouts in AESF
+### Bulkifying Callouts in the Integration Platform
 
-The middleware `/clients` endpoint accepts a list in the POST body. The AESF sync classes collect all changed accounts from the trigger batch and send one HTTP request:
+The middleware `/clients` endpoint accepts a list in the POST body. The sync classes collect all changed accounts from the trigger batch and send one HTTP request:
 
 ```apex
-public class AccountEpicSync {
+public class AccountEHRSync {
 
     @future(callout=true)
-    public static void syncToEpic(Set<Id> accountIds) {
+    public static void syncToEHR(Set<Id> accountIds) {
         List<Account> accounts = [
             SELECT Id, Name, BillingStreet, BillingCity, BillingState,
                    BillingPostalCode, BillingCountry,
-                   AESF__Epic_Client_Id__c, AESF__Sync_Status__c
+                   APP__EHR_Client_Id__c, APP__Sync_Status__c
             FROM   Account
             WHERE  Id IN :accountIds
         ];
@@ -471,7 +471,7 @@ public class AccountEpicSync {
         for (Account a : accounts) {
             payload.add(new Map<String, Object>{
                 'salesforce_id' => a.Id,
-                'epic_id'       => a.AESF__Epic_Client_Id__c,
+                'ehr_id'        => a.APP__EHR_Client_Id__c,
                 'name'          => a.Name,
                 'address'       => new Map<String, Object>{
                     'street'  => a.BillingStreet,
@@ -484,7 +484,7 @@ public class AccountEpicSync {
         }
 
         HttpRequest req = new HttpRequest();
-        req.setEndpoint('callout:AESF_Middleware/api/v2/clients/bulk');
+        req.setEndpoint('callout:CRM_Middleware/api/v2/clients/bulk');
         req.setMethod('POST');
         req.setHeader('Content-Type', 'application/json');
         req.setBody(JSON.serialize(payload));
@@ -495,7 +495,7 @@ public class AccountEpicSync {
 
         if (resp.getStatusCode() != 200) {
             // Log, update sync status fields to 'Failed'
-            ErrorLogger.logCalloutFailure('AccountEpicSync', resp);
+            ErrorLogger.logCalloutFailure('AccountEHRSync', resp);
         }
     }
 }
@@ -514,11 +514,11 @@ Apex exceptions fall into two categories: **caught** (you can write a try/catch)
 ### try/catch/finally
 
 ```apex
-public class EpicMiddlewareClient {
+public class EHRMiddlewareClient {
 
     public static HttpResponse post(String path, String body) {
         HttpRequest req = new HttpRequest();
-        req.setEndpoint('callout:AESF_Middleware' + path);
+        req.setEndpoint('callout:CRM_Middleware' + path);
         req.setMethod('POST');
         req.setHeader('Content-Type', 'application/json');
         req.setBody(body);
@@ -542,7 +542,7 @@ public class EpicMiddlewareClient {
 
 ### Database.SaveResult and Partial Success
 
-When you use `Database.insert(records, false)` (allOrNone = false), Salesforce attempts each record independently and returns results — some may succeed while others fail. This is critical for AESF sync where one bad record shouldn't block 199 good ones:
+When you use `Database.insert(records, false)` (allOrNone = false), Salesforce attempts each record independently and returns results — some may succeed while others fail. This is critical for integration platform sync where one bad record shouldn't block 199 good ones:
 
 ```apex
 List<Database.SaveResult> results = Database.insert(recordsToInsert, false);
@@ -567,10 +567,10 @@ if (!errors.isEmpty()) {
 ### Custom Exception Classes
 
 ```apex
-public class EpicSyncException extends Exception {
+public class EHRSyncException extends Exception {
     private Integer httpStatusCode;
 
-    public EpicSyncException(String message, Integer statusCode) {
+    public EHRSyncException(String message, Integer statusCode) {
         this(message);
         this.httpStatusCode = statusCode;
     }
@@ -582,20 +582,20 @@ public class EpicSyncException extends Exception {
 
 // Usage
 if (resp.getStatusCode() >= 500) {
-    throw new EpicSyncException(
+    throw new EHRSyncException(
         'Middleware returned ' + resp.getStatusCode(),
         resp.getStatusCode()
     );
 }
 ```
 
-**Common mistake:** Catching `Exception` at the top of every method and silently swallowing it with just a `System.debug`. This makes failures invisible. In AESF, the pattern is to log to a custom `AESF__Sync_Error__c` object and update the originating record's sync status field so that failures are visible in the UI and queryable in reports.
+**Common mistake:** Catching `Exception` at the top of every method and silently swallowing it with just a `System.debug`. This makes failures invisible. In the integration platform, the pattern is to log to a custom `APP__Sync_Error__c` object and update the originating record's sync status field so that failures are visible in the UI and queryable in reports.
 
 ---
 
 ## 7. Unit Testing and @isTest
 
-Salesforce requires 75% code coverage across all Apex to deploy to production. But coverage is a floor, not a goal — a test that touches lines without asserting anything is worse than useless because it gives false confidence. The AESF standard is tests that assert both the happy path and error paths.
+Salesforce requires 75% code coverage across all Apex to deploy to production. But coverage is a floor, not a goal — a test that touches lines without asserting anything is worse than useless because it gives false confidence. The integration platform standard is tests that assert both the happy path and error paths.
 
 ### Test Structure
 
@@ -621,12 +621,12 @@ private class AccountTriggerHandlerTest {
         Account acc = [SELECT Id FROM Account WHERE Name = 'Test Corp' LIMIT 1];
 
         // Set up mock HTTP response BEFORE calling code that makes callouts
-        Test.setMock(HttpCalloutMock.class, new EpicMiddlewareMock(200, '{"status":"ok"}'));
+        Test.setMock(HttpCalloutMock.class, new EHRMiddlewareMock(200, '{"status":"ok"}'));
 
         Test.startTest();
         // Trigger the after insert logic
         Account newAcc = new Account(
-            Name          = 'New Epic Client',
+            Name          = 'New EHR Client',
             BillingStreet = '200 Elm St'
         );
         insert newAcc;
@@ -634,25 +634,25 @@ private class AccountTriggerHandlerTest {
 
         // Assert the sync was attempted — check a side effect (e.g., status field)
         Account result = [
-            SELECT AESF__Sync_Status__c
+            SELECT APP__Sync_Status__c
             FROM   Account
             WHERE  Id = :newAcc.Id
         ];
-        System.assertEquals('Synced', result.AESF__Sync_Status__c,
+        System.assertEquals('Synced', result.APP__Sync_Status__c,
             'Account should be marked Synced after successful middleware callout');
     }
 
     @isTest
     static void testAfterInsert_calloutFailure() {
-        Test.setMock(HttpCalloutMock.class, new EpicMiddlewareMock(500, 'Internal Server Error'));
+        Test.setMock(HttpCalloutMock.class, new EHRMiddlewareMock(500, 'Internal Server Error'));
 
         Test.startTest();
         Account failAcc = new Account(Name = 'Fail Corp', BillingStreet = '1 Error Rd');
         insert failAcc;
         Test.stopTest();
 
-        Account result = [SELECT AESF__Sync_Status__c FROM Account WHERE Id = :failAcc.Id];
-        System.assertEquals('Failed', result.AESF__Sync_Status__c,
+        Account result = [SELECT APP__Sync_Status__c FROM Account WHERE Id = :failAcc.Id];
+        System.assertEquals('Failed', result.APP__Sync_Status__c,
             'Account should be marked Failed when middleware returns 500');
     }
 }
@@ -662,11 +662,11 @@ private class AccountTriggerHandlerTest {
 
 ```apex
 @isTest
-global class EpicMiddlewareMock implements HttpCalloutMock {
+global class EHRMiddlewareMock implements HttpCalloutMock {
     private Integer statusCode;
     private String  body;
 
-    public EpicMiddlewareMock(Integer statusCode, String body) {
+    public EHRMiddlewareMock(Integer statusCode, String body) {
         this.statusCode = statusCode;
         this.body       = body;
     }
@@ -689,18 +689,18 @@ These two calls are essential for async testing. `Test.startTest()` resets gover
 
 ---
 
-## 8. AESF Trigger Architecture Walkthrough
+## 8. Integration Platform Trigger Architecture Walkthrough
 
-The AESF trigger architecture for bidirectional sync follows a consistent pattern across all synced objects. Understanding it abstractly lets you navigate any of the 454 Apex classes quickly.
+The integration platform trigger architecture for bidirectional sync follows a consistent pattern across all synced objects. Understanding it abstractly lets you navigate any of the Apex classes quickly.
 
 ```
 Trigger (1 per object)
     └── TriggerHandler (extends base TriggerHandler)
             └── Sync Class (static @future or Queueable)
-                    └── EpicMiddlewareClient (HTTP utility)
-                            └── Named Credential: AESF_Middleware
-                                    └── FastAPI endpoint (aesf-py-middleware)
-                                            └── Epic BDE backend
+                    └── EHRMiddlewareClient (HTTP utility)
+                            └── Named Credential: CRM_Middleware
+                                    └── FastAPI endpoint (crm-middleware)
+                                            └── EHR system backend
 ```
 
 ### The Callout-in-Trigger Problem
@@ -718,14 +718,14 @@ trigger AccountTrigger on Account (after insert) {
 
 // THIS WORKS — defer the callout to async context
 trigger AccountTrigger on Account (after insert) {
-    AccountEpicSync.syncToEpic(Trigger.newMap.keySet());
-    // syncToEpic is annotated @future(callout=true)
+    AccountEHRSync.syncToEHR(Trigger.newMap.keySet());
+    // syncToEHR is annotated @future(callout=true)
 }
 ```
 
 ### Recursion Prevention
 
-When the middleware writes back to Salesforce (e.g., updating `AESF__Epic_Client_Id__c` after creating an Epic client), that DML fires the trigger again. Without a recursion guard, you get an infinite loop that terminates only when Apex stack depth limit is hit.
+When the middleware writes back to Salesforce (e.g., updating `APP__EHR_Client_Id__c` after creating an EHR system client), that DML fires the trigger again. Without a recursion guard, you get an infinite loop that terminates only when Apex stack depth limit is hit.
 
 ```apex
 public class TriggerRecursionGuard {
@@ -754,7 +754,7 @@ protected override void afterUpdate() {
         }
     }
     if (!toSync.isEmpty()) {
-        AccountEpicSync.syncToEpic(
+        AccountEHRSync.syncToEHR(
             new Map<Id, Account>(toSync).keySet()
         );
     }
@@ -807,8 +807,8 @@ Apex Deep Dive
 │   ├── Test.startTest()/stopTest() flushes async
 │   └── Assert outcomes, not just coverage lines
 │
-└── AESF Architecture
-    ├── Trigger → Handler → Sync Class → EpicMiddlewareClient
+└── Integration Platform Architecture
+    ├── Trigger → Handler → Sync Class → EHRMiddlewareClient
     ├── @future defers callout past DML transaction boundary
     └── Set<Id> recursion guard prevents write-back loops
 ```
@@ -829,13 +829,13 @@ Apex Deep Dive
 
 **5.** Why can't you make an HTTP callout directly in a trigger that fires in response to a DML operation?
 
-**6.** You need to call the AESF middleware from a trigger, then chain a second call that depends on the first call's response. Which async mechanism should you use and why?
+**6.** You need to call the integration platform middleware from a trigger, then chain a second call that depends on the first call's response. Which async mechanism should you use and why?
 
 **7.** What is the difference between `@future` and `Queueable` Apex? Name two limitations of `@future` that Queueable overcomes.
 
 **8.** In Batch Apex, why does each `execute()` call get fresh governor limits?
 
-**9.** What is the `allOrNone` parameter in `Database.insert(records, allOrNone)` and when would you set it to `false` in AESF?
+**9.** What is the `allOrNone` parameter in `Database.insert(records, allOrNone)` and when would you set it to `false` in the integration platform?
 
 **10.** Explain SOQL injection. How do bind variables (`:variable`) prevent it?
 
@@ -845,17 +845,17 @@ Apex Deep Dive
 
 **13.** What is an `HttpCalloutMock` and why must you register one before any test that invokes Apex code that makes HTTP callouts?
 
-**14.** Describe the recursion problem that can occur when the AESF middleware writes `AESF__Epic_Client_Id__c` back to a Salesforce Account after creating the Epic client record.
+**14.** Describe the recursion problem that can occur when the crm-middleware writes `APP__EHR_Client_Id__c` back to a Salesforce Account after creating the EHR system client record.
 
-**15.** You have an `Account` trigger that runs `AccountEpicSync.syncToEpic()` in `afterUpdate`. A user edits only the Account's Description field (not synced to Epic). What pattern prevents an unnecessary callout to the middleware?
+**15.** You have an `Account` trigger that runs `AccountEHRSync.syncToEHR()` in `afterUpdate`. A user edits only the Account's Description field (not synced to the EHR system). What pattern prevents an unnecessary callout to the middleware?
 
 **16.** What is `@TestSetup` and how does it differ from data created directly inside a test method?
 
 **17.** A Batch Apex job processes 50,000 Accounts with a scope size of 200. How many `execute()` calls will there be, and does each one have access to the full 100 SOQL query limit?
 
-**18.** You want to run a full Epic re-sync every night at 2 AM. Describe the two Apex classes you'd write and how you'd schedule the job.
+**18.** You want to run a full EHR system re-sync every night at 2 AM. Describe the two Apex classes you'd write and how you'd schedule the job.
 
-**19.** What is a Named Credential in Salesforce and why does AESF use one instead of hardcoding the middleware URL?
+**19.** What is a Named Credential in Salesforce and why does the integration platform use one instead of hardcoding the middleware URL?
 
 **20.** What is the minimum code coverage percentage required to deploy Apex to a Salesforce production org, and why is meeting this minimum not sufficient for reliable production code?
 
@@ -869,7 +869,7 @@ Apex Deep Dive
 
     **2.** The for loop issues one SOQL query per Contact record. With 200 records you'd hit the 100 SOQL limit on the 101st iteration and get a `System.LimitException: Too many SOQL queries: 101`. The fix: collect all `AccountId` values into a `Set<Id>` before the loop, run one query (`WHERE Id IN :accountIds`), build a `Map<Id, Account>` from the results, and do a `map.get(con.AccountId)` lookup inside the loop. Zero SOQL queries inside the loop.
 
-    **3.** Before triggers run before the record is committed to the database; `Trigger.new` is writable so you can modify field values without a DML statement — useful for field defaulting, computed fields, and validation that should block the save. After triggers run after the record is committed and has a permanent Id; `Trigger.new` is read-only but you now have the Id to use in related-record operations, cross-object updates, and dispatching async callouts that need the record Id. In AESF, Epic sync is always in `afterInsert`/`afterUpdate` because you need the record Id to build the middleware payload.
+    **3.** Before triggers run before the record is committed to the database; `Trigger.new` is writable so you can modify field values without a DML statement — useful for field defaulting, computed fields, and validation that should block the save. After triggers run after the record is committed and has a permanent Id; `Trigger.new` is read-only but you now have the Id to use in related-record operations, cross-object updates, and dispatching async callouts that need the record Id. In the integration platform, EHR sync is always in `afterInsert`/`afterUpdate` because you need the record Id to build the middleware payload.
 
     **4.** The base `TriggerHandler` class provides a single `run()` method that inspects `Trigger.isBefore`, `Trigger.isAfter`, `Trigger.isInsert`, `Trigger.isUpdate`, etc., and routes execution to the appropriate virtual method (`beforeInsert`, `afterUpdate`, etc.). Subclasses override only the methods they need. This keeps the trigger itself to a single line (`handler.run()`), ensures consistent routing logic across all handlers, and provides a single place to add cross-cutting features like bypass flags for testing and recursion guards.
 
@@ -881,7 +881,7 @@ Apex Deep Dive
 
     **8.** Batch Apex was explicitly designed for large-data-volume processing. Each `execute()` call is dispatched as a separate asynchronous Apex transaction with its own governor limit budget. This means whether you process 1,000 records or 10 million, no single `execute()` call ever exceeds limits — it processes its chunk (e.g., 50 records), commits, and the next `execute()` starts fresh. The tradeoff is per-transaction overhead: each chunk has startup cost, so very small scope sizes on very large datasets can be slow.
 
-    **9.** When `allOrNone` is `true` (the default), any single record failure rolls back the entire list. When it is `false`, the platform attempts each record independently and returns a `List<Database.SaveResult>` with per-record success/failure information. In AESF, setting `allOrNone = false` on bulk sync operations means one invalid record (e.g., a Contact missing a required Epic field) doesn't block the other 199 valid records from syncing. The caller checks `SaveResult.isSuccess()` for each record and logs failures to a custom error object without abandoning the successful records.
+    **9.** When `allOrNone` is `true` (the default), any single record failure rolls back the entire list. When it is `false`, the platform attempts each record independently and returns a `List<Database.SaveResult>` with per-record success/failure information. In the integration platform, setting `allOrNone = false` on bulk sync operations means one invalid record (e.g., a Contact missing a required EHR system field) doesn't block the other 199 valid records from syncing. The caller checks `SaveResult.isSuccess()` for each record and logs failures to a custom error object without abandoning the successful records.
 
     **10.** SOQL injection occurs when user-controlled input is concatenated directly into a dynamic SOQL string. For example: `Database.query('SELECT Id FROM Account WHERE Name = \'' + userInput + '\'')`— a malicious input like `' OR Name != '` could alter the query logic and return records the user shouldn't see. Bind variables prevent this because the Salesforce query engine treats bound values as data literals, not query syntax, regardless of their content. `WHERE Name = :userInput` is always safe because the platform never parses `userInput` as SOQL syntax.
 
@@ -891,16 +891,16 @@ Apex Deep Dive
 
     **13.** An `HttpCalloutMock` is an interface your test class implements to intercept HTTP requests made during a test and return a controlled `HttpResponse` instead of hitting a real endpoint. Salesforce blocks all real HTTP callouts during tests (to prevent test code from altering external systems or depending on network availability). You register the mock with `Test.setMock(HttpCalloutMock.class, new YourMock())` before the code under test runs. Without a registered mock, any test that triggers Apex code making a callout will throw `System.CalloutException: You cannot make callouts from tests`.
 
-    **14.** When an Account is inserted in Salesforce, `AccountTriggerHandler.afterInsert` fires and calls the AESF middleware to create the client in Epic. The middleware responds with an Epic client ID, and a subsequent process writes that ID to `AESF__Epic_Client_Id__c` on the Account (via a DML update). That DML update fires `AccountTrigger` again, triggering `afterUpdate`, which calls the middleware again — an infinite loop. Each iteration fires a new callout and a new DML update until Apex hits the maximum stack depth or another limit. The fix is a `Set<Id>` recursion guard: before processing a record in `afterUpdate`, check if its Id is in the set; if yes, skip it; if no, add it and proceed.
+    **14.** When an Account is inserted in Salesforce, `AccountTriggerHandler.afterInsert` fires and calls the crm-middleware to create the client in the EHR system. The middleware responds with an EHR client ID, and a subsequent process writes that ID to `APP__EHR_Client_Id__c` on the Account (via a DML update). That DML update fires `AccountTrigger` again, triggering `afterUpdate`, which calls the middleware again — an infinite loop. Each iteration fires a new callout and a new DML update until Apex hits the maximum stack depth or another limit. The fix is a `Set<Id>` recursion guard: before processing a record in `afterUpdate`, check if its Id is in the set; if yes, skip it; if no, add it and proceed.
 
-    **15.** Field-change detection: inside `afterUpdate`, compare `Trigger.new` values against `Trigger.oldMap` values for only the fields that map to Epic. If none of the synced fields changed, skip that record. Only records where at least one synced field differs are added to the `toSync` list that gets passed to `AccountEpicSync.syncToEpic()`. If `toSync` is empty after the check, the `@future` method is never enqueued and no callout is made. This is a standard pattern in all AESF trigger handlers.
+    **15.** Field-change detection: inside `afterUpdate`, compare `Trigger.new` values against `Trigger.oldMap` values for only the fields that map to the EHR system. If none of the synced fields changed, skip that record. Only records where at least one synced field differs are added to the `toSync` list that gets passed to `AccountEHRSync.syncToEHR()`. If `toSync` is empty after the check, the `@future` method is never enqueued and no callout is made. This is a standard pattern in all integration platform trigger handlers.
 
     **16.** `@TestSetup` is a static method annotated with `@TestSetup` that runs once before all test methods in the class, and its DML operations are rolled back between test methods (each test method gets a fresh copy). This means every test method in the class can query and use the records created in `@TestSetup` without recreating them. Data created directly inside a test method is only visible to that method. `@TestSetup` is preferable for shared reference data (test accounts, contacts, configurations) because it avoids duplicating setup code across test methods and reduces overall test execution time.
 
     **17.** With 50,000 records and a scope size of 200, there will be 250 `execute()` calls (50,000 ÷ 200). Yes, each `execute()` call runs in its own transaction with fresh governor limits, so each one has the full 100 SOQL query, 150 DML statement, and 60-second CPU budget (async limit). This is the fundamental advantage of Batch Apex for large datasets: you effectively multiply your per-transaction limit budget by the number of chunks.
 
-    **18.** Write a `Schedulable` class that calls `Database.executeBatch()` in its `execute()` method, and a `Database.Batchable` class that performs the actual sync. For example: `DailyEpicReconcileScheduler implements Schedulable` calls `Database.executeBatch(new AccountEpicBatchSync(), 50)`. Schedule it with `System.schedule('Daily Epic Reconcile', '0 0 2 * * ?', new DailyEpicReconcileScheduler())` — the cron expression `0 0 2 * * ?` means second 0, minute 0, hour 2 (2 AM), every day. The Scheduled class is a thin launcher; all logic lives in the Batch class.
+    **18.** Write a `Schedulable` class that calls `Database.executeBatch()` in its `execute()` method, and a `Database.Batchable` class that performs the actual sync. For example: `DailyEHRReconcileScheduler implements Schedulable` calls `Database.executeBatch(new AccountEHRBatchSync(), 50)`. Schedule it with `System.schedule('Daily EHR Reconcile', '0 0 2 * * ?', new DailyEHRReconcileScheduler())` — the cron expression `0 0 2 * * ?` means second 0, minute 0, hour 2 (2 AM), every day. The Scheduled class is a thin launcher; all logic lives in the Batch class.
 
-    **19.** A Named Credential is a Salesforce configuration object that stores an external service's endpoint URL, authentication method, and credentials (such as an OAuth token or basic auth password) in a secure, admin-controlled store. Apex code references it by label (`callout:AESF_Middleware`) rather than a hardcoded URL. AESF uses Named Credentials because: the middleware URL differs per environment (QA, Staging, Production), changing it requires no code deployment (just update the Named Credential in Setup), credentials are stored securely and not visible in Apex source code, and Named Credentials automatically manage authentication headers.
+    **19.** A Named Credential is a Salesforce configuration object that stores an external service's endpoint URL, authentication method, and credentials (such as an OAuth token or basic auth password) in a secure, admin-controlled store. Apex code references it by label (`callout:CRM_Middleware`) rather than a hardcoded URL. The integration platform uses Named Credentials because: the middleware URL differs per environment (QA, Staging, Production), changing it requires no code deployment (just update the Named Credential in Setup), credentials are stored securely and not visible in Apex source code, and Named Credentials automatically manage authentication headers.
 
-    **20.** The minimum is 75% code coverage across all Apex classes and triggers (and 0% on no individual class — each class is tested but the aggregate must be 75%). Meeting 75% is not sufficient because coverage measures which lines were executed, not whether the behavior was verified. A test that inserts a record and makes no assertions can cover 100% of a trigger's lines while verifying nothing. In AESF's context this is especially dangerous: a trigger handler that silently swallows exceptions and skips callouts would achieve full coverage with zero assertions, while leaving Epic perpetually out of sync with Salesforce. Meaningful tests assert specific outcomes: field values, error records created, callout payloads sent.
+    **20.** The minimum is 75% code coverage across all Apex classes and triggers (and 0% on no individual class — each class is tested but the aggregate must be 75%). Meeting 75% is not sufficient because coverage measures which lines were executed, not whether the behavior was verified. A test that inserts a record and makes no assertions can cover 100% of a trigger's lines while verifying nothing. In the integration platform's context this is especially dangerous: a trigger handler that silently swallows exceptions and skips callouts would achieve full coverage with zero assertions, while leaving the EHR system perpetually out of sync with Salesforce. Meaningful tests assert specific outcomes: field values, error records created, callout payloads sent.
